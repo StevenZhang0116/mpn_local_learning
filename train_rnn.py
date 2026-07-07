@@ -209,12 +209,16 @@ def run_seed(seed, record_steps):
             opt.step()
             if net.param_clamping:
                 net.param_clamp()
-            sch.step(grads["loss"].item())
+
+            # Held-out validation loss on the UPDATED net drives the scheduler
+            # (as in one_task.py) — smoother than the fresh per-batch train loss.
+            v_out = net.forward_outputs(v_inputs)
+            v_loss, _ = rnn.masked_mse_loss_and_output_grad(v_out, v_labels, v_mask)
+            sch.step(v_loss.item())
 
             if step in record_set:
                 train_acc = try_accuracy(net, grads["outputs"], labels, mask,
                                          inputs, isvalid=False)
-                v_out = net.forward_outputs(v_inputs)
                 valid_acc = try_accuracy(net, v_out, v_labels, v_mask, v_inputs,
                                          isvalid=True)
                 curves[rule]["train"].append(train_acc)

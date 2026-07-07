@@ -48,23 +48,34 @@ SEED = 42
 RULESET = "delaygo"           # single task to train on
 RULES_TO_RUN = ["bptt", "local_diag_rflo", "local_direct"]   # the two rules to compare
 FEEDBACK_MODE = "exact_readout"   # 'exact_readout' or 'random_fixed' (feedback align)
-N_RUNS = 3                    # independent seeds per rule
+N_RUNS = 5                    # independent seeds per rule
 N_HIDDEN = 200                # one_task.py: n_hidden = 200
-N_DATASETS = 3000             # one_task.py: n_datasets = 3000 (heavy on CPU)
+N_DATASETS = 5000             # one_task.py: n_datasets = 3000 (heavy on CPU)
 BATCH = 128                   # one_task.py: n_batches = batch_size = 128
 LR = 1e-3                     # one_task.py: lr = 1e-3
 GRAD_CLIP = 10                # one_task.py: gradient_clip = 10
 LOG_EVERY = 100               # record/print accuracy every this many steps
 FIG_DIR = "figure"            # subfolder for saved figures
+CKPT_DIR = "checkpoints"      # subfolder for saved trained networks
+SAVE_NETS = True              # save each trained network (per rule, per seed)
+
+
+def _param_tag():
+    """Shared parameter string identifying a run configuration."""
+    return (f"{RULESET}_h{N_HIDDEN}_b{BATCH}_n{N_DATASETS}"
+            f"_lr{LR:.0e}_{FEEDBACK_MODE}")
 
 
 def fig_path():
     """Figure filename encoding the key params so runs don't overwrite each
     other: task, hidden size, batch, #steps, lr, #runs, feedback mode."""
-    return os.path.join(
-        FIG_DIR,
-        f"train_mpn_{RULESET}_h{N_HIDDEN}_b{BATCH}_n{N_DATASETS}"
-        f"_lr{LR:.0e}_runs{N_RUNS}_{FEEDBACK_MODE}.png")
+    return os.path.join(FIG_DIR, f"train_mpn_{_param_tag()}_runs{N_RUNS}.png")
+
+
+def ckpt_path(rule, seed):
+    """Checkpoint filename for one trained network: run params + rule + seed, so
+    every (rule, seed) is a distinct file that can be reloaded later."""
+    return os.path.join(CKPT_DIR, f"mpn_{_param_tag()}_{rule}_seed{seed}.pt")
 
 DEVICE = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 DTYPE = torch.float32         # float32 for speed (one_task.py also runs float32)
@@ -166,6 +177,18 @@ def try_accuracy(net, output, labels, mask, inputs, isvalid=False):
         return float("nan")
 
 
+def load_net(path, device=None, dtype=DTYPE):
+    """Reload a network saved by run_seed. Returns the reconstructed
+    MultiPlasticNet with its trained weights and learning_rule restored.
+    Example:  net = load_net(ckpt_path('bptt', 42))"""
+    device = device or DEVICE
+    ckpt = torch.load(path, map_location=device, weights_only=False)
+    net = mpn.MultiPlasticNet(ckpt["net_params"], verbose=False).to(device).to(dtype)
+    net.load_state_dict(ckpt["state_dict"])
+    net.learning_rule = ckpt.get("learning_rule", net.learning_rule)
+    return net
+
+
 @torch.no_grad()
 def forward_outputs(net, inputs):
     """Unrolled forward over time (no grad), returning outputs (B, T, n_output).
@@ -243,12 +266,16 @@ def run_seed(seed, record_steps):
             opt.step()
             if net.param_clamping:
                 net.param_clamp()
-            sch.step(grads["loss"].item())
+
+            # Held-out validation loss on the UPDATED net drives the scheduler
+            # (as in one_task.py) — smoother than the fresh per-batch train loss.
+            v_out = forward_outputs(net, v_inputs)
+            v_loss, _ = mpn.masked_mse_loss_and_output_grad(v_out, v_labels, v_mask)
+            sch.step(v_loss.item())
 
             if step in record_set:
                 train_acc = try_accuracy(net, grads["outputs"], labels, mask,
                                          inputs, isvalid=False)
-                v_out = forward_outputs(net, v_inputs)
                 valid_acc = try_accuracy(net, v_out, v_labels, v_mask, v_inputs,
                                          isvalid=True)
                 curves[rule]["train"].append(train_acc)
@@ -259,6 +286,21 @@ def run_seed(seed, record_steps):
                 f"{RULE_LABEL[r]}: tr={curves[r]['train'][-1]:.3f} "
                 f"va={curves[r]['valid'][-1]:.3f}" for r in RULES_TO_RUN)
             print(f"  seed {seed} step {step:>5}   {msg}")
+
+    # Save each trained network (per rule) so it can be reloaded later. Stores
+    # state_dict + net_params (as in one_task.py) plus rule/seed metadata.
+    if SAVE_NETS:
+        os.makedirs(CKPT_DIR, exist_ok=True)
+        for rule in RULES_TO_RUN:
+            path = ckpt_path(rule, seed)
+            torch.save({
+                "state_dict": nets[rule].state_dict(),
+                "net_params": net_params,
+                "learning_rule": rule,
+                "feedback_mode": FEEDBACK_MODE,
+                "seed": seed,
+            }, path)
+            print(f"  saved network: {path}")
 
     del nets, optims, base
     gc.collect()
