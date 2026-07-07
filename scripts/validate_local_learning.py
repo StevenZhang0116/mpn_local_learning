@@ -28,7 +28,7 @@ Run from this directory:  python validate_local_learning.py
 """
 import torch
 
-import _bootstrap  # noqa: F401  -- prepends ./core to sys.path
+import _bootstrap  # prepends ../core + ../scripts to sys.path; exposes ROOT
 import mpn
 
 
