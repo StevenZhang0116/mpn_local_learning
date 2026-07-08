@@ -22,6 +22,8 @@ Tiers (see the plan in the extension description):
   Tier 6  deep-net input embedding (direct 3-factor): exact at eta=0, approximate
           otherwise, reduces to the single-MP net when no embedding.
   Tier 7  leaky RNN RFLO: == BPTT at W_rec=0; approximates otherwise (readout exact).
+  Tier 8  pre-only update (hebb_pre): all local rules == BPTT for the MP layer
+          (M is input-only → dM/dW=0); deep-net input embedding stays approximate.
   Tier 4  the same claims on the REAL delaygo task (train_mpn config / pipeline):
           exact == BPTT, diagonal RFLO an appreciable approximation. This is the
           integration check (Tiers 1-3 use synthetic random tensors).
@@ -37,7 +39,7 @@ import mpn
 
 def build_net(n_input, n_hidden, n_output, activation, layer_bias, output_bias,
               eta_type, lam_type, learning_rule='local_exact_rowlocal',
-              feedback_mode='exact_readout', seed=0):
+              feedback_mode='exact_readout', m_update_type='hebb_assoc', seed=0):
     torch.manual_seed(seed)
     net_params = {
         'n_neurons': [n_input, n_hidden, n_output],
@@ -51,7 +53,7 @@ def build_net(n_input, n_hidden, n_output, activation, layer_bias, output_bias,
         'ml_params': {
             'bias': layer_bias,
             'mp_type': 'mult',
-            'm_update_type': 'hebb_assoc',
+            'm_update_type': m_update_type,
             'm_activation': 'linear',
             'modulation_bounds': False,
             'eta_type': eta_type,
@@ -457,6 +459,67 @@ def tier7_rnn_rflo():
     return allok
 
 
+def tier8_hebb_pre():
+    """Pre-only Hebbian update ('hebb_pre'): M is input-only, so dM/dW = dM/db = 0
+    for the MP layer and every plastic trace is identically zero.
+      (a) all three local rules == BPTT on a single-MP-layer net (exact, no approx).
+      (b) contrast: on hebb_assoc the diag/direct rules DIFFER from BPTT (so (a)
+          is a real property of pre-only, not the test being trivially satisfied).
+      (c) deep net: MP-layer params (W, b, W_output, b_output) exact under
+          hebb_pre, but the input embedding W_in still feeds M, so W_in/b_in are
+          an approximation — same as hebb_assoc."""
+    print("── Tier 8: pre-only Hebbian update (hebb_pre) ──────────────────────")
+    allok = True
+
+    # (a) single-MP-layer, hebb_pre: exact / diag / direct all == BPTT.
+    keys = grad_keys(True, True)
+    for rule_name, rule in (("exact", "local_exact_rowlocal"),
+                            ("diag", "local_diag_rflo"),
+                            ("direct", "local_direct")):
+        net = build_net(5, 7, 3, 'tanh', True, True, 'scalar', 'scalar',
+                        learning_rule=rule, m_update_type='hebb_pre', seed=1)
+        inp, lab, msk, _ = make_data(6, 12, 5, 3)
+        ref = net.bptt_gradients(inp, lab, msk)
+        loc = net._local_sequence_gradients(
+            inp, lab, msk, {'local_exact_rowlocal': 'exact',
+                            'local_diag_rflo': 'diag', 'local_direct': 'direct'}[rule])
+        ok, d = compare(loc, ref, keys)
+        allok &= ok
+        print(f"  [{'PASS' if ok else 'FAIL'}] hebb_pre {rule_name:6} == BPTT     {fmt(d, keys)}")
+
+    # (b) contrast: hebb_assoc diag genuinely differs (pre-only exactness is real).
+    net = build_net(5, 7, 3, 'tanh', True, True, 'scalar', 'scalar',
+                    m_update_type='hebb_assoc', seed=2)
+    inp, lab, msk, _ = make_data(6, 12, 5, 3)
+    _, d_b = compare(net.local_diag_rflo_gradients(inp, lab, msk),
+                     net.bptt_gradients(inp, lab, msk), ['W'])
+    ok_b = d_b['W'][1] > 1e-3
+    allok &= ok_b
+    print(f"  [{'PASS' if ok_b else 'FAIL'}] hebb_assoc diag DIFFERS      W:rel={d_b['W'][1]:.2e} (>1e-3)")
+
+    # (c) deep net hebb_pre: MP-layer params exact; embedding W_in an approximation.
+    npar = {'n_neurons': [5, 7, 3], 'loss_type': 'MSE', 'activation': 'tanh',
+            'output_bias': True, 'output_matrix': '', 'dt': 40,
+            'input_layer_add': True, 'input_layer_add_trainable': True,
+            'linear_embed': 6, 'input_layer_bias': True,
+            'learning_rule': 'local_exact_rowlocal', 'feedback_mode': 'exact_readout',
+            'ml_params': {'bias': True, 'mp_type': 'mult', 'm_update_type': 'hebb_pre',
+                          'm_activation': 'linear', 'modulation_bounds': False,
+                          'eta_type': 'scalar', 'eta_train': False, 'lam_type': 'scalar',
+                          'lam_train': False, 'm_time_scale': 400, 'W_freeze': False}}
+    torch.manual_seed(3)
+    net = mpn.DeepMultiPlasticNet(npar, verbose=False).double()
+    inp, lab, msk, _ = make_data(6, 12, 5, 3)
+    ref, loc = net.bptt_gradients(inp, lab, msk), net.local_gradients(inp, lab, msk)
+    ok_mp, d_mp = compare(loc, ref, ['W', 'b', 'W_output', 'b_output'])
+    w_in_rel = compare(loc, ref, ['W_in'])[1]['W_in'][1]
+    ok_c = ok_mp and (w_in_rel > 1e-3)
+    allok &= ok_c
+    print(f"  [{'PASS' if ok_c else 'FAIL'}] dmpn hebb_pre: MP exact, W_in approx   "
+          f"{fmt(d_mp, ['W', 'W_output'])}  W_in:rel={w_in_rel:.2e} (>1e-3)")
+    return allok
+
+
 def main():
     torch.set_default_dtype(torch.float64)
     print("Validating local-learning rules vs autograd (BPTT), float64\n")
@@ -468,6 +531,7 @@ def main():
         tier5_direct_local(),
         tier6_deep_input_embedding(),
         tier7_rnn_rflo(),
+        tier8_hebb_pre(),
         tier4_real_task(),
     ]
     print("\n" + ("ALL CHECKS PASSED" if all(results) else "SOME CHECKS FAILED"))

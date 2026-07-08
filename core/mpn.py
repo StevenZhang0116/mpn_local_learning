@@ -209,23 +209,27 @@ class MultiPlasticLayer(BaseNetworkFunctions):
     # bounds. Indexing throughout: i = post (n_output), I = param-pre index of
     # W_{iI}, J = plastic-pre index. See run_sequence_local_mpn_exact.
 
-    def assert_local_assoc_config(self):
-        """Guard shared by the exact row-local and diagonal-RFLO rules. Both are
-        derived for the associative Hebbian M-update
+    def assert_local_config(self):
+        """Guard for the local (eligibility-trace) rules. They are derived for a
+        multiplicative modulation with a linear M-activation and no clamping, and
+        for one of two Hebbian M-updates:
 
-            M_{iI,t} = lam M_{iI,t-1} + eta h_{i,t} x_{I,t}
+            hebb_assoc: M_{iI,t} = lam M_{iI,t-1} + eta h_{i,t} x_{I,t}
+            hebb_pre:   M_{iI,t} = lam M_{iI,t-1} + eta c        x_{I,t}   (c const)
 
-        with multiplicative modulation, a linear M-activation, and no clamping.
-        Other m_update_types (hebb_pre, oja) / nonlinear m_act / bounds would
-        need extra terms (a dM_t/dM_pre factor, zero/undefined saturated grads),
-        so they are refused here rather than silently giving wrong gradients."""
+        For hebb_assoc M depends on the postsynaptic activity h (hence on W, b),
+        so the plastic-sensitivity traces P/A/Q are live. For hebb_pre M depends
+        only on the input, so dM/dW = dM/db = 0 identically: every plastic trace
+        is zero and the local rule is EXACT (see self._assoc). Other updates
+        (oja) / nonlinear m_act / bounds would need extra terms, so are refused
+        here rather than silently giving wrong gradients."""
         if self.mp_type != 'mult':
             raise NotImplementedError(
                 f"local rules derived for mp_type='mult', got '{self.mp_type}'")
-        if self.m_update_type != 'hebb_assoc':
+        if self.m_update_type not in ('hebb_assoc', 'hebb_pre'):
             raise NotImplementedError(
-                f"local rules derived for m_update_type='hebb_assoc', got "
-                f"'{self.m_update_type}'")
+                f"local rules derived for m_update_type in (hebb_assoc, hebb_pre), "
+                f"got '{self.m_update_type}'")
         if self.m_act != 'linear':
             raise NotImplementedError(
                 f"local rules require m_activation='linear', got '{self.m_act}'")
@@ -234,8 +238,18 @@ class MultiPlasticLayer(BaseNetworkFunctions):
                 "local rules require modulation_bounds=False (clamping gives "
                 "zero/undefined dM_t/dM_pre in saturated regions)")
 
-    # Back-compat alias (older callers / tests used the exact-only name).
-    assert_exact_rowlocal_config = assert_local_assoc_config
+    # Back-compat aliases (older callers / tests used these names).
+    assert_local_assoc_config = assert_local_config
+    assert_exact_rowlocal_config = assert_local_config
+
+    @property
+    def _assoc(self):
+        """delta_assoc in the derivation: 1.0 when M depends on h (hebb_assoc),
+        so dM/dW and dM/db are nonzero and the plastic traces P/A/Q are live;
+        0.0 for hebb_pre, where M is input-only so every plastic-sensitivity
+        trace is identically zero and the local rule reduces to the exact
+        instantaneous (direct) gradient."""
+        return 1.0 if self.m_update_type == 'hebb_assoc' else 0.0
 
     def reset_local_learning_state(self, B=1):
         """Allocate the exact row-local eligibility traces (zeroed).
@@ -301,12 +315,13 @@ class MultiPlasticLayer(BaseNetworkFunctions):
         update_M_matrix. update_mask (B,) freezes traces for inactive batch rows.
         """
         eta, lam = self._eta_lam_full()  # each (i, J)
+        a = self._assoc  # 0 for hebb_pre → dM/dW = dM/db = 0, traces stay zero
 
         outerP = torch.einsum('BiI,BJ->BiIJ', E, x)            # x_J E^I_i
-        P_new = lam[None, :, None, :] * self.P + eta[None, :, None, :] * outerP
+        P_new = lam[None, :, None, :] * self.P + a * eta[None, :, None, :] * outerP
 
         outerQ = torch.einsum('Bi,BJ->BiJ', R, x)              # x_J R_i
-        Q_new = lam[None, :, :] * self.Q + eta[None, :, :] * outerQ
+        Q_new = lam[None, :, :] * self.Q + a * eta[None, :, :] * outerQ
 
         if update_mask is not None:
             mP = update_mask.view(-1, 1, 1, 1).to(P_new.dtype)
@@ -370,11 +385,12 @@ class MultiPlasticLayer(BaseNetworkFunctions):
         update_mask (B,) freezes traces for inactive batch rows.
         """
         eta, lam = self._eta_lam_full()  # each (i, I)
+        a = self._assoc  # 0 for hebb_pre → dM/dW = dM/db = 0, traces stay zero
 
-        A_new = lam[None] * self.A + eta[None] * x.unsqueeze(1) * E     # x_I E_hat^I_i
+        A_new = lam[None] * self.A + a * eta[None] * x.unsqueeze(1) * E  # x_I E_hat^I_i
 
         outerQ = torch.einsum('Bi,BJ->BiJ', R, x)                      # x_J R_i
-        Q_new = lam[None] * self.Q + eta[None] * outerQ
+        Q_new = lam[None] * self.Q + a * eta[None] * outerQ
 
         if update_mask is not None:
             mA = update_mask.view(-1, 1, 1).to(A_new.dtype)
@@ -934,8 +950,13 @@ class MultiPlasticNet(MultiPlasticNetBase):
         the same dict shape as bptt_gradients().
         """
         mp = self.mp_layer
-        mp.assert_local_assoc_config()
+        mp.assert_local_config()
         assert mode in ('exact', 'diag', 'direct')
+        # For hebb_pre the plastic traces are identically zero, so all three
+        # modes give the same EXACT gradient — route to 'direct' to skip the
+        # unused O(B·post·pre²) P trace / O(B·post·pre) A trace allocation.
+        if mp.m_update_type == 'hebb_pre':
+            mode = 'direct'
 
         B, T, _ = inputs.shape
         dev, dt = inputs.device, inputs.dtype
@@ -1306,8 +1327,13 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
         eligibility -> grad accumulation -> trace update -> M update."""
         self._assert_single_mp()
         mp = self.mp_layers[0]
-        mp.assert_local_assoc_config()
+        mp.assert_local_config()
         assert mode in ('exact', 'diag', 'direct')
+        # For hebb_pre the plastic traces are identically zero, so all three
+        # modes give the same EXACT gradient — route to 'direct' to skip the
+        # unused P/A trace allocation.
+        if mp.m_update_type == 'hebb_pre':
+            mode = 'direct'
 
         B, T, _ = inputs.shape
         dev, dt = inputs.device, inputs.dtype
