@@ -25,6 +25,9 @@ RFLO eligibility traces (i = post/hidden unit; j = pre hidden; I = pre input):
     dL/dW_input_{iI} = sum_t ell_{i,t} q^in_{iI,t}
     dL/db_{i}        = sum_t ell_{i,t} s^b_{i,t}
 Readout grads stay EXACT (dL/dW_output, dL/db_output use the true dL_t/dy_t).
+Under 'local_diag_rflo' ALL weights (input, recurrent, bias) train by RFLO; under
+'bptt' everything trains by exact autograd — the learning_rule governs the whole
+network, there is no separate per-layer control.
 
 Trainable params: W_input, W_rec, W_output, b_hidden, (b_output if enabled).
 """
@@ -225,10 +228,11 @@ class LeakyRNN(BaseNetwork):
             grad_b_output += grad_output.sum(0)
 
         loss, _ = loss_and_grad(outputs, labels, masks)
-        params = self._trainable_params()
         all_grads = {'W_input': grad_W_input, 'W_rec': grad_W_rec,
                      'b_hidden': grad_b_hidden, 'W_output': grad_W_output,
                      'b_output': grad_b_output}
+
+        params = self._trainable_params()
         result = {k: all_grads[k] for k in params}
         result['loss'] = loss.detach()
         result['outputs'] = outputs.detach()

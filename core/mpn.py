@@ -1062,14 +1062,33 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
         if self.input_layer_active:
             arch.insert(1, cfg.get('linear_embed', 128)) # add an initial linear embedding layer
 
-        n_layers = len(arch) - 1     
+        n_layers = len(arch) - 1
         self.n_input = cfg['n_neurons'][0]
         self.n_hidden = cfg['n_neurons'][1]
         self.n_output = cfg['n_neurons'][-1]
 
         self.output_matrix = cfg['output_matrix']
 
+        # Learning rule / feedback for sequence_gradients() (see the rule methods
+        # below). Same options as MultiPlasticNet. 'local' aliases exact.
+        _rule = cfg.get('learning_rule', 'bptt')
+        if _rule == 'local':
+            _rule = 'local_exact_rowlocal'
+        assert _rule in ('bptt', 'local_exact_rowlocal', 'local_diag_rflo',
+                         'local_direct'), f"unknown learning_rule '{_rule}'"
+        self.learning_rule = _rule
+        self.feedback_mode = cfg.get('feedback_mode', 'exact_readout')
+        assert self.feedback_mode in ('exact_readout', 'random_fixed'), \
+            f"unknown feedback_mode '{self.feedback_mode}'"
+
         super().__init__(cfg, cfg['n_neurons'][-2], output_matrix=self.output_matrix, verbose=verbose)
+
+        # Fixed random feedback matrix for feedback alignment (shape of W_output).
+        if self.feedback_mode == 'random_fixed':
+            self.register_buffer('B_feedback', torch.tensor(
+                rand_weight_init(self.n_hidden, self.n_output,
+                                 init_type=cfg.get('B_feedback_init', 'xavier')),
+                dtype=self.W_output.dtype))
 
         # Creates all the MP layers
         self.param_clamping = True # Always have param clamping for MP layers because lam bounds
@@ -1122,7 +1141,6 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
                 self.W_initial_linear.bias = None
 
         self.mp_layers = []
-        print(self.dt)
 
         start_layer_count = 1 if self.input_layer_active else 0
         # if additional input layer is added, shift the starting index of layer counting from 1
@@ -1222,3 +1240,192 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
             _ = mp_layer.update_M_matrix(mpl_activities[mpl_idx], mpl_activities[mpl_idx + 1])
 
         return output, mpl_activities, db
+
+    # ─── Learning rules for the single-MP-layer deep net (+ optional input embed) ──
+    # Mirrors MultiPlasticNet's rule suite for the architecture
+    #     u -> [W_initial_linear, act] -> x -> [MP: W, M] -> h -> [W_output] -> y
+    # which is directly comparable to the RNN (input -> hidden -> output), with the
+    # plastic M playing the role the RNN's recurrence plays. Requires exactly one
+    # MP layer (the forzihan config). BPTT trains ALL params (incl. the input
+    # embedding) exactly via autograd; the local rules train the MP layer with
+    # eligibility traces and the input embedding with a DIRECT 3-factor rule
+    # (backproject the hidden learning signal through the modulated weights, then
+    # multiply by the embedding activation derivative and the raw input — the RNN's
+    # RFLO treatment of its input weights; M-mediated history is dropped).
+
+    def _assert_single_mp(self):
+        assert len(self.mp_layers) == 1, \
+            "deep-net learning rules support exactly one MP layer (forzihan config)"
+
+    def _has_trainable_embed(self):
+        return (self.input_layer_active and self.W_initial_linear.weight.requires_grad)
+
+    def _trainable_params(self):
+        """Trainable tensors this net computes gradients for, keyed by name."""
+        mp = self.mp_layers[0]
+        ps = {'W': mp.W, 'W_output': self.W_output}
+        if mp.layer_bias:
+            ps['b'] = mp.b
+        if self.b_output_active:
+            ps['b_output'] = self.b_output
+        if self.input_layer_active:
+            ps['W_in'] = self.W_initial_linear.weight
+            if self.W_initial_linear.bias is not None:
+                ps['b_in'] = self.W_initial_linear.bias
+        return {k: v for k, v in ps.items() if v.requires_grad}
+
+    def bptt_gradients(self, inputs, labels, masks,
+                       loss_and_grad=masked_mse_loss_and_output_grad):
+        """Full BPTT via autograd through the unrolled deep forward + M-update.
+        Trains every parameter (input embedding included) exactly."""
+        self._assert_single_mp()
+        B, T, _ = inputs.shape
+        self.reset_state(B=B)
+        outs = []
+        for t in range(T):
+            out, _, _ = self.network_step(inputs[:, t, :], seq_idx=t)
+            outs.append(out)
+        outputs = torch.stack(outs, dim=1)
+
+        loss, _ = loss_and_grad(outputs, labels, masks)
+        params = self._trainable_params()
+        grads = torch.autograd.grad(loss, list(params.values()))
+        result = {k: g.detach().clone() for k, g in zip(params, grads)}
+        result['loss'] = loss.detach()
+        result['outputs'] = outputs.detach()
+        return result
+
+    @torch.no_grad()
+    def _local_sequence_gradients(self, inputs, labels, masks, mode,
+                                  loss_and_grad=masked_mse_loss_and_output_grad,
+                                  update_masks=None):
+        """Forward-mode local learning for the deep net (one MP layer + optional
+        trainable input embedding). Same three modes as MultiPlasticNet for the MP
+        layer ('exact'/'diag'/'direct'); the input embedding always uses the direct
+        3-factor rule. Per-step order: forward (uses M_{t-1}) -> learning signal ->
+        eligibility -> grad accumulation -> trace update -> M update."""
+        self._assert_single_mp()
+        mp = self.mp_layers[0]
+        mp.assert_local_assoc_config()
+        assert mode in ('exact', 'diag', 'direct')
+
+        B, T, _ = inputs.shape
+        dev, dt = inputs.device, inputs.dtype
+        self.reset_state(B=B)
+        if mode == 'exact':
+            mp.reset_local_learning_state(B=B)
+        elif mode == 'diag':
+            mp.reset_diag_rflo_state(B=B)
+
+        feedback = self.W_output if self.feedback_mode == 'exact_readout' else self.B_feedback
+        embed = self._has_trainable_embed()
+
+        grad_W = torch.zeros_like(mp.W)
+        grad_b = torch.zeros_like(mp.b)
+        grad_Wout = torch.zeros_like(self.W_output)
+        grad_bout = torch.zeros_like(self.b_output)
+        if embed:
+            grad_Win = torch.zeros_like(self.W_initial_linear.weight)
+            has_bin = self.W_initial_linear.bias is not None
+            grad_bin = torch.zeros_like(self.W_initial_linear.bias) if has_bin else None
+        outputs = torch.zeros(B, T, self.n_output, dtype=dt, device=dev)
+        N = B * T * self.n_output
+
+        for t in range(T):
+            u_t = inputs[:, t, :]                       # raw input (B, n_input)
+
+            # Input embedding forward: a = W_in u (+ b_in); x = act(a).
+            if self.input_layer_active:
+                a_t = self.W_initial_linear(u_t)
+                x_t = self.act_fn(a_t)
+            else:
+                a_t, x_t = None, u_t
+
+            # MP layer forward (consumes M_{t-1}); readout.
+            hidden_pre, _ = mp(x_t)
+            hidden = self.act_fn(hidden_pre)
+            output = torch.einsum('iI,BI->Bi', self.W_output, hidden) + self.b_output.unsqueeze(0)
+            outputs[:, t, :] = output
+
+            # MP-layer eligibility E=dh/dW, R=dh/db from prev traces.
+            phi_prime = self.act_fn_p(hidden_pre)
+            if mode == 'exact':
+                E, R = mp.compute_exact_rowlocal_eligibility(x_t, phi_prime)
+            elif mode == 'diag':
+                E, R = mp.compute_diag_rflo_eligibility(x_t, phi_prime)
+            else:
+                E, R = mp.compute_direct_local_eligibility(x_t, phi_prime)
+
+            # Output gradient + hidden learning signal (feedback matrix).
+            m_t, y_t = masks[:, t, :], labels[:, t, :]
+            grad_output = (2.0 / N) * m_t * (m_t * output - m_t * y_t)
+            ell = grad_output @ feedback                 # (B, n_hidden)
+
+            grad_W += torch.einsum('Bi,BiI->iI', ell, E)
+            grad_b += torch.einsum('Bi,Bi->i', ell, R)
+            grad_Wout += torch.einsum('Ba,Bi->ai', grad_output, hidden)
+            grad_bout += grad_output.sum(0)
+
+            # Input embedding, local (direct 3-factor) rule. Backproject ell
+            # through the modulated MP weights to the embedding output x, then
+            # through act'(a).
+            #   ell_x_I = sum_i ell_i * phi'(h~_i) * W_eff_iI ;  grad_a = ell_x * act'(a)
+            #   dL/dW_in = grad_a^T u ;  dL/db_in = sum_B grad_a
+            if embed:
+                W_eff = mp.get_modulated_weights()       # (B, i, I) = W + W⊙M_{t-1}
+                ell_pre = ell * phi_prime                # (B, i)  = dL/dh~_i
+                ell_x = torch.einsum('Bi,BiI->BI', ell_pre, W_eff)   # (B, I=embed dim)
+                grad_a = ell_x * self.act_fn_p(a_t)      # through x = act(a)
+                grad_Win += torch.einsum('Bo,BI->oI', grad_a, u_t)
+                if has_bin:
+                    grad_bin += grad_a.sum(0)
+
+            # Advance traces then M.
+            um = None if update_masks is None else update_masks[:, t]
+            if mode == 'exact':
+                mp.update_exact_rowlocal_traces(x_t, E, R, update_mask=um)
+            elif mode == 'diag':
+                mp.update_diag_rflo_traces(x_t, E, R, update_mask=um)
+            mp.update_M_matrix(x_t, hidden, update_mask=um)
+
+        loss, _ = loss_and_grad(outputs, labels, masks)
+        all_grads = {'W': grad_W, 'b': grad_b, 'W_output': grad_Wout, 'b_output': grad_bout}
+        if embed:
+            all_grads['W_in'] = grad_Win
+            if has_bin:
+                all_grads['b_in'] = grad_bin
+
+        params = self._trainable_params()
+        result = {k: all_grads[k] for k in params}
+        result['loss'] = loss.detach()
+        result['outputs'] = outputs.detach()
+        return result
+
+    def local_gradients(self, inputs, labels, masks, **kwargs):
+        """Exact row-local MP-layer gradients + direct 3-factor input embedding."""
+        return self._local_sequence_gradients(inputs, labels, masks, 'exact', **kwargs)
+
+    def local_diag_rflo_gradients(self, inputs, labels, masks, **kwargs):
+        """Diagonal RFLO MP-layer gradients + direct 3-factor input embedding."""
+        return self._local_sequence_gradients(inputs, labels, masks, 'diag', **kwargs)
+
+    def local_direct_gradients(self, inputs, labels, masks, **kwargs):
+        """Direct/instantaneous MP-layer gradients + direct 3-factor input embedding."""
+        return self._local_sequence_gradients(inputs, labels, masks, 'direct', **kwargs)
+
+    def sequence_gradients(self, inputs, labels, masks, **kwargs):
+        """Dispatch on self.learning_rule; write grads into each param's .grad."""
+        if self.learning_rule == 'bptt':
+            grads = self.bptt_gradients(inputs, labels, masks, **kwargs)
+        elif self.learning_rule == 'local_exact_rowlocal':
+            grads = self.local_gradients(inputs, labels, masks, **kwargs)
+        elif self.learning_rule == 'local_diag_rflo':
+            grads = self.local_diag_rflo_gradients(inputs, labels, masks, **kwargs)
+        elif self.learning_rule == 'local_direct':
+            grads = self.local_direct_gradients(inputs, labels, masks, **kwargs)
+        else:
+            raise ValueError(f"unknown learning_rule '{self.learning_rule}'")
+
+        for name, p in self._trainable_params().items():
+            p.grad = grads[name].clone()
+        return grads

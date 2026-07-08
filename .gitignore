@@ -7,3 +7,7 @@ __pycache__/
 
 # Saved trained networks
 checkpoints/
+
+# Saved figures and their underlying plot data
+figure/
+figure_data/

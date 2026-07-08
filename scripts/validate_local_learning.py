@@ -19,6 +19,9 @@ Tiers (see the plan in the extension description):
           is an approximation, not accidentally exact).
   Tier 5  direct/instantaneous rule ('local_direct'): == BPTT at T=1 and at
           eta=0; grad_W == diagonal RFLO with A=0; an approximation otherwise.
+  Tier 6  deep-net input embedding (direct 3-factor): exact at eta=0, approximate
+          otherwise, reduces to the single-MP net when no embedding.
+  Tier 7  leaky RNN RFLO: == BPTT at W_rec=0; approximates otherwise (readout exact).
   Tier 4  the same claims on the REAL delaygo task (train_mpn config / pipeline):
           exact == BPTT, diagonal RFLO an appreciable approximation. This is the
           integration check (Tiers 1-3 use synthetic random tensors).
@@ -294,11 +297,14 @@ def tier5_direct_local():
 
 
 def tier4_real_task():
-    """Integration check on the ACTUAL train_mpn pipeline: real delaygo trials
-    (real seq length, cost masks) through the exact train_mpn net config. The
-    synthetic tiers use random tensors; this confirms the same claims hold on
-    the real task — exact == BPTT, diagonal RFLO is an appreciable approximation."""
-    print("── Tier 4: real delaygo task (train_mpn config) ────────────────────")
+    """Integration check on the ACTUAL train_mpn pipeline: real task trials (real
+    seq length, cost masks) through the exact train_mpn net config, which is now
+    a DeepMultiPlasticNet with a trainable input embedding. Confirms on the real
+    task: exact-MP == BPTT for the MP layer + readout, and diagonal RFLO is an
+    appreciable approximation (readout stays exact). The input embedding uses the
+    direct 3-factor rule (an approximation under all local rules), so W_in/b_in
+    are excluded from the exact==BPTT keys and characterized in Tier 6."""
+    print("── Tier 4: real task (train_mpn deep-MPN config) ───────────────────")
     try:
         import numpy as np
         import mpn_tasks
@@ -310,20 +316,27 @@ def tier4_real_task():
     np.random.seed(tm.SEED)
     torch.manual_seed(tm.SEED)
     task_params, train_params, net_params = tm.build_params()
+    # Correctness is size-independent; shrink hidden/embedding so long-sequence
+    # tasks (e.g. contextdelaydm1) fit under a tight memory ceiling. This still
+    # exercises the real task pipeline (real seq length, cost masks) end to end.
+    net_params["n_neurons"] = [net_params["n_neurons"][0], 24, net_params["n_neurons"][-1]]
+    net_params["linear_embed"] = 24
     task_params, train_params, net_params = mpn_tasks.convert_and_init_multitask_params(
         (task_params, train_params, net_params)
     )
     net_params["prefs"] = mpn_tasks.get_prefs(task_params["hp"])
-    # Smaller/faster than a full training batch; correctness is size-independent.
-    B = 16
-    net = mpn.MultiPlasticNet(net_params, verbose=False).double()
+    # Small batch too: the exact P-trace is (B, post, pre, pre).
+    B = 4
+    net = mpn.DeepMultiPlasticNet(net_params, verbose=False).double()
 
     data, _ = mpn_tasks.generate_trials_wrap(
         task_params, B, rules=task_params["rules"],
         mode_input="random_batch", device=torch.device("cpu"),
     )
     inp, lab, msk = (d.double() for d in data)
-    keys = grad_keys(net.mp_layer.layer_bias, net.b_output_active)
+    # MP-layer + readout keys where exact-local must equal BPTT (embedding is
+    # the direct 3-factor approximation, checked separately).
+    keys = grad_keys(net.mp_layers[0].layer_bias, net.b_output_active)
 
     ref = net.bptt_gradients(inp, lab, msk)
     exact = net.local_gradients(inp, lab, msk)
@@ -335,11 +348,113 @@ def tier4_real_task():
     diag_wout_rel = d_diag['W_output'][1]
     ok_diag = (diag_w_rel > 1e-3) and (diag_wout_rel < 1e-8)
 
-    print(f"  [{'PASS' if ok_exact else 'FAIL'}] exact == BPTT           "
+    print(f"  [{'PASS' if ok_exact else 'FAIL'}] exact MP+readout == BPTT   "
           f"{fmt(d_exact, keys)}")
-    print(f"  [{'PASS' if ok_diag else 'FAIL'}] diag RFLO approximates   "
+    print(f"  [{'PASS' if ok_diag else 'FAIL'}] diag RFLO approximates      "
           f"W:rel={diag_w_rel:.2e} (>1e-3)  W_output:rel={diag_wout_rel:.1e} (exact)")
     return ok_exact and ok_diag
+
+
+def tier6_deep_input_embedding():
+    """The deep net's trainable input embedding (W_in, b_in), direct 3-factor rule:
+      (a) eta=0 → exact-local == BPTT for ALL params incl. W_in/b_in (no M history).
+      (b) eta>0 → W_in is an approximation to BPTT, while the readout stays exact.
+      (c) with NO input layer, dmpn reduces to the single-MP net: exact == BPTT."""
+    print("── Tier 6: deep-net input embedding (direct 3-factor) ──────────────")
+
+    def build(seed, input_layer, trainable, eta):
+        torch.manual_seed(seed)
+        npar = {
+            'n_neurons': [6, 12, 3], 'loss_type': 'MSE', 'activation': 'tanh',
+            'output_bias': True, 'output_matrix': '', 'dt': 40,
+            'input_layer_add': input_layer, 'input_layer_add_trainable': trainable,
+            'linear_embed': 8, 'input_layer_bias': True,
+            'learning_rule': 'local_exact_rowlocal', 'feedback_mode': 'exact_readout',
+            'ml_params': {'bias': True, 'mp_type': 'mult', 'm_update_type': 'hebb_assoc',
+                          'm_activation': 'linear', 'modulation_bounds': False,
+                          'eta_type': 'scalar', 'eta_train': False, 'lam_type': 'scalar',
+                          'lam_train': False, 'm_time_scale': 400, 'W_freeze': False}}
+        net = mpn.DeepMultiPlasticNet(npar, verbose=False).double()
+        with torch.no_grad():
+            net.mp_layers[0].eta.fill_(eta)
+            net.mp_layers[0].lam.fill_(0.6 * net.mp_layers[0].lam_clamp)
+        return net
+
+    def data(B=4, T=10, n_in=6, n_out=3):
+        torch.manual_seed(0)
+        return (torch.randn(B, T, n_in), torch.randn(B, T, n_out), torch.rand(B, T, n_out))
+
+    allok = True
+
+    # (a) eta=0 → all params (incl. W_in, b_in) exact vs BPTT.
+    net = build(1, True, True, 0.0); inp, lab, msk = data()
+    ref, loc = net.bptt_gradients(inp, lab, msk), net.local_gradients(inp, lab, msk)
+    keys = [k for k in ref if k not in ('loss', 'outputs')]
+    ok_a, d_a = compare(loc, ref, keys)
+    allok &= ok_a
+    print(f"  [{'PASS' if ok_a else 'FAIL'}] eta=0 exact==BPTT (incl W_in) {fmt(d_a, keys)}")
+
+    # (b) eta>0 → W_in approximate, readout exact.
+    net = build(2, True, True, 0.12); inp, lab, msk = data()
+    ref, loc = net.bptt_gradients(inp, lab, msk), net.local_gradients(inp, lab, msk)
+    _, d_b = compare(loc, ref, ['W_in', 'W_output'])
+    ok_b = (d_b['W_in'][1] > 1e-3) and (d_b['W_output'][1] < 1e-8)
+    allok &= ok_b
+    print(f"  [{'PASS' if ok_b else 'FAIL'}] eta>0 W_in approximates       "
+          f"W_in:rel={d_b['W_in'][1]:.2e} (>1e-3)  W_output:rel={d_b['W_output'][1]:.1e} (exact)")
+
+    # (c) no input layer → reduces to single-MP net; exact == BPTT.
+    net = build(3, False, False, 0.12); inp, lab, msk = data()
+    ref, loc = net.bptt_gradients(inp, lab, msk), net.local_gradients(inp, lab, msk)
+    keys = [k for k in ref if k not in ('loss', 'outputs')]
+    ok_c, d_c = compare(loc, ref, keys)
+    allok &= ok_c
+    print(f"  [{'PASS' if ok_c else 'FAIL'}] no-embed exact==BPTT          {fmt(d_c, keys)}")
+    return allok
+
+
+def tier7_rnn_rflo():
+    """LeakyRNN RFLO ('local_diag_rflo') vs BPTT:
+      (a) W_rec=0 → RFLO == BPTT for ALL params (no recurrent credit to drop).
+      (b) W_rec!=0 → RFLO approximates (W_rec/W_input differ), readout exact."""
+    print("── Tier 7: leaky RNN RFLO (local_diag_rflo) ────────────────────────")
+    import rnn
+
+    def build(seed, zero_wrec=False):
+        torch.manual_seed(seed)
+        npar = {'n_neurons': [6, 12, 3], 'loss_type': 'MSE', 'activation': 'tanh',
+                'output_bias': True, 'hidden_bias': True, 'dt': 40, 'leaky': True,
+                'alpha': 0.8, 'learning_rule': 'local_diag_rflo',
+                'feedback_mode': 'exact_readout'}
+        net = rnn.LeakyRNN(npar, verbose=False).double()
+        if zero_wrec:
+            with torch.no_grad():
+                net.W_rec.zero_()
+        return net
+
+    def data(B=4, T=10, n_in=6, n_out=3):
+        torch.manual_seed(0)
+        return (torch.randn(B, T, n_in), torch.randn(B, T, n_out), torch.rand(B, T, n_out))
+
+    allok = True
+
+    # (a) W_rec = 0 → RFLO exact.
+    net = build(1, zero_wrec=True); inp, lab, msk = data()
+    ref, loc = net.bptt_gradients(inp, lab, msk), net.local_diag_rflo_gradients(inp, lab, msk)
+    keys = [k for k in ref if k not in ('loss', 'outputs')]
+    ok_a, d_a = compare(loc, ref, keys)
+    allok &= ok_a
+    print(f"  [{'PASS' if ok_a else 'FAIL'}] W_rec=0 RFLO==BPTT           {fmt(d_a, keys)}")
+
+    # (b) W_rec != 0 → approximation; readout exact.
+    net = build(2); inp, lab, msk = data()
+    ref, loc = net.bptt_gradients(inp, lab, msk), net.local_diag_rflo_gradients(inp, lab, msk)
+    _, d_b = compare(loc, ref, ['W_rec', 'W_output'])
+    ok_b = (d_b['W_rec'][1] > 1e-3) and (d_b['W_output'][1] < 1e-8)
+    allok &= ok_b
+    print(f"  [{'PASS' if ok_b else 'FAIL'}] W_rec!=0 RFLO approximates   "
+          f"W_rec:rel={d_b['W_rec'][1]:.2e} (>1e-3)  W_output:rel={d_b['W_output'][1]:.1e} (exact)")
+    return allok
 
 
 def main():
@@ -351,6 +466,8 @@ def main():
         tier3_diag_matches_zeroed_reference(),
         extra_diag_differs_from_bptt(),
         tier5_direct_local(),
+        tier6_deep_input_embedding(),
+        tier7_rnn_rflo(),
         tier4_real_task(),
     ]
     print("\n" + ("ALL CHECKS PASSED" if all(results) else "SOME CHECKS FAILED"))
