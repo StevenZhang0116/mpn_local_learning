@@ -1069,10 +1069,21 @@ class MultiPlasticNet(MultiPlasticNetBase):
 
 class DeepMultiPlasticNet(MultiPlasticNetBase):
     """
-    N-layer feedforward setup, with N-1 multi-plastic layers followed by a single readout layer.
+    N-layer feedforward setup: an optional trainable input embedding, then one or
+    more multi-plastic layers stacked in sequence, followed by a single readout
+    layer, i.e.
+        u -> [W_initial_linear, act] -> [MP_1] -> [MP_2] -> ... -> [W_output] -> y
+    The number of MP layers is len(n_neurons) - 2 (one per hidden width); pass
+    n_neurons=[in, h1, h2, out] for two MP layers, etc.
+
+    BPTT (bptt_gradients / sequence_gradients with learning_rule='bptt') supports
+    ANY number of MP layers — it is autograd through the unrolled forward, which
+    already iterates over self.mp_layers. The local rules (local_*) currently
+    support exactly one MP layer (they lack the inter-layer learning-signal
+    back-projection a deeper stack would need); they assert this.
     """
 
-    def __init__(self, net_params, verbose=False, forzihan=True):
+    def __init__(self, net_params, verbose=False):
         cfg = copy.deepcopy(net_params)
 
         # Mar 16th: add input layer
@@ -1164,11 +1175,10 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
         self.mp_layers = []
 
         start_layer_count = 1 if self.input_layer_active else 0
-        # if additional input layer is added, shift the starting index of layer counting from 1
-        for mpl_idx in range(start_layer_count, n_layers - 1): # (e.g. three-layer has two MP layers)
-            if forzihan:
-                assert n_layers - 1 - start_layer_count == 1, "2025-10-29: One-Layer MPN Now"
-
+        # if additional input layer is added, shift the starting index of layer counting from 1.
+        # One MP layer per hidden width: range below yields len(n_neurons) - 2 layers
+        # (e.g. n_neurons=[in, h1, h2, out] -> two MP layers).
+        for mpl_idx in range(start_layer_count, n_layers - 1):
             ml_key = f'ml_params{mpl_idx}' if f'ml_params{mpl_idx}' in cfg else 'ml_params'
             # Updates some parameters for each new MPL
             cfg[ml_key]['dt'] = self.dt
@@ -1264,29 +1274,37 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
 
     # ─── Learning rules for the single-MP-layer deep net (+ optional input embed) ──
     # Mirrors MultiPlasticNet's rule suite for the architecture
-    #     u -> [W_initial_linear, act] -> x -> [MP: W, M] -> h -> [W_output] -> y
-    # which is directly comparable to the RNN (input -> hidden -> output), with the
-    # plastic M playing the role the RNN's recurrence plays. Requires exactly one
-    # MP layer (the forzihan config). BPTT trains ALL params (incl. the input
-    # embedding) exactly via autograd; the local rules train the MP layer with
-    # eligibility traces and the input embedding with a DIRECT 3-factor rule
-    # (backproject the hidden learning signal through the modulated weights, then
-    # multiply by the embedding activation derivative and the raw input — the RNN's
-    # RFLO treatment of its input weights; M-mediated history is dropped).
+    #   u -> [W_initial_linear, act] -> x -> [MP_1] -> ... -> [MP_k] -> [W_output] -> y
+    # For k == 1 this is directly comparable to the RNN (input -> hidden -> output),
+    # with the plastic M playing the role the RNN's recurrence plays.
+    # BPTT trains ALL params (every MP layer + the input embedding) exactly via
+    # autograd through the unrolled forward, for ANY number of MP layers. The local
+    # rules train the (single) MP layer with eligibility traces and the input
+    # embedding with a DIRECT 3-factor rule (backproject the hidden learning signal
+    # through the modulated weights, then multiply by the embedding activation
+    # derivative and the raw input — the RNN's RFLO treatment of its input weights;
+    # M-mediated history is dropped) and support exactly one MP layer.
 
     def _assert_single_mp(self):
-        assert len(self.mp_layers) == 1, \
-            "deep-net learning rules support exactly one MP layer (forzihan config)"
+        assert len(self.mp_layers) == 1, (
+            "the local learning rules support exactly one MP layer; use "
+            "learning_rule='bptt' for a multi-MP-layer stack.")
 
     def _has_trainable_embed(self):
         return (self.input_layer_active and self.W_initial_linear.weight.requires_grad)
 
     def _trainable_params(self):
-        """Trainable tensors this net computes gradients for, keyed by name."""
-        mp = self.mp_layers[0]
-        ps = {'W': mp.W, 'W_output': self.W_output}
-        if mp.layer_bias:
-            ps['b'] = mp.b
+        """Trainable tensors this net computes gradients for, keyed by name.
+        The first MP layer keeps the bare keys 'W'/'b' (back-compat with the
+        single-MP-layer local rules and validate); any further MP layers are keyed
+        'W{j}'/'b{j}' by their position j in self.mp_layers. Readout is 'W_output'/
+        'b_output'; the optional trainable input embedding is 'W_in'/'b_in'."""
+        ps = {'W_output': self.W_output}
+        for j, mp in enumerate(self.mp_layers):
+            suffix = '' if j == 0 else str(j)
+            ps[f'W{suffix}'] = mp.W
+            if mp.layer_bias:
+                ps[f'b{suffix}'] = mp.b
         if self.b_output_active:
             ps['b_output'] = self.b_output
         if self.input_layer_active:
@@ -1298,8 +1316,8 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
     def bptt_gradients(self, inputs, labels, masks,
                        loss_and_grad=masked_mse_loss_and_output_grad):
         """Full BPTT via autograd through the unrolled deep forward + M-update.
-        Trains every parameter (input embedding included) exactly."""
-        self._assert_single_mp()
+        Trains every parameter (all MP layers + the input embedding) exactly, for
+        any number of MP layers."""
         B, T, _ = inputs.shape
         self.reset_state(B=B)
         outs = []

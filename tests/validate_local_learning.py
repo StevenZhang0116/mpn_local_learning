@@ -29,7 +29,7 @@ Tiers (see the plan in the extension description):
           integration check (Tiers 1-3 use synthetic random tensors).
 
 Runs in float64 for a tight tolerance.
-Run from this directory:  python validate_local_learning.py
+Run from this directory (mpn_local_learning/tests):  python validate_local_learning.py
 """
 import torch
 
@@ -317,6 +317,10 @@ def tier4_real_task():
 
     np.random.seed(tm.SEED)
     torch.manual_seed(tm.SEED)
+    # Tier 4 is the MULTITASK (ring-task) integration check, so pin a ring task
+    # here regardless of train_mpn's current default RULESET (which may be a
+    # non-ring task like seq-MNIST that generate_trials_wrap doesn't handle).
+    tm.RULESET = "delaygo"
     task_params, train_params, net_params = tm.build_params()
     # Correctness is size-independent; shrink hidden/embedding so long-sequence
     # tasks (e.g. contextdelaydm1) fit under a tight memory ceiling. This still

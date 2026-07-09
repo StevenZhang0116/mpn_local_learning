@@ -30,6 +30,7 @@ import torch
 
 import _bootstrap  # prepends ../core + ../scripts to sys.path; exposes ROOT
 import rnn
+import tasks
 import train_common as tc
 
 # ─── Configuration (mirrors train_mpn.py) ─────────────────────────────────────
@@ -141,6 +142,9 @@ def _cfg():
         net_factory=lambda np_, verbose: rnn.LeakyRNN(np_, verbose=verbose),
         # LeakyRNN has its own no-grad forward for held-out evaluation.
         eval_outputs=lambda net, inputs: net.forward_outputs(inputs),
+        task=tasks.make_task(RULESET),
+        acc_label=tasks.acc_label_for(RULESET),
+        metric=tasks.metric_for(RULESET),
     )
 
 

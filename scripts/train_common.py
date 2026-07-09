@@ -20,6 +20,7 @@ globals like N_HIDDEN before calling ckpt_path/build_params) and delegates:
 import copy
 import gc
 import os
+import time
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -30,7 +31,7 @@ import matplotlib
 matplotlib.use("Agg")  # headless: write PNG, no display
 import matplotlib.pyplot as plt
 
-import mpn_tasks
+import tasks  # Task adapters (data/metric seam); make_task(ruleset) picks one
 from mpn import masked_mse_loss_and_output_grad  # one shared masked-MSE definition
 
 
@@ -68,9 +69,20 @@ class RunConfig:
     build_params: Callable      # () -> (task_params, train_params, net_params)
     net_factory: Callable       # (net_params, verbose) -> net
     eval_outputs: Callable      # (net, inputs) -> outputs (B, T, n_output), no grad
+    # Task adapter (the data/metric seam): provides init_params / valid_batch /
+    # train_batch / accuracy. Defaults to None, resolved to tasks.make_task(ruleset)
+    # in run_seed so callers that don't set it keep the ring-task behaviour.
+    task: object = None
     # optional extra string appended to the filename param tag (e.g. eta/lambda);
     # keep it filename-safe. Empty by default.
     tag_extra: str = ""
+    # y-axis label for the plotted panels (task-dependent: accuracy label for the
+    # ring tasks / seq-MNIST, loss label for the adding problem).
+    acc_label: str = "angle accuracy (%)"
+    # Which curve the figure shows: 'accuracy' (percent, 0-110 y) or 'loss'
+    # (masked-MSE, log-y). Regression tasks like the adding problem use 'loss'
+    # because accuracy is uninformative there. Accuracy is always logged either way.
+    metric: str = "accuracy"
 
 
 # ─── Path helpers (read the passed cfg, i.e. the caller's live globals) ───────
@@ -95,13 +107,12 @@ def ckpt_path(cfg, rule, seed):
 
 
 # ─── Training pieces ──────────────────────────────────────────────────────────
-def try_accuracy(net, output, labels, mask, inputs, isvalid=False):
-    """Best-effort angle accuracy via the library; returns nan on failure.
-    train uses isvalid=False (current batch), validation isvalid=True."""
+def try_accuracy(task, net, output, labels, mask, inputs, isvalid=False):
+    """Accuracy via the task adapter; returns nan on failure. train uses
+    isvalid=False (current batch), validation isvalid=True. The task decides the
+    metric (angle for ring tasks, argmax-correct for seq-MNIST)."""
     try:
-        acc, _ = net.compute_acc(output.float(), labels.float(), mask.float(),
-                                 inputs.float(), mode=net.acc_measure, isvalid=isvalid)
-        return float(acc)
+        return float(task.accuracy(net, output, labels, mask, inputs, isvalid=isvalid))
     except Exception:
         return float("nan")
 
@@ -122,11 +133,12 @@ def run_seed(cfg, seed, record_steps):
     np.random.seed(seed)
     torch.manual_seed(seed)
 
+    # Task adapter (data/metric seam). Defaults to the ring-task pipeline.
+    task = cfg.task if cfg.task is not None else tasks.make_task(cfg.ruleset)
+
     task_params, train_params, net_params = cfg.build_params()
-    task_params, train_params, net_params = mpn_tasks.convert_and_init_multitask_params(
-        (task_params, train_params, net_params)
-    )
-    net_params["prefs"] = mpn_tasks.get_prefs(task_params["hp"])
+    task_params, train_params, net_params = task.init_params(
+        task_params, train_params, net_params)
 
     # One base net → deepcopy so every rule starts from the SAME weights.
     base = cfg.net_factory(net_params, seed == cfg.seed).to(cfg.device).to(cfg.dtype)
@@ -138,27 +150,40 @@ def run_seed(cfg, seed, record_steps):
         optims[rule] = make_optim(net, cfg.lr)
 
     # Held-out validation set, generated ONCE and shared across rules.
-    vdata, _ = mpn_tasks.generate_trials_wrap(
-        task_params, train_params["valid_n_batch"], rules=task_params["rules"],
-        mode_input="random_batch", device=cfg.device,
-    )
-    v_inputs, v_labels, v_mask = (d.to(cfg.dtype) for d in vdata)
+    v_inputs, v_labels, v_mask = task.valid_batch(
+        task_params, train_params, cfg.device, cfg.dtype)
 
     curves = {r: {"train": [], "valid": []} for r in cfg.rules_to_run}
     record_set = set(record_steps)
 
+    # Aligned log table: one header per seed, then one row per rule per recorded
+    # step (see the print block below). label_w keeps the rule column aligned.
+    label_w = max(len(cfg.rule_label.get(r, r)) for r in cfg.rules_to_run)
+    print(f"  seed {seed}:")
+    print(f"    {'step':>6}  {'rule':<{label_w}}   {'acc tr':>7} {'acc va':>7}   "
+          f"{'loss tr':>9} {'loss va':>9}   {'lr':>7}   {'ms/step':>8}")
+
+    # Accumulate the training-update wall time per rule so we can report the mean
+    # ms/step over each logging window (single-step timings are too noisy). Timed
+    # region = the training update only (sequence_gradients + clip + opt.step),
+    # NOT the shared held-out eval — that is what differs across rules.
+    t_accum = {r: 0.0 for r in cfg.rules_to_run}   # seconds since last record
+    n_accum = 0                                    # steps since last record
+
     for step in range(cfg.n_datasets):
         # One batch, generated once and fed identically to every rule.
-        data, _ = mpn_tasks.generate_trials_wrap(
-            task_params, cfg.batch, rules=task_params["rules"],
-            mode_input="random_batch", device=cfg.device,
-        )
-        inputs, labels, mask = (d.to(cfg.dtype) for d in data)
+        inputs, labels, mask = task.train_batch(
+            task_params, train_params, cfg.batch, cfg.device, cfg.dtype)
 
         step_log = {}  # per-rule (train_loss, valid_loss, lr) for this step's log line
         for rule in cfg.rules_to_run:
             net = nets[rule]
             trainable, opt, sch = optims[rule]
+
+            # Time the training update only (the part that differs across rules).
+            if cfg.device.type == "cuda":
+                torch.cuda.synchronize()
+            t0 = time.perf_counter()
             opt.zero_grad()
             grads = net.sequence_gradients(inputs, labels, mask)
             if cfg.grad_clip is not None:
@@ -166,6 +191,9 @@ def run_seed(cfg, seed, record_steps):
             opt.step()
             if net.param_clamping:
                 net.param_clamp()
+            if cfg.device.type == "cuda":
+                torch.cuda.synchronize()
+            t_accum[rule] += time.perf_counter() - t0
 
             # Held-out validation loss on the UPDATED net drives the scheduler
             # (as in one_task.py) — smoother than the fresh per-batch train loss.
@@ -174,24 +202,39 @@ def run_seed(cfg, seed, record_steps):
             sch.step(v_loss.item())
 
             if step in record_set:
-                train_acc = try_accuracy(net, grads["outputs"], labels, mask,
+                train_acc = try_accuracy(task, net, grads["outputs"], labels, mask,
                                          inputs, isvalid=False)
-                valid_acc = try_accuracy(net, v_out, v_labels, v_mask, v_inputs,
+                valid_acc = try_accuracy(task, net, v_out, v_labels, v_mask, v_inputs,
                                          isvalid=True)
-                curves[rule]["train"].append(train_acc)
-                curves[rule]["valid"].append(valid_acc)
-                # grads['loss'] is the masked-MSE training loss for this batch;
-                # lr is the current (post-scheduler) learning rate for this rule.
-                step_log[rule] = (float(grads["loss"]), float(v_loss),
+                train_loss, valid_loss = float(grads["loss"]), float(v_loss)
+                # curves hold the PLOTTED metric (accuracy or loss); the console
+                # log below always shows both. lr is the current (post-scheduler) lr.
+                if cfg.metric == "loss":
+                    curves[rule]["train"].append(train_loss)
+                    curves[rule]["valid"].append(valid_loss)
+                else:
+                    curves[rule]["train"].append(train_acc)
+                    curves[rule]["valid"].append(valid_acc)
+                step_log[rule] = (train_acc, valid_acc, train_loss, valid_loss,
                                   opt.param_groups[0]["lr"])
 
+        n_accum += 1   # one more timed step since the last log line
+
         if step in record_set:
-            msg = "  ".join(
-                f"{cfg.rule_label[r]}: acc tr={curves[r]['train'][-1]:.3f} "
-                f"va={curves[r]['valid'][-1]:.3f} | loss tr={step_log[r][0]:.3e} "
-                f"va={step_log[r][1]:.3e} | lr={step_log[r][2]:.1e}"
-                for r in cfg.rules_to_run)
-            print(f"  seed {seed} step {step:>5}   {msg}")
+            # One aligned row per rule under this step (step shown once, then blank
+            # so rules for the same step read as a group). Always show both acc and
+            # loss, plus the mean ms per training update over this logging window
+            # (averaged over n_accum steps to smooth single-step jitter).
+            for i, r in enumerate(cfg.rules_to_run):
+                step_col = f"{step:>6}" if i == 0 else " " * 6
+                tr_acc, va_acc, tr_loss, va_loss, lr = step_log[r]
+                ms = 1000.0 * t_accum[r] / max(n_accum, 1)
+                print(f"    {step_col}  {cfg.rule_label.get(r, r):<{label_w}}   "
+                      f"{tr_acc:>7.3f} {va_acc:>7.3f}   "
+                      f"{tr_loss:>9.3e} {va_loss:>9.3e}   {lr:>7.1e}   {ms:>8.1f}")
+            # Reset the window accumulators after logging.
+            t_accum = {r: 0.0 for r in cfg.rules_to_run}
+            n_accum = 0
 
     # Save each trained network (per rule) so it can be reloaded later. Stores
     # state_dict + net_params (as in one_task.py) plus rule/seed metadata.
@@ -217,27 +260,33 @@ def run_seed(cfg, seed, record_steps):
 
 # ─── Plotting / persistence ───────────────────────────────────────────────────
 def plot(cfg, record_steps, agg, rules, title_suffix, save_to):
-    """One figure, two panels (train / test accuracy), each rule mean ± std.
-    Driven purely by the passed arrays so it works both live and from a reloaded
-    .npz (replot_from_npz)."""
+    """One figure, two panels (train / test), each rule mean ± std. The plotted
+    metric follows cfg.metric: 'accuracy' → percent, linear 0-110 y; 'loss' →
+    masked-MSE, log y. Driven purely by the passed arrays so it works both live
+    and from a reloaded .npz (replot_from_npz)."""
+    metric = getattr(cfg, "metric", "accuracy")
+    is_loss = (metric == "loss")
+    scale = 1.0 if is_loss else 100.0     # accuracy stored as fraction → percent
     steps = np.asarray(record_steps)
+    noun = "loss" if is_loss else "accuracy"
     fig, axes = plt.subplots(1, 2, figsize=(12, 4.5), sharey=True)
     for ax, split, title in zip(axes, ("train", "valid"),
-                                ("Training accuracy", "Testing (held-out) accuracy")):
+                                (f"Training {noun}", f"Testing (held-out) {noun}")):
         for rule in rules:
-            # Accuracy is stored as a fraction in [0, 1]; plot as percent so a
-            # fully-solved task (100%) sits below the 110 upper bound.
-            mean = 100.0 * np.asarray(agg[rule][split]["mean"])
-            std = 100.0 * np.asarray(agg[rule][split]["std"])
+            mean = scale * np.asarray(agg[rule][split]["mean"])
+            std = scale * np.asarray(agg[rule][split]["std"])
             color = cfg.rule_color.get(rule, None)
             ax.plot(steps, mean, color=color, label=cfg.rule_label.get(rule, rule), lw=2)
             ax.fill_between(steps, mean - std, mean + std, color=color, alpha=0.2)
         ax.set_title(title)
         ax.set_xlabel("training step")
         ax.grid(alpha=0.3)
-        ax.set_ylim(0, 110)
-    axes[0].set_ylabel("angle accuracy (%)")
-    axes[1].legend(loc="lower right", frameon=False)
+        if is_loss:
+            ax.set_yscale("log")          # loss spans orders of magnitude
+        else:
+            ax.set_ylim(0, 110)
+    axes[0].set_ylabel(getattr(cfg, "acc_label", "angle accuracy (%)"))
+    axes[1].legend(loc="best" if is_loss else "lower right", frameon=False)
     fig.suptitle(f"{cfg.title}  {title_suffix}")
     fig.tight_layout()
     os.makedirs(os.path.dirname(save_to), exist_ok=True)
@@ -259,6 +308,8 @@ def save_plot_data(cfg, record_steps, runs, agg, path=None):
         "ruleset": cfg.ruleset, "n_hidden": cfg.n_hidden, "batch": cfg.batch,
         "n_datasets": cfg.n_datasets, "lr": cfg.lr, "n_runs": cfg.n_runs,
         "feedback_mode": cfg.feedback_mode, "title": cfg.title,
+        # what the stored curves represent, so replot renders the right axes
+        "metric": cfg.metric, "acc_label": cfg.acc_label,
     }
     for r in cfg.rules_to_run:
         for split in ("train", "valid"):
@@ -281,11 +332,14 @@ def replot_from_npz(cfg, npz_path, save_to=None):
                for sp in ("train", "valid")} for r in rules}
     suffix = (f"(mean ± std over {int(d['n_runs'])} runs, "
               f"hidden={int(d['n_hidden'])})")
-    # Prefer the title saved with the data; fall back to cfg.title.
-    cfg_for_plot = cfg
+    # Prefer the title / metric / label saved with the data; fall back to cfg.
+    cfg_for_plot = copy.copy(cfg)
     if "title" in d.files:
-        cfg_for_plot = copy.copy(cfg)
         cfg_for_plot.title = str(d["title"])
+    if "metric" in d.files:
+        cfg_for_plot.metric = str(d["metric"])
+    if "acc_label" in d.files:
+        cfg_for_plot.acc_label = str(d["acc_label"])
     save_to = save_to or (os.path.splitext(str(npz_path))[0] + "_replot.png")
     plot(cfg_for_plot, record_steps, agg, rules, suffix, save_to)
     return save_to
@@ -326,10 +380,13 @@ def run_experiment(cfg):
     plot(cfg, record_steps, agg, cfg.rules_to_run,
          f"(mean ± std over {cfg.n_runs} runs, hidden={cfg.n_hidden})", fig_path(cfg))
 
-    # Final-accuracy summary.
-    print("\nFinal accuracy (mean ± std over runs):")
+    # Final-metric summary (the plotted metric: accuracy or loss).
+    metric_noun = "loss" if cfg.metric == "loss" else "accuracy"
+    fmt = "{:.3e}" if cfg.metric == "loss" else "{:.3f}"
+    print(f"\nFinal {metric_noun} (mean ± std over runs):")
     for r in cfg.rules_to_run:
         tr = agg[r]["train"]; va = agg[r]["valid"]
-        print(f"  {cfg.rule_label.get(r, r):<16} train {tr['mean'][-1]:.3f} ± {tr['std'][-1]:.3f}"
-              f"   test {va['mean'][-1]:.3f} ± {va['std'][-1]:.3f}")
+        print(f"  {cfg.rule_label.get(r, r):<16} "
+              f"train {fmt.format(tr['mean'][-1])} ± {fmt.format(tr['std'][-1])}"
+              f"   test {fmt.format(va['mean'][-1])} ± {fmt.format(va['std'][-1])}")
     return agg

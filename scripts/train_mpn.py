@@ -46,11 +46,12 @@ import torch
 
 import _bootstrap  # prepends ../core + ../scripts to sys.path; exposes ROOT
 import mpn
+import tasks
 import train_common as tc
 
 # ─── Configuration (aligned with MultiTaskMPN/one_task/one_task.py) ───────────
 SEED = 42
-RULESET = "contextdelaydm1"           # single task to train on
+RULESET = "seqmnist_pixel"           # single task to train on
 # Network: 'dmpn' = DeepMultiPlasticNet (trainable input embedding + MP layer,
 # RNN-comparable); 'mpn1' = MultiPlasticNet (single MP layer, no embedding).
 # Overridable with --net on the command line (see main()).
@@ -230,6 +231,9 @@ def _cfg():
         build_params=build_params,
         net_factory=lambda np_, verbose: net_cls(np_, verbose=verbose),
         eval_outputs=forward_outputs,
+        task=tasks.make_task(RULESET),
+        acc_label=tasks.acc_label_for(RULESET),
+        metric=tasks.metric_for(RULESET),
         tag_extra=_eta_lam_tag(),
     )
 
