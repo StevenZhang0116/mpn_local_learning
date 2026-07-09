@@ -35,7 +35,7 @@ import train_common as tc
 
 # ─── Configuration (mirrors train_mpn.py) ─────────────────────────────────────
 SEED = 42
-RULESET = "contextdelaydm1"           # single task to train on
+RULESET = "seqmnist_pixel"           # single task to train on
 RULES_TO_RUN = ["bptt", "local_diag_rflo"]   # rules to compare
 FEEDBACK_MODE = "exact_readout"   # 'exact_readout' or 'random_fixed' (feedback align)
 N_RUNS = 3                    # independent seeds per rule
