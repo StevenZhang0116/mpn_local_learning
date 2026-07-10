@@ -46,6 +46,7 @@ import torch
 
 import _bootstrap  # prepends ../core + ../scripts to sys.path; exposes ROOT
 import mpn
+import mpn_revise
 import tasks
 import train_common as tc
 
@@ -56,6 +57,16 @@ RULESET = "seqmnist_pixel"           # single task to train on
 # RNN-comparable); 'mpn1' = MultiPlasticNet (single MP layer, no embedding).
 # Overridable with --net on the command line (see main()).
 NET_TYPE = "dmpn"
+# Network implementation: True → core/mpn_revise.py (the efficiency-optimized
+# version: fused local rules, ~2× local_direct / ~1.6× local_diag_rflo / ~1.4×
+# BPTT, results identical to mpn.py up to float round-off — verified by
+# tests/test_mpn_revise.py). False → core/mpn.py (the reference implementation).
+USE_FAST_MPN = True
+# Tier-B: torch.compile the fused local per-step core (direct/diag, hebb_assoc)
+# in mpn_revise. Off by default (compilation has warm-up cost and needs a working
+# GPU compiler); flip on for long-unroll GPU runs where the fusion pays off. Only
+# meaningful when USE_FAST_MPN is True. Overridable with --compile-local.
+COMPILE_LOCAL = False
 RULES_TO_RUN = ["bptt", "local_diag_rflo", "local_direct"]   # rules to compare
 FEEDBACK_MODE = "exact_readout"   # 'exact_readout' or 'random_fixed' (feedback align)
 N_RUNS = 3                    # independent seeds per rule
@@ -170,17 +181,25 @@ def build_params():
     return task_params, train_params, net_params
 
 
+def _mpn():
+    """The active MPN implementation module: mpn_revise (fast) if USE_FAST_MPN
+    else mpn (reference). Both expose the same classes / API."""
+    return mpn_revise if USE_FAST_MPN else mpn
+
+
 @torch.no_grad()
 def forward_outputs(net, inputs):
     """Unrolled forward over time (no grad), returning outputs (B, T, n_output),
     for evaluating the held-out validation set. Works for both net types:
     DeepMultiPlasticNet.network_step runs the full forward (embedding + MP layer)
     and returns 3 values; MultiPlasticNet's returns 2, so drive its mp_layer
-    directly (the library's iterate_sequence_batch can't unpack the 2-tuple)."""
+    directly (the library's iterate_sequence_batch can't unpack the 2-tuple).
+    Branch on the deep-net class from EITHER module so it works whichever
+    implementation built the net (mpn or mpn_revise)."""
     B, T, _ = inputs.shape
     net.reset_state(B=B)
     outs = []
-    if isinstance(net, mpn.DeepMultiPlasticNet):
+    if isinstance(net, (mpn.DeepMultiPlasticNet, mpn_revise.DeepMultiPlasticNet)):
         for t in range(T):
             out, _, _ = net.network_step(inputs[:, t, :], seq_idx=t)
             outs.append(out)
@@ -196,8 +215,10 @@ def forward_outputs(net, inputs):
 
 
 def _net_class():
-    """The network class selected by NET_TYPE."""
-    return mpn.DeepMultiPlasticNet if NET_TYPE == "dmpn" else mpn.MultiPlasticNet
+    """The network class selected by NET_TYPE, from the active implementation
+    module (mpn_revise if USE_FAST_MPN else mpn)."""
+    m = _mpn()
+    return m.DeepMultiPlasticNet if NET_TYPE == "dmpn" else m.MultiPlasticNet
 
 
 def _eta_lam_tag():
@@ -216,6 +237,8 @@ def _cfg():
     """Package the current module globals + MPN-specific hooks into a RunConfig.
     Built fresh on each call so notebooks/validate/--net can override globals
     (e.g. NET_TYPE, N_HIDDEN, FEEDBACK_MODE) before any path/build helper below."""
+    # Apply the Tier-B compile toggle to the fast impl (no-op unless USE_FAST_MPN).
+    mpn_revise.set_compile_local(COMPILE_LOCAL and USE_FAST_MPN)
     net_cls = _net_class()
     desc = "deep MPN" if NET_TYPE == "dmpn" else "MPN"
     # NET_TYPE is part of the prefix so dmpn/mpn1 runs don't overwrite each other.
@@ -253,8 +276,9 @@ def load_net(path, device=None, dtype=DTYPE):
     and learning_rule restored.  Example:  net = load_net(ckpt_path('bptt', 42))"""
     device = device or DEVICE
     ckpt = torch.load(path, map_location=device, weights_only=False)
-    net_cls = (mpn.DeepMultiPlasticNet if ckpt["net_params"].get("net_type") == "dmpn"
-               else mpn.MultiPlasticNet)
+    m = _mpn()  # active implementation (mpn_revise if USE_FAST_MPN else mpn)
+    net_cls = (m.DeepMultiPlasticNet if ckpt["net_params"].get("net_type") == "dmpn"
+               else m.MultiPlasticNet)
     net = net_cls(ckpt["net_params"], verbose=False).to(device).to(dtype)
     net.load_state_dict(ckpt["state_dict"])
     net.learning_rule = ckpt.get("learning_rule", net.learning_rule)
@@ -274,11 +298,19 @@ def _parse_args():
     p.add_argument("--steps", type=int, default=N_DATASETS, help="training batches")
     p.add_argument("--feedback", choices=["exact_readout", "random_fixed"],
                    default=FEEDBACK_MODE, help="hidden learning-signal feedback")
+    p.add_argument("--impl", choices=["fast", "ref"],
+                   default="fast" if USE_FAST_MPN else "ref",
+                   help="MPN implementation: fast=mpn_revise (optimized), "
+                        "ref=mpn (reference). Default: %(default)s.")
+    p.add_argument("--compile-local", action="store_true", default=COMPILE_LOCAL,
+                   help="torch.compile the fused local per-step core (direct/diag, "
+                        "hebb_assoc) in the fast impl. Default: %(default)s.")
     return p.parse_args()
 
 
 def main():
     global NET_TYPE, RULESET, N_RUNS, N_HIDDEN, N_DATASETS, FEEDBACK_MODE
+    global USE_FAST_MPN, COMPILE_LOCAL
     args = _parse_args()
     NET_TYPE = args.net
     RULESET = args.task
@@ -286,6 +318,8 @@ def main():
     N_HIDDEN = args.hidden
     N_DATASETS = args.steps
     FEEDBACK_MODE = args.feedback
+    USE_FAST_MPN = (args.impl == "fast")
+    COMPILE_LOCAL = args.compile_local
     tc.run_experiment(_cfg())
 
 
