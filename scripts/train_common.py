@@ -76,6 +76,17 @@ class RunConfig:
     # optional extra string appended to the filename param tag (e.g. eta/lambda);
     # keep it filename-safe. Empty by default.
     tag_extra: str = ""
+    # Architecture fragment for filenames (figure / data / checkpoint). When set,
+    # it REPLACES the default single-scalar "h{n_hidden}" fragment in param_tag, so
+    # a multi-MP-layer / embedding stack is distinguishable on disk (e.g.
+    # "e200-h150-100" for a 200-wide embedding then MP 200->150->100). Leave empty
+    # (the default) to keep the historical "h{n_hidden}" name byte-for-byte — a
+    # single-hidden run's filenames are then unchanged. Keep it filename-safe.
+    arch_tag: str = ""
+    # Human-readable architecture for the figure title / suffix and .npz provenance
+    # (e.g. "arch=[20, 200, 150, 100, 3]"). Empty → the suffix falls back to
+    # "hidden={n_hidden}" as before.
+    arch_desc: str = ""
     # y-axis label for the plotted panels (task-dependent: accuracy label for the
     # ring tasks / seq-MNIST, loss label for the adding problem).
     acc_label: str = "angle accuracy (%)"
@@ -83,11 +94,21 @@ class RunConfig:
     # (masked-MSE, log-y). Regression tasks like the adding problem use 'loss'
     # because accuracy is uninformative there. Accuracy is always logged either way.
     metric: str = "accuracy"
+    # At each recorded step, also log the per-weight-matrix cosine similarity
+    # between every non-BPTT rule's gradient and the TRUE BPTT gradient at the same
+    # weights (a "how well does this local rule align with the exact gradient?"
+    # diagnostic). Costs one extra BPTT pass per local rule per recorded step
+    # (record steps only, not every step), timed OUTSIDE the fwd/bwd/opt readout.
+    log_grad_align: bool = True
 
 
 # ─── Path helpers (read the passed cfg, i.e. the caller's live globals) ───────
 def param_tag(cfg):
-    tag = (f"{cfg.ruleset}_h{cfg.n_hidden}_b{cfg.batch}_n{cfg.n_datasets}"
+    # Architecture fragment: cfg.arch_tag if provided (multi-layer stacks), else
+    # the historical single-scalar "h{n_hidden}" (so single-hidden filenames are
+    # unchanged byte-for-byte).
+    arch = cfg.arch_tag if getattr(cfg, "arch_tag", "") else f"h{cfg.n_hidden}"
+    tag = (f"{cfg.ruleset}_{arch}_b{cfg.batch}_n{cfg.n_datasets}"
            f"_lr{cfg.lr:.0e}_{cfg.feedback_mode}")
     if cfg.tag_extra:
         tag += f"_{cfg.tag_extra}"
@@ -104,6 +125,88 @@ def data_path(cfg):
 
 def ckpt_path(cfg, rule, seed):
     return os.path.join(cfg.ckpt_dir, f"{cfg.ckpt_prefix}_{param_tag(cfg)}_{rule}_seed{seed}.pt")
+
+
+def arch_suffix(cfg):
+    """Architecture note for the figure title/suffix: the full stack when known
+    (cfg.arch_desc), else the historical single scalar 'hidden={n_hidden}'."""
+    return cfg.arch_desc if getattr(cfg, "arch_desc", "") else f"hidden={cfg.n_hidden}"
+
+
+# ─── Gradient-alignment diagnostic (local rule vs exact BPTT) ─────────────────
+# Which weight matrices to report alignment for, in log order. Keys match the
+# gradient dicts from sequence_gradients / bptt_gradients. Biases (keys starting
+# 'b') are intentionally skipped. Handles both models:
+#   MPN — 'W_in' (dmpn input embedding), 'W'/'W1'/'W2'/... (each MP layer's plastic
+#         weight; layer 0 is the bare 'W'), 'W_output' (readout).
+#   RNN — 'W_input', 'W_rec', 'W_output'.
+def _grad_align_keys(grad_dict):
+    """Weight-matrix keys present in grad_dict, ordered input → hidden → output.
+    Every key starting with 'W' (biases 'b*' and 'loss'/'outputs' skipped)."""
+    w_keys = [k for k in grad_dict if k.startswith("W")]
+
+    def order(k):
+        # input-side first, output last, hidden weights (incl numbered MP layers
+        # and W_rec) in the middle by their numeric suffix (bare 'W' → 0).
+        if k in ("W_in", "W_input"):
+            return (0, 0, k)
+        if k == "W_output":
+            return (2, 0, k)
+        if k == "W":
+            return (1, 0, k)
+        if k[1:].isdigit():                 # 'W1', 'W2', ... (MP-layer index)
+            return (1, int(k[1:]), k)
+        return (1, 0, k)                    # 'W_rec' and any other hidden weight
+    return sorted(w_keys, key=order)
+
+
+def cosine_alignment(g_local, g_ref, keys):
+    """Per-key cosine similarity between two gradient dicts (flattened tensors).
+    Returns {key: cos in [-1, 1]} (nan if either gradient is ~0). Cosine, not raw
+    error, so the scale differences between rules/layers don't confound it."""
+    out = {}
+    for k in keys:
+        a, b = g_local.get(k), g_ref.get(k)
+        if a is None or b is None:
+            out[k] = float("nan")
+            continue
+        a = a.reshape(-1).to(torch.float64)
+        b = b.reshape(-1).to(torch.float64)
+        na, nb = a.norm(), b.norm()
+        out[k] = float(torch.dot(a, b) / (na * nb)) if (na > 0 and nb > 0) else float("nan")
+    return out
+
+
+def bptt_reference_grads(net, inputs, labels, mask, loss_kw):
+    """Exact BPTT gradients for `net` at its CURRENT weights, as a detached
+    {name: grad} dict — the reference the local rules are compared against. Must
+    run with autograd ENABLED (bptt_gradients builds the backward graph), so this
+    is deliberately NOT wrapped in torch.no_grad. Restores net.learning_rule + the
+    net's _bptt timing attributes afterwards so this diagnostic call perturbs
+    neither the rule dispatch nor the fwd/bwd ms readout of the real update."""
+    _MISSING = object()
+    saved_rule = net.learning_rule
+    saved_fwd = getattr(net, "_bptt_fwd_s", _MISSING)
+    saved_bwd = getattr(net, "_bptt_bwd_s", _MISSING)
+    try:
+        # No return_outputs kwarg: the MPN bptt_gradients accepts it but the RNN's
+        # does not, and the returned 'outputs' is dropped below anyway — keep this
+        # helper model-agnostic.
+        ref = net.bptt_gradients(inputs, labels, mask, **loss_kw)
+    finally:
+        net.learning_rule = saved_rule
+        # bptt_gradients SETS _bptt_fwd_s/_bwd_s. Fully restore the prior state so
+        # the training loop's timing split (which reads these right after
+        # sequence_gradients) is unaffected: on a LOCAL-rule net they were absent,
+        # so delete them (else a stale reference timing would leak into the next
+        # step and be wrongly charged to the local rule as bwd time).
+        for attr, saved in (("_bptt_fwd_s", saved_fwd), ("_bptt_bwd_s", saved_bwd)):
+            if saved is _MISSING:
+                if hasattr(net, attr):
+                    delattr(net, attr)
+            else:
+                setattr(net, attr, saved)
+    return {k: v for k, v in ref.items() if k not in ("loss", "outputs")}
 
 
 # ─── Training pieces ──────────────────────────────────────────────────────────
@@ -123,6 +226,25 @@ def make_optim(net, lr):
     sch = torch.optim.lr_scheduler.ReduceLROnPlateau(
         opt, mode="min", factor=0.95, patience=30, min_lr=1e-8)
     return trainable, opt, sch
+
+
+@torch.no_grad()
+def eval_outputs_chunked(cfg, net, v_inputs, chunk):
+    """Run the held-out forward in batch-dim chunks of size `chunk` and concatenate
+    the outputs, to cap peak memory when valid_n_batch > chunk (avoids CUDA OOM on
+    the unrolled validation forward, whose per-step M/eligibility tensors scale with
+    the batch). Validation samples never interact (cfg.eval_outputs calls
+    reset_state(B=chunk) per chunk), so the concatenated outputs equal a single
+    cfg.eval_outputs(net, v_inputs) call up to float round-off — the SAME
+    computation, just tiled differently (bit-exact in float64; ~1e-7 in float32
+    from kernel tiling), so downstream loss/accuracy are unchanged. When chunking
+    is off or the whole set fits (chunk is None, or B not greater than chunk),
+    it is a single call (bit-identical)."""
+    B = v_inputs.shape[0]
+    if chunk is None or B <= chunk:
+        return cfg.eval_outputs(net, v_inputs)
+    outs = [cfg.eval_outputs(net, v_inputs[i:i + chunk]) for i in range(0, B, chunk)]
+    return torch.cat(outs, dim=0)
 
 
 def run_seed(cfg, seed, record_steps):
@@ -149,6 +271,15 @@ def run_seed(cfg, seed, record_steps):
         nets[rule] = net
         optims[rule] = make_optim(net, cfg.lr)
 
+    # The task's objective. None → the net's default masked MSE; keeping it None
+    # (not passing an explicit fn) preserves the local rules' single-pass fast
+    # path AND the module-local default-loss identity check (mpn vs mpn_archive
+    # each own their masked_mse symbol). A task-specific loss (e.g. seq-MNIST's
+    # cross-entropy) is passed through to both the gradient and validation calls.
+    task_loss = getattr(task, "loss_and_grad", None)
+    loss_kw = {} if task_loss is None else {"loss_and_grad": task_loss}
+    val_loss_fn = masked_mse_loss_and_output_grad if task_loss is None else task_loss
+
     # Held-out validation set, generated ONCE and shared across rules.
     v_inputs, v_labels, v_mask = task.valid_batch(
         task_params, train_params, cfg.device, cfg.dtype)
@@ -156,18 +287,41 @@ def run_seed(cfg, seed, record_steps):
     curves = {r: {"train": [], "valid": []} for r in cfg.rules_to_run}
     record_set = set(record_steps)
 
+    # Gradient-alignment diagnostic: per-weight-matrix cosine of each LOCAL rule's
+    # gradient vs the exact BPTT gradient at the same weights. Only meaningful for
+    # non-bptt rules, so only enabled if there is at least one. The columns (one per
+    # W-matrix: input embedding, each MP layer, readout — biases skipped) are fixed
+    # for the run, derived from any net's trainable params.
+    align_on = cfg.log_grad_align and any(r != "bptt" for r in cfg.rules_to_run)
+    align_keys = (_grad_align_keys(next(iter(nets.values()))._trainable_params())
+                  if align_on else [])
+    def _short(k):
+        return {"W_in": "Win", "W_input": "Win", "W_rec": "Wrec",
+                "W_output": "Wout"}.get(k, k)
+
     # Aligned log table: one header per seed, then one row per rule per recorded
     # step (see the print block below). label_w keeps the rule column aligned.
     label_w = max(len(cfg.rule_label.get(r, r)) for r in cfg.rules_to_run)
+    align_hdr = ("   " + " ".join(f"{'cos ' + _short(k):>9}" for k in align_keys)
+                 if align_on else "")
     print(f"  seed {seed}:")
     print(f"    {'step':>6}  {'rule':<{label_w}}   {'acc tr':>7} {'acc va':>7}   "
-          f"{'loss tr':>9} {'loss va':>9}   {'lr':>7}   {'ms/step':>8}")
+          f"{'loss tr':>9} {'loss va':>9}   {'lr':>7}   "
+          f"{'fwd ms':>7} {'bwd ms':>7} {'opt ms':>7}{align_hdr}")
 
-    # Accumulate the training-update wall time per rule so we can report the mean
-    # ms/step over each logging window (single-step timings are too noisy). Timed
-    # region = the training update only (sequence_gradients + clip + opt.step),
-    # NOT the shared held-out eval — that is what differs across rules.
-    t_accum = {r: 0.0 for r in cfg.rules_to_run}   # seconds since last record
+    # Per-rule wall time, split into forward / backward / optimizer phases and
+    # averaged over each logging window (single-step timings are too noisy). The
+    # held-out eval is NOT timed (shared across rules). Phases:
+    #   fwd — the forward pass that produces the gradients: for BPTT the unrolled
+    #         forward+M loop; for the local rules the whole forward+eligibility loop
+    #         (which IS the gradient computation — forward-mode, no backward).
+    #   bwd — the backward pass: BPTT's torch.autograd.grad; ZERO for the local
+    #         rules (they have no backward). BPTT reports its own fwd/bwd split via
+    #         net._bptt_fwd_s / _bptt_bwd_s; local rules → fwd = grad-production, bwd = 0.
+    #   opt — grad-clip + optimizer.step() + param_clamp (rule-independent).
+    t_fwd = {r: 0.0 for r in cfg.rules_to_run}
+    t_bwd = {r: 0.0 for r in cfg.rules_to_run}
+    t_opt = {r: 0.0 for r in cfg.rules_to_run}
     n_accum = 0                                    # steps since last record
 
     for step in range(cfg.n_datasets):
@@ -175,30 +329,67 @@ def run_seed(cfg, seed, record_steps):
         inputs, labels, mask = task.train_batch(
             task_params, train_params, cfg.batch, cfg.device, cfg.dtype)
 
-        step_log = {}  # per-rule (train_loss, valid_loss, lr) for this step's log line
+        step_log = {}    # per-rule (train_loss, valid_loss, lr) for this step's log line
+        step_align = {}  # per-rule {key: cosine vs BPTT} at record steps (local rules)
         for rule in cfg.rules_to_run:
             net = nets[rule]
             trainable, opt, sch = optims[rule]
 
-            # Time the training update only (the part that differs across rules).
-            if cfg.device.type == "cuda":
+            # Time the training update, split into fwd / bwd / opt (cuda-synced so
+            # the wall-clock reflects completed GPU work, not the async launch queue).
+            cuda = (cfg.device.type == "cuda")
+            opt.zero_grad()
+            if cuda:
                 torch.cuda.synchronize()
             t0 = time.perf_counter()
-            opt.zero_grad()
-            grads = net.sequence_gradients(inputs, labels, mask)
+            grads = net.sequence_gradients(inputs, labels, mask, **loss_kw)
+            if cuda:
+                torch.cuda.synchronize()
+            t_grad = time.perf_counter() - t0
+            # Split grad time into fwd/bwd: BPTT exposes its internal forward vs
+            # autograd.grad split; local rules have no backward → all fwd, bwd 0.
+            # Either way the TOTAL charged is the outer-measured t_grad, so every
+            # rule is timed over the SAME interval (sequence_gradients incl. its
+            # .grad write-back). BPTT's internal split ends at autograd.grad, so it
+            # misses the wrapper's result-dict build + .grad clone; attribute that
+            # remainder to fwd (as the comment always intended) rather than dropping
+            # it — otherwise BPTT would be undercounted relative to the local rules.
+            fwd_s = getattr(net, "_bptt_fwd_s", None)
+            bwd_s = getattr(net, "_bptt_bwd_s", None)
+            if fwd_s is not None and bwd_s is not None:
+                t_bwd[rule] += bwd_s
+                t_fwd[rule] += t_grad - bwd_s   # fwd + un-split wrapper remainder
+            else:
+                t_fwd[rule] += t_grad
+
+            # Gradient-alignment diagnostic (record steps only, non-bptt rules).
+            # Compare THIS rule's gradient to the exact BPTT gradient at the SAME
+            # (pre-update) weights → per-layer cosine similarity. Done before
+            # opt.step() (weights unchanged) and NOT inside the fwd/bwd/opt timers.
+            if align_on and step in record_set and rule != "bptt":
+                ref = bptt_reference_grads(net, inputs, labels, mask, loss_kw)
+                step_align[rule] = cosine_alignment(grads, ref, align_keys)
+
+            t0 = time.perf_counter()
             if cfg.grad_clip is not None:
                 torch.nn.utils.clip_grad_norm_(trainable, cfg.grad_clip)
             opt.step()
             if net.param_clamping:
                 net.param_clamp()
-            if cfg.device.type == "cuda":
+            if cuda:
                 torch.cuda.synchronize()
-            t_accum[rule] += time.perf_counter() - t0
+            t_opt[rule] += time.perf_counter() - t0
 
             # Held-out validation loss on the UPDATED net drives the scheduler
             # (as in one_task.py) — smoother than the fresh per-batch train loss.
-            v_out = cfg.eval_outputs(net, v_inputs)
-            v_loss, _ = masked_mse_loss_and_output_grad(v_out, v_labels, v_mask)
+            # The held-out set can be larger than the training batch (valid_n_batch
+            # = batch*3 by default), so run the forward in chunks of cfg.batch to
+            # bound peak memory (prevents CUDA OOM); validation samples don't
+            # interact, so the loss is computed ONCE on the concatenated outputs
+            # (its normalizer — 1/N for MSE, 1/n_scored for CE — is then applied
+            # over the full held-out set, exact; no per-chunk averaging).
+            v_out = eval_outputs_chunked(cfg, net, v_inputs, cfg.batch)
+            v_loss, _ = val_loss_fn(v_out, v_labels, v_mask)
             sch.step(v_loss.item())
 
             if step in record_set:
@@ -223,17 +414,33 @@ def run_seed(cfg, seed, record_steps):
         if step in record_set:
             # One aligned row per rule under this step (step shown once, then blank
             # so rules for the same step read as a group). Always show both acc and
-            # loss, plus the mean ms per training update over this logging window
-            # (averaged over n_accum steps to smooth single-step jitter).
+            # loss, plus the mean fwd/bwd/opt ms per training update over this
+            # logging window (averaged over n_accum steps to smooth jitter). For the
+            # local rules bwd is ~0 (forward-mode, no backward); for BPTT fwd is the
+            # unrolled forward and bwd is autograd.grad.
+            m = max(n_accum, 1)
             for i, r in enumerate(cfg.rules_to_run):
                 step_col = f"{step:>6}" if i == 0 else " " * 6
                 tr_acc, va_acc, tr_loss, va_loss, lr = step_log[r]
-                ms = 1000.0 * t_accum[r] / max(n_accum, 1)
+                fwd_ms = 1000.0 * t_fwd[r] / m
+                bwd_ms = 1000.0 * t_bwd[r] / m
+                opt_ms = 1000.0 * t_opt[r] / m
+                # Per-layer cosine vs BPTT (blank for bptt itself: it IS the ref).
+                if align_on:
+                    al = step_align.get(r, {})
+                    align_cols = "   " + " ".join(
+                        f"{al[k]:>9.4f}" if (r != 'bptt' and k in al and al[k] == al[k])
+                        else f"{'—':>9}" for k in align_keys)
+                else:
+                    align_cols = ""
                 print(f"    {step_col}  {cfg.rule_label.get(r, r):<{label_w}}   "
                       f"{tr_acc:>7.3f} {va_acc:>7.3f}   "
-                      f"{tr_loss:>9.3e} {va_loss:>9.3e}   {lr:>7.1e}   {ms:>8.1f}")
+                      f"{tr_loss:>9.3e} {va_loss:>9.3e}   {lr:>7.1e}   "
+                      f"{fwd_ms:>7.1f} {bwd_ms:>7.1f} {opt_ms:>7.1f}{align_cols}")
             # Reset the window accumulators after logging.
-            t_accum = {r: 0.0 for r in cfg.rules_to_run}
+            t_fwd = {r: 0.0 for r in cfg.rules_to_run}
+            t_bwd = {r: 0.0 for r in cfg.rules_to_run}
+            t_opt = {r: 0.0 for r in cfg.rules_to_run}
             n_accum = 0
 
     # Save each trained network (per rule) so it can be reloaded later. Stores
@@ -308,6 +515,9 @@ def save_plot_data(cfg, record_steps, runs, agg, path=None):
         "ruleset": cfg.ruleset, "n_hidden": cfg.n_hidden, "batch": cfg.batch,
         "n_datasets": cfg.n_datasets, "lr": cfg.lr, "n_runs": cfg.n_runs,
         "feedback_mode": cfg.feedback_mode, "title": cfg.title,
+        # full architecture (multi-layer stacks) for provenance + replot suffix
+        "arch_tag": getattr(cfg, "arch_tag", ""),
+        "arch_desc": getattr(cfg, "arch_desc", ""),
         # what the stored curves represent, so replot renders the right axes
         "metric": cfg.metric, "acc_label": cfg.acc_label,
     }
@@ -330,8 +540,11 @@ def replot_from_npz(cfg, npz_path, save_to=None):
     record_steps = d["record_steps"]
     agg = {r: {sp: {"mean": d[f"mean__{r}__{sp}"], "std": d[f"std__{r}__{sp}"]}
                for sp in ("train", "valid")} for r in rules}
-    suffix = (f"(mean ± std over {int(d['n_runs'])} runs, "
-              f"hidden={int(d['n_hidden'])})")
+    # Prefer the full architecture saved with the data; fall back to hidden=scalar
+    # for older .npz files that predate arch_desc.
+    arch_note = (str(d["arch_desc"]) if "arch_desc" in d.files and str(d["arch_desc"])
+                 else f"hidden={int(d['n_hidden'])}")
+    suffix = f"(mean ± std over {int(d['n_runs'])} runs, {arch_note})"
     # Prefer the title / metric / label saved with the data; fall back to cfg.
     cfg_for_plot = copy.copy(cfg)
     if "title" in d.files:
@@ -349,7 +562,7 @@ def run_experiment(cfg):
     """Full experiment: train every rule in lockstep across cfg.n_runs seeds,
     aggregate mean/std, save plot data, render the figure, print a summary."""
     print(f"Task: {cfg.ruleset}{cfg.header_note}  |  rules: {cfg.rules_to_run}  |  "
-          f"runs: {cfg.n_runs}  |  hidden={cfg.n_hidden} batch={cfg.batch} "
+          f"runs: {cfg.n_runs}  |  {arch_suffix(cfg)} batch={cfg.batch} "
           f"steps={cfg.n_datasets} lr={cfg.lr} clip={cfg.grad_clip}")
     print(f"Device: {cfg.device}  dtype: {cfg.dtype}  feedback: {cfg.feedback_mode}\n")
 
@@ -378,7 +591,7 @@ def run_experiment(cfg):
 
     save_plot_data(cfg, record_steps, runs, agg)
     plot(cfg, record_steps, agg, cfg.rules_to_run,
-         f"(mean ± std over {cfg.n_runs} runs, hidden={cfg.n_hidden})", fig_path(cfg))
+         f"(mean ± std over {cfg.n_runs} runs, {arch_suffix(cfg)})", fig_path(cfg))
 
     # Final-metric summary (the plotted metric: accuracy or loss).
     metric_noun = "loss" if cfg.metric == "loss" else "accuracy"

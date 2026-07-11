@@ -1,3 +1,44 @@
+"""
+Efficiency-optimized MPN implementation (the default; wired in everywhere).
+
+The reference implementation this was derived from is kept as core/mpn_archive.py.
+Same networks (MultiPlasticLayer / MultiPlasticNet / DeepMultiPlasticNet) and the
+same public API (bptt_gradients / local_* / sequence_gradients), producing results
+IDENTICAL to mpn_archive.py up to floating-point round-off (some changes are
+bitwise-exact, the speedups reorder ops). Verified by tests/test_mpn_revise.py:
+float64 diffs are ~1e-16 (pure round-off → same computation), float32 well within
+1e-5, across BPTT and all local rules on both nets.
+
+What is optimized (vs mpn_archive.py), all result-preserving:
+  Forward / BPTT
+    - MP-layer forward splits W_eff·x into F.linear(x, W) [static GEMM] +
+      bmm(W⊙M, x) [plastic] — no materialized (B,i,I) W_eff.
+    - update_M_matrix computes M_pre = λM + η·postᵀpre directly (no −M+λM, no
+      delta_M alloc); masked path vectorized. Readout via F.linear.
+    - BPTT uses a loss-only helper (skips the unused analytic grad_output);
+      dropped redundant clones.
+  Local rules (the main win here)
+    - local_direct / local_diag_rflo FUSE eligibility+grad+trace into
+      local_grad_step_fast WITHOUT materializing the (B,i,I) E tensor:
+      direct contracts ℓ·φ'·(1+M)·x directly; diag reuses factor=1+M+W·A for
+      both grad_W and the A-update. exact still builds E/P (algorithmic).
+    - update_M_matrix_local_fast skips the general branch/clamp path (valid only
+      in the clean local config assert_local_config guarantees: mult, linear
+      m_act, no bounds — hard-sets self.M = M_pre).
+    - Input-embedding backprojection via backproject_through_modulated_weights_fast
+      (ℓ_pre@W + bmm(ℓ_pre, W⊙M), no W_eff).
+    - eta/lam expanded once per unroll; batched readout/embedding grads; streams
+      the scalar loss and supports return_outputs=False to skip storing outputs.
+    - Tier-A overhead cuts (long-unroll): the mode branch is hoisted OUT of the
+      per-step loop (step_fn_for(mode) → _local_step_{direct,diag,exact} resolved
+      once); inputs/labels/masks are made time-major + contiguous so per-step reads
+      are contiguous (B,·) rows; the readout/embedding scratch buffers (go/hid/ga/u)
+      are persistent (self._scratch, reused across calls, never checkpointed) and
+      time-major so writes are contiguous. All calc-preserving.
+  Measured: local_direct ~2.0×, local_diag_rflo ~1.6×, BPTT ~1.4× vs archive (CPU).
+
+core/mpn_archive.py is left untouched as the reference implementation.
+"""
 import torch
 from torch import nn
 from torch.utils.data import TensorDataset
@@ -6,8 +47,102 @@ from torch.nn.init import orthogonal_
 
 import math
 import numpy as np
-import copy 
-import time 
+import copy
+import time
+import os
+
+
+# ─── Tier-B: optional torch.compile of the local per-step core (opt-in) ───────
+# The direct/diag local rules have a fixed per-timestep computation with no
+# data-dependent Python control flow, which makes it a clean torch.compile /
+# CUDA-graph target: compiling fuses the elementwise ops and cuts launch overhead
+# over a long unroll (T=784 seq-MNIST-pixel). To keep this safe when it cannot be
+# validated (no GPU in dev), it is:
+#   * OPT-IN and default OFF (set MPN_COMPILE_LOCAL=1 or call
+#     mpn.set_compile_local(True)); the eager path is untouched when off;
+#   * a PURE-FUNCTIONAL core (no self / no in-place attribute writes inside the
+#     compiled region) so the same function runs eager and compiled — one source
+#     of truth, CPU-verifiable — with the network doing the state assignment;
+#   * wrapped in a try/except that falls back to the eager core if compilation
+#     raises, so a compile failure can never break a training run.
+COMPILE_LOCAL = os.environ.get("MPN_COMPILE_LOCAL", "0") == "1"
+_COMPILED = {}   # (fn_name -> compiled callable) cache
+
+
+def set_compile_local(flag: bool):
+    """Enable/disable torch.compile of the local per-step cores at runtime.
+    Clears the compiled-fn cache so the next call recompiles as needed."""
+    global COMPILE_LOCAL
+    COMPILE_LOCAL = bool(flag)
+    _COMPILED.clear()
+
+
+def _maybe_compile(fn):
+    """Return fn, or a torch.compile'd version cached by name when COMPILE_LOCAL
+    is on. Falls back to the eager fn if torch.compile raises (e.g. unsupported
+    backend) so the caller never has to care."""
+    if not COMPILE_LOCAL:
+        return fn
+    key = fn.__name__
+    cached = _COMPILED.get(key)
+    if cached is None:
+        try:
+            cached = torch.compile(fn, dynamic=False)
+        except Exception as e:   # pragma: no cover - environment dependent
+            print(f"[mpn] torch.compile({key}) failed ({e}); using eager.")
+            cached = fn
+        _COMPILED[key] = cached
+    return cached
+
+
+# ─── Pure-functional local per-step cores (no self, no in-place attr writes) ──
+# These implement exactly the same math as MultiPlasticLayer._local_step_{direct,
+# diag} + update_M_matrix_local_fast, but as pure tensor->tensor functions so they
+# can be torch.compile'd. Each returns the per-step grads AND the NEW state
+# (M_new for direct; M_new/A_new/Q_new for diag); the layer assigns state. Bias
+# eligibility R / phi' need not be returned (self.E/self.R were dead diagnostics).
+
+def _core_direct_step(x, hidden, phi_prime, ell, M, W, eta, lam, um):
+    """Full fused direct step: grads (using M_{t-1}) + the hebb_assoc M update.
+    grad_W = sum_B (ell*phi')_i (1+M_iI) x_I ; grad_b = sum_B (ell*phi')_i ;
+    M_new = lam*M + eta*(hiddenᵀx). Returns (grad_W_t, grad_b_t, M_new).
+    Used only for hebb_assoc (a=1); hebb_pre keeps the eager path (its M update
+    uses a post-independent constant, handled by update_M_matrix_local_fast)."""
+    ell_phi = ell * phi_prime
+    grad_W_t = (ell_phi.unsqueeze(-1) * (1.0 + M) * x.unsqueeze(1)).sum(0)
+    grad_b_t = ell_phi.sum(0)
+    outer = hidden.unsqueeze(-1) * x.unsqueeze(1)                 # (B,i,I) hebb_assoc
+    M_new = lam.unsqueeze(0) * M + eta.unsqueeze(0) * outer
+    if um is not None:
+        m = um.view(-1, 1, 1)
+        M_new = m * M_new + (1.0 - m) * M
+    return grad_W_t, grad_b_t, M_new
+
+
+def _core_diag_step(x, hidden, phi_prime, ell, M, A, Q, W, eta, lam, a, um):
+    """Full fused diagonal-RFLO step: grad_W/grad_b (from t-1 traces) + A,Q,M
+    updates. Same math as _local_step_diag + update_M_matrix_local_fast. Returns
+    (grad_W_t, grad_b_t, M_new, A_new, Q_new)."""
+    W0 = W.unsqueeze(0)
+    factor = 1.0 + M + W0 * A                                    # (B,i,I)
+    ell_phi = ell * phi_prime
+
+    grad_W_t = (ell_phi.unsqueeze(-1) * x.unsqueeze(1) * factor).sum(0)
+
+    row_recurrent_b = torch.bmm(Q * W0, x.unsqueeze(-1)).squeeze(-1)
+    R = phi_prime * (1.0 + row_recurrent_b)
+    grad_b_t = torch.einsum('Bi,Bi->i', ell, R)
+
+    A_new = lam.unsqueeze(0) * A + a * eta.unsqueeze(0) * phi_prime.unsqueeze(-1) * x.square().unsqueeze(1) * factor
+    Q_new = lam.unsqueeze(0) * Q + a * eta.unsqueeze(0) * R.unsqueeze(-1) * x.unsqueeze(1)
+    outer = hidden.unsqueeze(-1) * x.unsqueeze(1)                 # hebb_assoc M update
+    M_new = lam.unsqueeze(0) * M + eta.unsqueeze(0) * outer
+    if um is not None:
+        m3 = um.view(-1, 1, 1)
+        A_new = m3 * A_new + (1.0 - m3) * A
+        Q_new = m3 * Q_new + (1.0 - m3) * Q
+        M_new = m3 * M_new + (1.0 - m3) * M
+    return grad_W_t, grad_b_t, M_new, A_new, Q_new
 
 from net_helpers import BaseNetwork, BaseNetworkFunctions
 from net_helpers import rand_weight_init, get_activation_function
@@ -24,6 +159,34 @@ def masked_mse_loss_and_output_grad(output, labels, mask):
     diff = mask * output - mask * labels           # = mask * (output - labels)
     loss = (diff ** 2).sum() / N
     grad_output = (2.0 / N) * mask * diff          # 2/N * mask^2 * (output - labels)
+    return loss, grad_output
+
+
+def masked_mse_loss_only(output, labels, mask):
+    """Scalar masked MSE only — BIT-IDENTICAL to the loss from
+    masked_mse_loss_and_output_grad (same ops, same order) but WITHOUT building
+    the unused grad_output tensor. The BPTT path uses this: autograd supplies the
+    parameter gradients, so the analytic output gradient is dead work. The loss
+    tensor and its backward graph are unchanged, so autograd.grad returns exactly
+    the same parameter gradients as before (bitwise)."""
+    N = output.numel()
+    diff = mask * output - mask * labels           # identical expression → identical loss
+    return (diff ** 2).sum() / N
+
+
+def masked_cross_entropy_loss_and_grad(output, labels, mask):
+    """Softmax cross-entropy on the mask-selected positions; identical semantics
+    to mpn_archive.masked_cross_entropy_loss_and_grad (see it for the full
+    contract). output is LOGITS; the per-position weight is w[b,t] = max_c
+    mask[b,t,c] (CE normalizes over channels, so a per-channel graded mask is not
+    meaningful). Being a non-default loss, it routes the local rules through their
+    two-pass path. Kept here so this impl mirrors the archive's loss surface."""
+    w = mask.amax(dim=-1)                              # (B, T) per-position weight
+    n_scored = w.sum().clamp_min(1.0)
+    logp = torch.log_softmax(output, dim=-1)
+    ce = -(labels * logp).sum(dim=-1)                  # (B, T)
+    loss = (w * ce).sum() / n_scored
+    grad_output = w.unsqueeze(-1) * (logp.exp() - labels) / n_scored
     return loss, grad_output
 
 
@@ -305,7 +468,7 @@ class MultiPlasticLayer(BaseNetworkFunctions):
             raise ValueError(f"param_type {ptype} not recognized")
         return expand(self.eta, self.eta_type), expand(self.lam, self.lam_type)
 
-    def update_exact_rowlocal_traces(self, x, E, R, update_mask=None):
+    def update_exact_rowlocal_traces(self, x, E, R, update_mask=None, eta_lam=None):
         """Advance the eligibility traces one step (uses M_t's eta/lam):
 
         P^I_{iJ,t} = lam_{iJ} P^I_{iJ,t-1} + eta_{iJ} x_J E^I_{i,t}
@@ -313,8 +476,9 @@ class MultiPlasticLayer(BaseNetworkFunctions):
 
         Call AFTER compute_exact_rowlocal_eligibility, in step with
         update_M_matrix. update_mask (B,) freezes traces for inactive batch rows.
-        """
-        eta, lam = self._eta_lam_full()  # each (i, J)
+        eta_lam: optional precomputed (eta, lam) from _eta_lam_full() — eta/lam are
+        constant during an unroll, so the loop hoists this out (identical values)."""
+        eta, lam = eta_lam if eta_lam is not None else self._eta_lam_full()  # each (i, J)
         a = self._assoc  # 0 for hebb_pre → dM/dW = dM/db = 0, traces stay zero
 
         outerP = torch.einsum('BiI,BJ->BiIJ', E, x)            # x_J E^I_i
@@ -375,7 +539,7 @@ class MultiPlasticLayer(BaseNetworkFunctions):
         self.E, self.R = E, R
         return E, R
 
-    def update_diag_rflo_traces(self, x, E, R, update_mask=None):
+    def update_diag_rflo_traces(self, x, E, R, update_mask=None, eta_lam=None):
         """Advance the diagonal-RFLO traces one step (uses M_t's eta/lam):
 
         A_{iI,t} = lam_{iI} A_{iI,t-1} + eta_{iI} x_I E_hat^I_{i,t}
@@ -383,8 +547,9 @@ class MultiPlasticLayer(BaseNetworkFunctions):
 
         Call AFTER compute_diag_rflo_eligibility, in step with update_M_matrix.
         update_mask (B,) freezes traces for inactive batch rows.
-        """
-        eta, lam = self._eta_lam_full()  # each (i, I)
+        eta_lam: optional precomputed (eta, lam) — constant over the unroll, hoisted
+        out of the time loop (identical values, avoids re-expanding every step)."""
+        eta, lam = eta_lam if eta_lam is not None else self._eta_lam_full()  # each (i, I)
         a = self._assoc  # 0 for hebb_pre → dM/dW = dM/db = 0, traces stay zero
 
         A_new = lam[None] * self.A + a * eta[None] * x.unsqueeze(1) * E  # x_I E_hat^I_i
@@ -420,6 +585,174 @@ class MultiPlasticLayer(BaseNetworkFunctions):
 
         self.E, self.R = E, R
         return E, R
+
+    # ─── Fast fused local-learning helpers ───────────────────────────────────
+    # These helpers implement the same local rules as compute_*_eligibility plus
+    # update_*_traces, but fuse the hot operations for local_direct and
+    # local_diag_rflo so the full eligibility tensor E is not materialized unless
+    # exact row-local learning requires it.
+
+    def _apply_update_mask_3d(self, new, old, update_mask):
+        if update_mask is None:
+            return new
+        m = update_mask.view(-1, 1, 1).to(dtype=new.dtype, device=new.device)
+        return m * new + (1.0 - m) * old
+
+    def _apply_update_mask_4d(self, new, old, update_mask):
+        if update_mask is None:
+            return new
+        m = update_mask.view(-1, 1, 1, 1).to(dtype=new.dtype, device=new.device)
+        return m * new + (1.0 - m) * old
+
+    def update_M_matrix_local_fast(self, pre, post, eta=None, lam=None, update_mask=None):
+        """Fast M update for the clean local-rule regime.
+
+        Algebraically identical to update_M_matrix for the configurations allowed
+        by assert_local_config(): multiplicative MP, linear M activation, no
+        modulation bounds, and Hebbian associative/pre-only updates. It skips the
+        general-purpose branch/clamp path and reuses preexpanded eta/lam.
+        """
+        if eta is None or lam is None:
+            eta, lam = self._eta_lam_full()
+
+        M_prev = self.M
+        if self.m_update_type == 'hebb_pre':
+            c = 1.0 / math.sqrt(post.shape[-1])
+            outer = c * pre.unsqueeze(1).expand(-1, self.n_output, -1)
+        elif self.m_update_type == 'hebb_assoc':
+            outer = post.unsqueeze(-1) * pre.unsqueeze(1)
+        else:
+            raise NotImplementedError("fast local M update supports hebb_assoc/hebb_pre only")
+
+        M_pre = lam.unsqueeze(0) * M_prev + eta.unsqueeze(0) * outer
+        M_pre = self._apply_update_mask_3d(M_pre, M_prev, update_mask)
+
+        self.M_pre = M_pre
+        self.M = M_pre  # assert_local_config guarantees linear m_act and no bounds.
+
+        if hasattr(self, '_plasticity_freeze_mask') and self._plasticity_freeze_mask is not None:
+            self.M[:, self._plasticity_freeze_mask[0],
+                      self._plasticity_freeze_mask[1]] = self._M_frozen_vals
+
+        return M_pre - M_prev
+
+    # ── Mode-specialized fused local step (dispatched once, not per timestep) ──
+    # Each _local_step_<mode> is one fused local-learning step for MP-layer W,b and
+    # its traces, mathematically identical to compute_*_eligibility + update_*_traces
+    # but without materializing the (B,i,I) eligibility E. The sequence loop resolves
+    # the right one ONCE (via step_fn_for) instead of branching on `mode` every step.
+
+    def _local_step_direct(self, x, phi_prime, ell, eta, lam, update_mask=None):
+        """Direct/instantaneous: grad_W = sum_B ell_i phi'_i (1 + M_iI) x_I,
+        grad_b = sum_B ell_i phi'_i. No trace (P/A/Q) touched."""
+        ell_phi = ell * phi_prime
+        grad_W_t = (ell_phi.unsqueeze(-1) * (1.0 + self.M) * x.unsqueeze(1)).sum(0)
+        grad_b_t = ell_phi.sum(0)
+        self.E, self.R = None, phi_prime
+        return grad_W_t, grad_b_t
+
+    def _local_step_diag(self, x, phi_prime, ell, eta, lam, update_mask=None):
+        """Diagonal RFLO: factor = 1 + M + W*A fused into grad_W and the A update
+        (E_hat = phi'*x*factor never built); exact bias trace Q kept."""
+        W, M_prev = self.W, self.M
+        a = self._assoc
+        A_prev, Q_prev = self.A, self.Q
+        factor = 1.0 + M_prev + W.unsqueeze(0) * A_prev
+        ell_phi = ell * phi_prime
+
+        grad_W_t = (ell_phi.unsqueeze(-1) * x.unsqueeze(1) * factor).sum(0)
+
+        row_recurrent_b = torch.bmm(Q_prev * W.unsqueeze(0), x.unsqueeze(-1)).squeeze(-1)
+        R = phi_prime * (1.0 + row_recurrent_b)
+        grad_b_t = torch.einsum('Bi,Bi->i', ell, R)
+
+        A_new = (lam.unsqueeze(0) * A_prev
+                 + a * eta.unsqueeze(0) * phi_prime.unsqueeze(-1)
+                 * x.square().unsqueeze(1) * factor)
+        Q_new = (lam.unsqueeze(0) * Q_prev
+                 + a * eta.unsqueeze(0) * R.unsqueeze(-1) * x.unsqueeze(1))
+        self.A = self._apply_update_mask_3d(A_new, A_prev, update_mask)
+        self.Q = self._apply_update_mask_3d(Q_new, Q_prev, update_mask)
+        self.E, self.R = None, R
+        return grad_W_t, grad_b_t
+
+    def _local_step_exact(self, x, phi_prime, ell, eta, lam, update_mask=None):
+        """Exact row-local: E is still built (the full P trace update needs it),
+        but eta/lam are reused and the P/Q update is done inline."""
+        a = self._assoc
+        E, R = self.compute_exact_rowlocal_eligibility(x, phi_prime)
+        grad_W_t = torch.einsum('Bi,BiI->iI', ell, E)
+        grad_b_t = torch.einsum('Bi,Bi->i', ell, R)
+
+        P_prev, Q_prev = self.P, self.Q
+        outerP = torch.einsum('BiI,BJ->BiIJ', E, x)
+        P_new = lam[None, :, None, :] * P_prev + a * eta[None, :, None, :] * outerP
+        Q_new = lam[None, :, :] * Q_prev + a * eta[None, :, :] * R.unsqueeze(-1) * x.unsqueeze(1)
+        self.P = self._apply_update_mask_4d(P_new, P_prev, update_mask)
+        self.Q = self._apply_update_mask_3d(Q_new, Q_prev, update_mask)
+        return grad_W_t, grad_b_t
+
+    def step_fn_for(self, mode):
+        """Return the mode's fused per-step function, resolved ONCE before a loop
+        (so the per-timestep call has no `mode` branch)."""
+        return {'direct': self._local_step_direct,
+                'diag': self._local_step_diag,
+                'exact': self._local_step_exact}[mode]
+
+    # ── torch.compile fast path (opt-in; see set_compile_local / COMPILE_LOCAL) ──
+    def can_compile_step(self, mode):
+        """True if this layer/mode can use the compiled pure-functional core: only
+        direct/diag with the hebb_assoc M update (hebb_pre's M update uses a
+        post-independent constant, kept on the eager path)."""
+        return (COMPILE_LOCAL and mode in ('direct', 'diag')
+                and self.m_update_type == 'hebb_assoc')
+
+    def compiled_step_and_update(self, mode, x, hidden, phi_prime, ell, eta, lam,
+                                 update_mask=None):
+        """Run the fused (compiled) core for `mode`, ASSIGN the returned state
+        (M, and A/Q for diag), and return (grad_W_t, grad_b_t). Same result as
+        step_fn_for(mode)(...) followed by update_M_matrix_local_fast(...), but the
+        grads + all trace/M updates happen inside one compiled region."""
+        if mode == 'direct':
+            core = _maybe_compile(_core_direct_step)
+            grad_W_t, grad_b_t, M_new = core(
+                x, hidden, phi_prime, ell, self.M, self.W, eta, lam, update_mask)
+            self.M_pre = M_new
+            self.M = M_new
+            self.E, self.R = None, phi_prime
+        else:  # 'diag'
+            core = _maybe_compile(_core_diag_step)
+            grad_W_t, grad_b_t, M_new, A_new, Q_new = core(
+                x, hidden, phi_prime, ell, self.M, self.A, self.Q, self.W,
+                eta, lam, self._assoc, update_mask)
+            self.A, self.Q = A_new, Q_new
+            self.M_pre = M_new
+            self.M = M_new
+            self.E, self.R = None, None
+        # Plasticity-freeze (rare) still handled here to match the eager path.
+        if getattr(self, '_plasticity_freeze_mask', None) is not None:
+            self.M[:, self._plasticity_freeze_mask[0],
+                      self._plasticity_freeze_mask[1]] = self._M_frozen_vals
+        return grad_W_t, grad_b_t
+
+    def local_grad_step_fast(self, x, phi_prime, ell, mode, eta=None, lam=None,
+                             update_mask=None):
+        """Back-compat single-call dispatcher (kept for external callers). The
+        sequence loops use step_fn_for(mode) to hoist this dispatch out of the loop.
+        Returns (grad_W_t, grad_b_t)."""
+        if eta is None or lam is None:
+            eta, lam = self._eta_lam_full()
+        return self.step_fn_for(mode)(x, phi_prime, ell, eta, lam, update_mask)
+
+    def backproject_through_modulated_weights_fast(self, ell_pre):
+        """Compute ell_x = ell_pre @ W_eff without materializing W_eff.
+
+        ell_pre: (B, post), usually ell * phi_prime.
+        returns: (B, pre), sum_i ell_pre_i W_iI (1 + M_iI).
+        """
+        base = ell_pre.matmul(self.W)
+        plastic = torch.bmm(ell_pre.unsqueeze(1), self.W.unsqueeze(0) * self.M).squeeze(1)
+        return base + plastic
 
     @torch.no_grad()
     def param_clamp(self):
@@ -543,7 +876,7 @@ class MultiPlasticLayer(BaseNetworkFunctions):
 
         return M_bounds, init_string
 
-    def update_M_matrix(self, pre, post, update_mask=None):
+    def update_M_matrix(self, pre, post, update_mask=None, eta_lam_build=None):
         """
         Updates the modulation matrix from one time step to the next.
         Should only be called in the network_step pass once. Directly updates self.M.
@@ -557,46 +890,45 @@ class MultiPlasticLayer(BaseNetworkFunctions):
         pre.shape: (B, n_input)
         post.shape: (B, n_output)
         update_mask: (B,)
+        eta_lam_build: optional precomputed (eta, lam) from build_M_parameter —
+            these are constant over an unroll, so the sequence loops hoist the
+            expansion out (identical values, one fewer op per step).
         """
 
-        eta = self.build_M_parameter(self.eta, self.eta_type)
-        lam = self.build_M_parameter(self.lam, self.lam_type)
+        if eta_lam_build is not None:
+            eta, lam = eta_lam_build
+        else:
+            eta = self.build_M_parameter(self.eta, self.eta_type)
+            lam = self.build_M_parameter(self.lam, self.lam_type)
         M = self.M
 
-        delta_M = torch.zeros_like(M)
+        # Compute the pre-activation modulation M_pre directly, batched, without the
+        # `-M + λM` cancellation or a zeros(delta_M) allocation. Both branches below
+        # implement the same recurrence as the original:
+        #   hebb: M_pre = λ M_{t-1} + η · postᵀpre   (hebb_pre: post → 1/√n_out const)
+        #   oja : M_pre = M_{t-1} + η·postᵀpre − |η|·post²·M_{t-1}
+        # update_mask (B,) freezes inactive rows: M_pre = M there (Δ = 0), matching
+        # the original's per-row skip — done vectorized instead of a Python loop.
+        if self.m_update_type in ('hebb_pre',):
+            post = 1 / math.sqrt(post.shape[-1]) * torch.ones_like(post)
 
-        if update_mask is not None: # Update each batch_idx individually using the update_mask
-            for batch_idx in range(M.shape[0]):
-                if update_mask[batch_idx]: # Only calculates delta_M if batch is being updated (I think this saves time?)
-                    if self.m_update_type in ('hebb_pre',):
-                        post = 1 / math.sqrt(post.shape[-1]) * torch.ones_like(post)
+        if self.m_update_type in ('hebb_assoc', 'hebb_pre',):
+            outer = torch.einsum('Bi,BI->BiI', post, pre)
+            M_pre = lam.unsqueeze(0) * M + eta.unsqueeze(0) * outer
+        elif self.m_update_type in ('oja',):
+            outer = torch.einsum('Bi,BI->BiI', post, pre)
+            M_pre = (M + eta.unsqueeze(0) * outer
+                     - torch.abs(eta).unsqueeze(0) * (post ** 2).unsqueeze(-1) * M)
+        else:
+            raise ValueError(f"unknown m_update_type '{self.m_update_type}'")
 
-                    if self.m_update_type in ('hebb_assoc', 'hebb_pre',):
-                        delta_M[batch_idx] = - M[batch_idx] + lam * M[batch_idx] + eta * torch.einsum(
-                            'i, I -> iI', post[batch_idx], pre[batch_idx]
-                        )
-                    elif self.m_update_type in ('oja',):
-                        delta_M[batch_idx] = (eta * torch.einsum('i, I -> iI', post[batch_idx], pre[batch_idx]) -
-                                              torch.abs(eta) * torch.einsum('i, iI -> iI', post[batch_idx]**2, M[batch_idx]))
-        else: # Update all M at once
-            if self.m_update_type in ('hebb_pre',):
-                post = 1 / math.sqrt(post.shape[-1]) * torch.ones_like(post)
+        if update_mask is not None:
+            # Freeze inactive batch rows (Δ = 0 → M_pre = M) without a Python loop.
+            m = update_mask.view(-1, 1, 1).to(M_pre.dtype)
+            M_pre = m * M_pre + (1.0 - m) * M
 
-            if self.m_update_type in ('hebb_assoc', 'hebb_pre',):
-                delta_M = - M + lam.unsqueeze(0) * M + eta.unsqueeze(0) * torch.einsum(
-                    'Bi, BI -> BiI', post, pre
-                )
-
-            elif self.m_update_type in ('oja',):
-                raise NotImplementedError('Need to update to a batched version.')
-                # delta_M[batch_idx] = (eta * torch.einsum('i, I -> iI', post[batch_idx], pre[batch_idx]) -
-                #                       torch.abs(eta) * torch.einsum('i, iI -> iI', post[batch_idx]**2, M[batch_idx]))
-
-        self.M_pre = self.M + delta_M
-        self.M = self.m_act_fn(self.M_pre)
-
-        # # Masks batches of delta_M
-        # delta_M_masked = torch.einsum('B, BiI -> BiI', update_mask, delta_M)
+        self.M_pre = M_pre
+        self.M = self.m_act_fn(M_pre)
 
         # Update M matrices, while being sure update holds matrix within bounds
         # (this may error if not self.ei_types, but this is always true in our settings)
@@ -609,7 +941,8 @@ class MultiPlasticLayer(BaseNetworkFunctions):
             self.M[:, self._plasticity_freeze_mask[0],
                       self._plasticity_freeze_mask[1]] = self._M_frozen_vals
 
-        return delta_M # This is only used for theory matching
+        # Returned only for "theory matching" consumers; keep it correct (M_pre - M).
+        return self.M_pre - M
 
     def get_modulated_weights(self, M=None):
         """
@@ -651,8 +984,20 @@ class MultiPlasticLayer(BaseNetworkFunctions):
 
         """
 
-        modulated_weights = self.get_modulated_weights()
-        pre_act_no_bias =  torch.einsum('BiI, BI -> Bi', modulated_weights, x)
+        # pre_act_no_bias[b,i] = sum_I W_eff[b,i,I] x[b,I], with the modulated weight
+        # W_eff = W + W⊙M (mult) or W + M (add). Instead of materializing the full
+        # (B,i,I) W_eff and contracting it, split into:
+        #   static  = x @ Wᵀ                         (batch-independent → one GEMM)
+        #   plastic = bmm(W⊙M or M, x)               (the genuinely batched part)
+        # Same math, reordered: one fewer (B,i,I) temporary (no W_eff add) and the
+        # static term routes through an optimized dense-linear kernel.
+        static = F.linear(x, self.W)                          # (B, i) = x @ Wᵀ
+        if self.mp_type == 'mult':
+            plastic_w = self.W.unsqueeze(0) * self.M          # (B, i, I) = W⊙M
+        else:  # 'add'
+            plastic_w = self.M                                # (B, i, I)
+        plastic = torch.bmm(plastic_w, x.unsqueeze(-1)).squeeze(-1)   # (B, i)
+        pre_act_no_bias = static + plastic
 
         pre_act = pre_act_no_bias + self.b.unsqueeze(0)
 
@@ -752,6 +1097,24 @@ class MultiPlasticNetBase(BaseNetwork):
 
         for mp_layer in self.mp_layers:
             mp_layer.reset_state(B=B)
+
+    def _scratch(self, name, shape, dtype, device):
+        """Return a persistent scratch buffer (allocated once, reused across calls)
+        keyed by `name`; reallocated only if shape/dtype/device change. For buffers
+        the local loop OVERWRITES every element each step, so no zeroing is needed —
+        this just avoids re-allocating (B,T,·) tensors on every sequence_gradients
+        call (allocator/‑churn win, especially at long T). Stored under
+        self._scratch_bufs (a plain dict, not a registered buffer, so it never lands
+        in state_dict / checkpoints)."""
+        cache = getattr(self, '_scratch_bufs', None)
+        if cache is None:
+            cache = {}
+            self._scratch_bufs = cache
+        buf = cache.get(name)
+        if buf is None or buf.shape != shape or buf.dtype != dtype or buf.device != device:
+            buf = torch.empty(shape, dtype=dtype, device=device)
+            cache[name] = buf
+        return buf
 
     def param_clamp(self):
         # mp_layer call doesn't track gradients, since this is always called after weight updates
@@ -853,15 +1216,14 @@ class MultiPlasticNet(MultiPlasticNetBase):
 
     def forward(self, inputs, run_mode='minimal', verbose=False):
 
-        x = torch.clone(inputs)
+        x = inputs  # read-only downstream (never mutated in-place) → no clone needed
 
         # Returns pre-activation
         hidden_pre, db_mp = self.mp_layer(x, run_mode=run_mode)
 
         hidden = self.act_fn(hidden_pre)
 
-        output_hidden = torch.einsum('iI, BI -> Bi', self.W_output, hidden)
-        output = output_hidden + self.b_output.unsqueeze(0)
+        output = F.linear(hidden, self.W_output, self.b_output)
 
         if run_mode in ('track_states'):
             db = {
@@ -903,133 +1265,200 @@ class MultiPlasticNet(MultiPlasticNetBase):
         return {k: v for k, v in ps.items() if v.requires_grad}
 
     def bptt_gradients(self, inputs, labels, masks,
-                       loss_and_grad=masked_mse_loss_and_output_grad):
+                       loss_and_grad=masked_mse_loss_and_output_grad,
+                       return_outputs=True):
         """Full BPTT gradients via autograd through the unrolled forward +
         update_M_matrix loop. Returns {param_name: grad, ..., 'loss', 'outputs'}.
         With m_activation='linear' and no bounds, update_M_matrix is fully
-        differentiable, so autograd through it is exactly BPTT."""
+        differentiable, so autograd through it is exactly BPTT. Records a fwd/bwd
+        wall-time split in self._bptt_fwd_s / _bptt_bwd_s (CUDA-synced) for timing."""
         B, T, _ = inputs.shape
+        _cuda = self.W_output.is_cuda
+        if _cuda:
+            torch.cuda.synchronize()
+        _t0 = time.perf_counter()
         self.reset_state(B=B)
         outs = []
         for t in range(T):
             x_t = inputs[:, t, :]
             hidden_pre, _ = self.mp_layer(x_t)
             hidden = self.act_fn(hidden_pre)
-            out = torch.einsum('iI,BI->Bi', self.W_output, hidden) + self.b_output.unsqueeze(0)
+            out = F.linear(hidden, self.W_output, self.b_output)
             outs.append(out)
             self.mp_layer.update_M_matrix(x_t, hidden)
         outputs = torch.stack(outs, dim=1)
 
-        loss, _ = loss_and_grad(outputs, labels, masks)
+        # BPTT only needs the SCALAR loss (autograd supplies the param grads); the
+        # default helper's analytic grad_output would be dead work, so skip it.
+        # Bit-identical loss + backward graph → identical gradients.
+        if loss_and_grad is masked_mse_loss_and_output_grad:
+            loss = masked_mse_loss_only(outputs, labels, masks)
+        else:
+            loss, _ = loss_and_grad(outputs, labels, masks)
         params = self._trainable_params()
+        if _cuda:
+            torch.cuda.synchronize()
+        _t1 = time.perf_counter()
         grads = torch.autograd.grad(loss, list(params.values()))
-        result = {k: g.detach().clone() for k, g in zip(params, grads)}
+        if _cuda:
+            torch.cuda.synchronize()
+        _t2 = time.perf_counter()
+        self._bptt_fwd_s = _t1 - _t0
+        self._bptt_bwd_s = _t2 - _t1
+        # autograd.grad returns fresh tensors we own; detach is enough (no clone).
+        result = {k: g.detach() for k, g in zip(params, grads)}
         result['loss'] = loss.detach()
-        result['outputs'] = outputs.detach()
+        result['outputs'] = outputs.detach() if return_outputs else None
         return result
+
+    @torch.no_grad()
+    def _prepass_output_grad(self, inputs, labels, masks, loss_and_grad, eta, lam,
+                             update_masks):
+        """Forward-only pre-pass for a CUSTOM loss. Advances M with the same
+        clean-config fast update the accumulation loop uses (M/traces never depend
+        on grad_output, so the M-trajectory is identical), builds the full output
+        sequence, and returns (loss, grad_output_seq) from loss_and_grad. A general
+        loss's dL/d output_t can couple across time, so the per-step output gradient
+        cannot be formed until every output exists; the accumulation pass then
+        consumes grad_output_seq[:, t]. Keeps grads CONSISTENT with the reported
+        loss, matching bptt_gradients()."""
+        mp = self.mp_layer
+        B, T, _ = inputs.shape
+        dev, dt = inputs.device, inputs.dtype
+        self.reset_state(B=B)
+        outputs = torch.empty(B, T, self.n_output, dtype=dt, device=dev)
+        for t in range(T):
+            x_t = inputs[:, t, :]
+            hidden_pre, _ = mp(x_t)
+            hidden = self.act_fn(hidden_pre)
+            outputs[:, t, :] = F.linear(hidden, self.W_output, self.b_output)
+            um = None if update_masks is None else update_masks[:, t]
+            mp.update_M_matrix_local_fast(x_t, hidden, eta=eta, lam=lam, update_mask=um)
+        loss, grad_output_seq = loss_and_grad(outputs, labels, masks)
+        return loss, grad_output_seq
 
     @torch.no_grad()
     def _local_sequence_gradients(self, inputs, labels, masks, mode,
                                   loss_and_grad=masked_mse_loss_and_output_grad,
-                                  update_masks=None):
-        """Shared forward-mode local-learning loop for the three local rules:
-          mode='exact'  — exact row-local (full trace P, Q)
-          mode='diag'   — diagonal / same-synapse RFLO (trace A, exact Q)
-          mode='direct' — direct/instantaneous (no trace; stops gradient through
-                          the plasticity history)
-        They differ only in the eligibility / trace equations; the loop order,
-        learning signal, and gradient accumulation are identical.
+                                  update_masks=None,
+                                  return_outputs=True):
+        """Shared forward-mode local-learning loop.
 
-        Per-time-step order (must match the theory):
-            forward (uses M_{t-1}) -> learning signal ell -> eligibility E,R
-            (from t-1 traces) -> gradient accumulation -> trace update -> M update.
-
-        ell_{i,t} = (dL_t/dy_t) . F[:, i], where F = W_output (exact_readout) or
-        a fixed random B_feedback (random_fixed, feedback alignment). The readout
-        gradients (W_output, b_output) always use the true grad_output. Returns
-        the same dict shape as bptt_gradients().
+        This keeps the local rules mathematically identical but fuses the hot
+        direct/diagonal operations:
+          * local_direct never materializes E_dir;
+          * local_diag_rflo never materializes E_hat;
+          * eta/lam expansion is cached once per sequence;
+          * the clean local M update skips the general update_M_matrix path;
+          * return_outputs=False avoids storing outputs when using the default
+            masked-MSE loss.
         """
         mp = self.mp_layer
         mp.assert_local_config()
         assert mode in ('exact', 'diag', 'direct')
-        # For hebb_pre the plastic traces are identically zero, so all three
-        # modes give the same EXACT gradient — route to 'direct' to skip the
-        # unused O(B·post·pre²) P trace / O(B·post·pre) A trace allocation.
         if mp.m_update_type == 'hebb_pre':
             mode = 'direct'
 
         B, T, _ = inputs.shape
         dev, dt = inputs.device, inputs.dtype
+        eta, lam = mp._eta_lam_full()   # constant over the unroll; also used by the pre-pass
+
+        # Custom loss: a forward-only pre-pass supplies grad_output_seq (dL/d
+        # outputs) and the loss from the SUPPLIED loss_and_grad, so the returned
+        # grads match the reported loss instead of the hard-coded masked-MSE one.
+        # M/traces never depend on grad_output, so re-running the forward after
+        # reset_state reproduces the identical M-trajectory.
+        default_loss = (loss_and_grad is masked_mse_loss_and_output_grad)
+        need_outputs = return_outputs or (not default_loss)
+        prepass_loss, grad_output_seq = (None, None)
+        if not default_loss:
+            prepass_loss, grad_output_seq = self._prepass_output_grad(
+                inputs, labels, masks, loss_and_grad, eta, lam, update_masks)
+
         self.reset_state(B=B)
         if mode == 'exact':
             mp.reset_local_learning_state(B=B)
         elif mode == 'diag':
             mp.reset_diag_rflo_state(B=B)
-        # mode == 'direct' needs no eligibility state.
 
-        # Feedback matrix for the hidden learning signal (W_output or random).
         feedback = self.W_output if self.feedback_mode == 'exact_readout' else self.B_feedback
+        step_fn = mp.step_fn_for(mode)      # resolve the per-step rule ONCE (no in-loop branch)
+        # Tier-B: if compilation is on and this mode/config supports it, use the
+        # fused compiled core (grads + M/A/Q update in one region); else eager.
+        use_compiled = mp.can_compile_step(mode)
 
         grad_W = torch.zeros_like(mp.W)
         grad_b = torch.zeros_like(mp.b)
-        grad_Wout = torch.zeros_like(self.W_output)
-        grad_bout = torch.zeros_like(self.b_output)
-        outputs = torch.zeros(B, T, self.n_output, dtype=dt, device=dev)
 
-        # Global normalizer for the per-timestep output gradient: the loss is a
-        # mean over ALL B*T*n_out elements, so dL/d output_t carries the full
-        # 1/N (not a per-step count). The per-step grad below is the analytic
-        # masked-MSE gradient this rule is derived for; the loss_and_grad kwarg
-        # is used only for the returned scalar loss.
+        # Time-major, contiguous views: per-step rows inputs_T[t] are contiguous
+        # (B, ·) instead of strided slices of a (B, T, ·) tensor — one upfront copy
+        # for faster per-step reads over a long unroll. Same math.
+        inputs_T = inputs.transpose(0, 1).contiguous()
+        labels_T = labels.transpose(0, 1).contiguous()
+        masks_T = masks.transpose(0, 1).contiguous()
+        um_T = update_masks.transpose(0, 1).contiguous() if update_masks is not None else None
+
+        # Persistent scratch for the readout-gradient contraction, stored time-major
+        # (T, B, ·) so the per-step writes are contiguous; fully overwritten each
+        # step so no zeroing. These NEVER escape (consumed by the einsum below), so
+        # reusing one buffer across calls is safe. outputs is a FRESH allocation
+        # (it is returned via .detach(), which shares storage — a scratch buffer
+        # would be clobbered on the next call), (B, T, ·) for the caller.
+        go_seq = self._scratch('local_go', (T, B, self.n_output), dt, dev)
+        hid_seq = self._scratch('local_hid', (T, B, self.n_hidden), dt, dev)
+        outputs = torch.empty(B, T, self.n_output, dtype=dt, device=dev) if need_outputs else None
+        loss_sum = torch.zeros((), dtype=dt, device=dev)
+
         N = B * T * self.n_output
 
         for t in range(T):
-            x_t = inputs[:, t, :]
+            x_t = inputs_T[t]
 
-            # Forward at time t (consumes M_{t-1}).
             hidden_pre, _ = mp(x_t)
             hidden = self.act_fn(hidden_pre)
-            output = torch.einsum('iI,BI->Bi', self.W_output, hidden) + self.b_output.unsqueeze(0)
-            outputs[:, t, :] = output
+            output = F.linear(hidden, self.W_output, self.b_output)
+            if need_outputs:
+                outputs[:, t, :] = output
 
-            # Eligibility E=dh_t/dW, R=dh_t/db (exact / diagonal / direct).
+            m_t = masks_T[t]
+            if default_loss:
+                diff_t = m_t * output - m_t * labels_T[t]
+                grad_output = (2.0 / N) * m_t * diff_t
+                loss_sum = loss_sum + (diff_t * diff_t).sum()
+            else:
+                grad_output = grad_output_seq[:, t, :]
+
+            ell = grad_output @ feedback
             phi_prime = self.act_fn_p(hidden_pre)
-            if mode == 'exact':
-                E, R = mp.compute_exact_rowlocal_eligibility(x_t, phi_prime)
-            elif mode == 'diag':
-                E, R = mp.compute_diag_rflo_eligibility(x_t, phi_prime)
-            else:  # 'direct'
-                E, R = mp.compute_direct_local_eligibility(x_t, phi_prime)
+            um = None if um_T is None else um_T[t]
 
-            # Per-timestep output gradient (masked MSE, global 1/N). Hidden
-            # learning signal uses the feedback matrix; readout grads use the
-            # true grad_output.
-            m_t, y_t = masks[:, t, :], labels[:, t, :]
-            grad_output = (2.0 / N) * m_t * (m_t * output - m_t * y_t)
-            ell = grad_output @ feedback                    # (B, n_hidden)
+            if use_compiled:
+                # Fused core computes grads AND advances M/A/Q — no separate update.
+                grad_W_t, grad_b_t = mp.compiled_step_and_update(
+                    mode, x_t, hidden, phi_prime, ell, eta, lam, um)
+            else:
+                grad_W_t, grad_b_t = step_fn(x_t, phi_prime, ell, eta, lam, um)
+                mp.update_M_matrix_local_fast(x_t, hidden, eta=eta, lam=lam, update_mask=um)
+            grad_W += grad_W_t
+            grad_b += grad_b_t
 
-            grad_W += torch.einsum('Bi,BiI->iI', ell, E)
-            grad_b += torch.einsum('Bi,Bi->i', ell, R)
-            grad_Wout += torch.einsum('Ba,Bi->ai', grad_output, hidden)
-            grad_bout += grad_output.sum(0)
+            go_seq[t] = grad_output
+            hid_seq[t] = hidden
 
-            # Advance traces (if any) then modulations (M -> t), both mask-aware.
-            # 'direct' keeps no trace, but STILL updates M — the rule uses the
-            # true MPN forward dynamics; it only stops eligibility flow through
-            # the history that produced M.
-            um = None if update_masks is None else update_masks[:, t]
-            if mode == 'exact':
-                mp.update_exact_rowlocal_traces(x_t, E, R, update_mask=um)
-            elif mode == 'diag':
-                mp.update_diag_rflo_traces(x_t, E, R, update_mask=um)
-            mp.update_M_matrix(x_t, hidden, update_mask=um)
+        # Readout grads from the time-major buffers (one contraction each).
+        grad_Wout = torch.einsum('TBa,TBi->ai', go_seq, hid_seq)
+        grad_bout = go_seq.sum(dim=(0, 1))
 
-        loss, _ = loss_and_grad(outputs, labels, masks)
+        if default_loss:
+            loss = masked_mse_loss_only(outputs, labels, masks) if outputs is not None else (loss_sum / N)
+        else:
+            loss = prepass_loss   # from the pre-pass, same outputs → identical value
+
         params = self._trainable_params()
         all_grads = {'W': grad_W, 'b': grad_b, 'W_output': grad_Wout, 'b_output': grad_bout}
         result = {k: all_grads[k] for k in params}
         result['loss'] = loss.detach()
-        result['outputs'] = outputs.detach()
+        result['outputs'] = outputs.detach() if return_outputs and outputs is not None else None
         return result
 
     def local_gradients(self, inputs, labels, masks, **kwargs):
@@ -1078,9 +1507,14 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
 
     BPTT (bptt_gradients / sequence_gradients with learning_rule='bptt') supports
     ANY number of MP layers — it is autograd through the unrolled forward, which
-    already iterates over self.mp_layers. The local rules (local_*) currently
-    support exactly one MP layer (they lack the inter-layer learning-signal
-    back-projection a deeper stack would need); they assert this.
+    already iterates over self.mp_layers. The local rules (local_*) ALSO support
+    any number of MP layers: each layer keeps its own intra-layer eligibility
+    (exact row-local / diagonal RFLO / direct) and is credited by a same-time
+    inter-layer learning signal backprojected through the modulated weights of the
+    layers above it (see _same_time_boundary_signals). Those hidden-layer updates
+    are surrogates — they omit temporal paths through the plastic state of the
+    layers above them — even when the intra-layer eligibility is exact; with exact
+    readout feedback the TOP plastic layer's gradient is exact.
     """
 
     def __init__(self, net_params, verbose=False):
@@ -1115,10 +1549,17 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
 
         super().__init__(cfg, cfg['n_neurons'][-2], output_matrix=self.output_matrix, verbose=verbose)
 
-        # Fixed random feedback matrix for feedback alignment (shape of W_output).
+        # Fixed random feedback matrix for the TOP-layer learning signal
+        # (feedback alignment). Must match W_output's shape — (n_output, top_hidden)
+        # where top_hidden = last plastic-layer width = cfg['n_neurons'][-2], NOT the
+        # first hidden width self.n_hidden (which is wrong for a deep unequal-width
+        # stack). For a single MP layer the two coincide, so the single-layer init is
+        # RNG-identical to before. Only the top boundary uses random feedback; the
+        # inter-layer boundary signals always backproject through the modulated
+        # weights (per-boundary feedback alignment is not yet implemented).
         if self.feedback_mode == 'random_fixed':
             self.register_buffer('B_feedback', torch.tensor(
-                rand_weight_init(self.n_hidden, self.n_output,
+                rand_weight_init(cfg['n_neurons'][-2], self.n_output,
                                  init_type=cfg.get('B_feedback_init', 'xavier')),
                 dtype=self.W_output.dtype))
 
@@ -1207,15 +1648,16 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
         else:
             x = inputs
 
-        layer_input = torch.clone(x)
+        layer_input = x  # read-only downstream (never mutated in-place) → no clone
 
         mpl_activities = [x,] # Used for updating the M matrices
 
         db = {} if run_mode in ('track_states',) else None
 
         for mpl_idx, mp_layer in enumerate(self.mp_layers):
-            # Returns pre-activation
-            layer_input_old = layer_input.clone()
+            # The pre-layer activity is only needed for the track_states log below;
+            # capture it there (as a detached snapshot) instead of cloning every step.
+            layer_input_old = layer_input
             hidden_pre, db_mp = mp_layer(layer_input, run_mode=run_mode)
 
             layer_input = self.act_fn(hidden_pre)
@@ -1234,11 +1676,10 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
                 db['b{}'.format(mp_layer.mp_layer_name)] = db_mp['b']
                 db['input{}'.format(mp_layer.mp_layer_name)] = layer_input_old.detach()
 
-        if run_mode in ('debug',): 
+        if run_mode in ('debug',):
             print(f'  Output layer forward.')
-            
-        output_hidden = torch.einsum('iI, BI -> Bi', self.W_output, layer_input)
-        output = output_hidden + self.b_output.unsqueeze(0)
+
+        output = F.linear(layer_input, self.W_output, self.b_output)
         
         return output, mpl_activities, db
 
@@ -1279,19 +1720,94 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
     # with the plastic M playing the role the RNN's recurrence plays.
     # BPTT trains ALL params (every MP layer + the input embedding) exactly via
     # autograd through the unrolled forward, for ANY number of MP layers. The local
-    # rules train the (single) MP layer with eligibility traces and the input
-    # embedding with a DIRECT 3-factor rule (backproject the hidden learning signal
-    # through the modulated weights, then multiply by the embedding activation
-    # derivative and the raw input — the RNN's RFLO treatment of its input weights;
-    # M-mediated history is dropped) and support exactly one MP layer.
-
-    def _assert_single_mp(self):
-        assert len(self.mp_layers) == 1, (
-            "the local learning rules support exactly one MP layer; use "
-            "learning_rule='bptt' for a multi-MP-layer stack.")
+    # rules train EVERY MP layer with its own eligibility traces, credited by a
+    # same-time inter-layer learning signal backprojected through the modulated
+    # weights of the layers above (M-mediated temporal paths through upper layers
+    # dropped), and train the input embedding with the same DIRECT 3-factor rule
+    # (backproject the boundary signal through layer 0's modulated weights, then
+    # multiply by the embedding activation derivative and the raw input — the RNN's
+    # RFLO treatment of its input weights). Works for any number of MP layers.
 
     def _has_trainable_embed(self):
         return (self.input_layer_active and self.W_initial_linear.weight.requires_grad)
+
+    # ── Deep-local forward + same-time boundary-signal helpers ────────────────
+    # These implement the two ingredients the multi-MP-layer local rules need
+    # (see the class docstring): a forward that stops short of the M update, and
+    # a top-down learning-signal pass that backprojects the readout error through
+    # every layer's MODULATED weights W_eff = W ⊙ (1 + M_{t-1}). Both read the
+    # frozen M_{t-1}, so they must run before any layer advances its M.
+
+    def _forward_local_stack(self, u_t):
+        """Forward one time step through the whole stack WITHOUT updating any M.
+
+        Returns (output, h, z, phi_p, embed_pre) with the zero-based indexing the
+        deep-local loop uses:
+            h[0]      input representation (= embedding output, or raw u_t)
+            z[n]      preactivation of MP layer n           (B, d_{n+1})
+            phi_p[n]  phi'(z[n])                            (B, d_{n+1})
+            h[n+1]    output of MP layer n                  (B, d_{n+1})
+            output    readout(h[L])
+        embed_pre is the embedding PRE-activation (for the embedding grad) or None.
+        Every mp(...) call consumes that layer's own M_{t-1}; nothing is advanced.
+        """
+        if self.input_layer_active:
+            embed_pre = self.W_initial_linear(u_t)
+            h0 = self.act_fn(embed_pre)
+        else:
+            embed_pre = None
+            h0 = u_t
+
+        h = [h0]
+        z = []
+        phi_p = []
+        for mp in self.mp_layers:
+            z_n, _ = mp(h[-1])              # uses this layer's M_{t-1}
+            phi_p.append(self.act_fn_p(z_n))
+            z.append(z_n)
+            h.append(self.act_fn(z_n))
+
+        output = F.linear(h[-1], self.W_output, self.b_output)
+        return output, h, z, phi_p, embed_pre
+
+    def _same_time_boundary_signals(self, grad_output, phi_p, need_input_signal):
+        """Same-time layer-boundary learning signals using the frozen M_{t-1}.
+
+        ell_h[n] approximates dL/dh[n] (the signal at the INPUT boundary of MP
+        layer n). The top signal is exact readout feedback (or the fixed random
+        matrix); each lower boundary is obtained by ordinary spatial backprop of
+        the layer above's preactivation signal through its modulated weights:
+
+            ell_h[L]   = grad_output @ W_output          (or @ B_feedback)
+            ell_h[n]   = W_eff^{(n)T} ( ell_h[n+1] ⊙ phi'(z[n]) )   for n < L
+
+        This drops temporal paths through the plastic state of upper layers but
+        keeps the same-time spatial gradient. Layer n's eligibility routine is fed
+        ell_h[n+1] (its OUTPUT-boundary signal) — NOT premultiplied by phi'.
+
+        Returns ell_h, a length-(L+1) list. ell_h[1..L] are always filled (every
+        MP layer's step needs its output signal); ell_h[0] is filled only when
+        need_input_signal (the trainable input embedding) — for a single MP layer
+        with no embedding this computes exactly one matmul, matching the old path.
+        """
+        L = len(self.mp_layers)
+        ell_h = [None] * (L + 1)
+
+        if self.feedback_mode == 'exact_readout':
+            ell_h[L] = grad_output @ self.W_output
+        else:
+            ell_h[L] = grad_output @ self.B_feedback
+
+        # Fill ell_h[L-1 .. 1] (each MP layer n uses ell_h[n+1]); then ell_h[0]
+        # only if the embedding needs it (backprojected through layer 0).
+        for n in range(L - 1, 0, -1):
+            delta_n = ell_h[n + 1] * phi_p[n]
+            ell_h[n] = self.mp_layers[n].backproject_through_modulated_weights_fast(delta_n)
+        if need_input_signal:
+            delta_0 = ell_h[1] * phi_p[0]
+            ell_h[0] = self.mp_layers[0].backproject_through_modulated_weights_fast(delta_0)
+
+        return ell_h
 
     def _trainable_params(self):
         """Trainable tensors this net computes gradients for, keyed by name.
@@ -1314,11 +1830,17 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
         return {k: v for k, v in ps.items() if v.requires_grad}
 
     def bptt_gradients(self, inputs, labels, masks,
-                       loss_and_grad=masked_mse_loss_and_output_grad):
+                       loss_and_grad=masked_mse_loss_and_output_grad,
+                       return_outputs=True):
         """Full BPTT via autograd through the unrolled deep forward + M-update.
         Trains every parameter (all MP layers + the input embedding) exactly, for
-        any number of MP layers."""
+        any number of MP layers. Records a fwd/bwd wall-time split in
+        self._bptt_fwd_s / _bptt_bwd_s (CUDA-synced) for the timing readout."""
         B, T, _ = inputs.shape
+        _cuda = self.W_output.is_cuda
+        if _cuda:
+            torch.cuda.synchronize()
+        _t0 = time.perf_counter()
         self.reset_state(B=B)
         outs = []
         for t in range(T):
@@ -1326,135 +1848,250 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
             outs.append(out)
         outputs = torch.stack(outs, dim=1)
 
-        loss, _ = loss_and_grad(outputs, labels, masks)
+        # BPTT only needs the SCALAR loss (autograd supplies the param grads); the
+        # default helper's analytic grad_output would be dead work, so skip it.
+        # Bit-identical loss + backward graph → identical gradients.
+        if loss_and_grad is masked_mse_loss_and_output_grad:
+            loss = masked_mse_loss_only(outputs, labels, masks)
+        else:
+            loss, _ = loss_and_grad(outputs, labels, masks)
         params = self._trainable_params()
+        if _cuda:
+            torch.cuda.synchronize()
+        _t1 = time.perf_counter()
         grads = torch.autograd.grad(loss, list(params.values()))
-        result = {k: g.detach().clone() for k, g in zip(params, grads)}
+        if _cuda:
+            torch.cuda.synchronize()
+        _t2 = time.perf_counter()
+        self._bptt_fwd_s = _t1 - _t0
+        self._bptt_bwd_s = _t2 - _t1
+        # autograd.grad returns fresh tensors we own; detach is enough (no clone).
+        result = {k: g.detach() for k, g in zip(params, grads)}
         result['loss'] = loss.detach()
-        result['outputs'] = outputs.detach()
+        result['outputs'] = outputs.detach() if return_outputs else None
         return result
+
+    @torch.no_grad()
+    def _prepass_output_grad(self, inputs, labels, masks, loss_and_grad, eta_lam,
+                             update_masks):
+        """Forward-only pre-pass for a CUSTOM loss (deep net). Runs the embedding +
+        full MP stack with the same clean-config fast M update the accumulation
+        loop uses (for EVERY layer), builds the full output sequence, and returns
+        (loss, grad_output_seq) from loss_and_grad. See
+        MultiPlasticNet._prepass_output_grad. eta_lam is the per-layer list of
+        (eta, lam) expansions (one entry per MP layer)."""
+        layers = self.mp_layers
+        B, T, _ = inputs.shape
+        dev, dt = inputs.device, inputs.dtype
+        self.reset_state(B=B)
+        outputs = torch.empty(B, T, self.n_output, dtype=dt, device=dev)
+        for t in range(T):
+            u_t = inputs[:, t, :]
+            output, h, z, phi_p, embed_pre = self._forward_local_stack(u_t)
+            outputs[:, t, :] = output
+            um = None if update_masks is None else update_masks[:, t]
+            for n, mp in enumerate(layers):
+                eta_n, lam_n = eta_lam[n]
+                mp.update_M_matrix_local_fast(h[n], h[n + 1], eta=eta_n, lam=lam_n,
+                                              update_mask=um)
+        loss, grad_output_seq = loss_and_grad(outputs, labels, masks)
+        return loss, grad_output_seq
 
     @torch.no_grad()
     def _local_sequence_gradients(self, inputs, labels, masks, mode,
                                   loss_and_grad=masked_mse_loss_and_output_grad,
-                                  update_masks=None):
-        """Forward-mode local learning for the deep net (one MP layer + optional
-        trainable input embedding). Same three modes as MultiPlasticNet for the MP
-        layer ('exact'/'diag'/'direct'); the input embedding always uses the direct
-        3-factor rule. Per-step order: forward (uses M_{t-1}) -> learning signal ->
-        eligibility -> grad accumulation -> trace update -> M update."""
-        self._assert_single_mp()
-        mp = self.mp_layers[0]
-        mp.assert_local_config()
+                                  update_masks=None,
+                                  return_outputs=True):
+        """Forward-mode local learning for the deep net — ANY number of MP layers.
+
+        Per time step (see the class docstring and the module derivation) the
+        ordering is strict:
+          1. forward the whole stack with M_{t-1}                (_forward_local_stack)
+          2. readout error grad_output
+          3. every same-time boundary signal ell_h[.] with M_{t-1}
+             (_same_time_boundary_signals) BEFORE any M is advanced
+          4. each layer's local gradient from its own eligibility, credited by its
+             OUTPUT-boundary signal ell_h[n+1]
+          5. (fused into 4 for direct/diag) advance each layer's traces
+          6. only now advance every layer's M from M_{t-1} to M_t
+
+        Each layer keeps its own intra-layer eligibility (exact P/Q, diagonal A/Q,
+        or direct); the inter-layer credit is the same-time spatial backprojection
+        through the modulated weights, which drops temporal paths through upper
+        plastic layers. For a single MP layer this reduces to the previous
+        single-layer computation bit-for-bit (one top boundary matmul, same
+        scratch buffers, same einsums).
+
+        Loss handling mirrors MultiPlasticNet: default masked MSE is inline; a
+        custom loss_and_grad triggers a forward-only pre-pass whose grad_output_seq
+        feeds the accumulation pass (grads stay consistent with the reported loss).
+        """
+        layers = self.mp_layers
+        L = len(layers)
+        for mp in layers:
+            mp.assert_local_config()
         assert mode in ('exact', 'diag', 'direct')
-        # For hebb_pre the plastic traces are identically zero, so all three
-        # modes give the same EXACT gradient — route to 'direct' to skip the
-        # unused P/A trace allocation.
-        if mp.m_update_type == 'hebb_pre':
+        # hebb_pre: M input-only → dM/dW = dM/db = 0, every plastic trace is zero,
+        # so the trace modes collapse to the direct rule (per layer). _assoc already
+        # zeroes the trace terms, but routing to 'direct' also skips the unused
+        # trace allocation, exactly as the single-layer path does.
+        if all(mp.m_update_type == 'hebb_pre' for mp in layers):
             mode = 'direct'
 
         B, T, _ = inputs.shape
         dev, dt = inputs.device, inputs.dtype
+        eta_lam = [mp._eta_lam_full() for mp in layers]   # per-layer (eta, lam), constant over the unroll
+
+        # Custom loss: forward-only pre-pass supplies grad_output_seq and the loss
+        # (see MultiPlasticNet._local_sequence_gradients / _prepass_output_grad).
+        default_loss = (loss_and_grad is masked_mse_loss_and_output_grad)
+        need_outputs = return_outputs or (not default_loss)
+        prepass_loss, grad_output_seq = (None, None)
+        if not default_loss:
+            prepass_loss, grad_output_seq = self._prepass_output_grad(
+                inputs, labels, masks, loss_and_grad, eta_lam, update_masks)
+
         self.reset_state(B=B)
-        if mode == 'exact':
-            mp.reset_local_learning_state(B=B)
-        elif mode == 'diag':
-            mp.reset_diag_rflo_state(B=B)
+        for mp in layers:
+            if mode == 'exact':
+                mp.reset_local_learning_state(B=B)
+            elif mode == 'diag':
+                mp.reset_diag_rflo_state(B=B)
 
-        feedback = self.W_output if self.feedback_mode == 'exact_readout' else self.B_feedback
         embed = self._has_trainable_embed()
+        step_fns = [mp.step_fn_for(mode) for mp in layers]   # per-layer rule, resolved once
+        # Tier-B fused compiled core (opt-in). Safe for a deep stack too: all
+        # boundary signals are computed up front, and each layer's compiled step
+        # reads/advances only its OWN M/traces, so advancing M[n] inside the
+        # per-layer loop never disturbs another layer's step.
+        use_compiled = all(mp.can_compile_step(mode) for mp in layers)
 
-        grad_W = torch.zeros_like(mp.W)
-        grad_b = torch.zeros_like(mp.b)
-        grad_Wout = torch.zeros_like(self.W_output)
-        grad_bout = torch.zeros_like(self.b_output)
+        grad_W = [torch.zeros_like(mp.W) for mp in layers]
+        grad_b = [torch.zeros_like(mp.b) for mp in layers]
+
+        # Time-major, contiguous views (see MultiPlasticNet._local_sequence_gradients).
+        inputs_T = inputs.transpose(0, 1).contiguous()
+        labels_T = labels.transpose(0, 1).contiguous()
+        masks_T = masks.transpose(0, 1).contiguous()
+        um_T = update_masks.transpose(0, 1).contiguous() if update_masks is not None else None
+
+        # Persistent scratch (time-major, contiguous writes, fully overwritten →
+        # no zeroing). go_seq/hid_seq/ga_seq/u_seq never escape (consumed by the
+        # einsums below), so reuse across calls is safe; outputs is a fresh alloc
+        # since it is returned (its .detach() shares storage). hid_seq holds the TOP
+        # hidden activity h[L] fed to the readout, so it is sized by W_output's input
+        # width (= last plastic width), NOT self.n_hidden (wrong for unequal widths).
+        top_hidden_dim = self.W_output.shape[1]
+        go_seq = self._scratch('dlocal_go', (T, B, self.n_output), dt, dev)
+        hid_seq = self._scratch('dlocal_hid', (T, B, top_hidden_dim), dt, dev)
+        outputs = torch.empty(B, T, self.n_output, dtype=dt, device=dev) if need_outputs else None
+        loss_sum = torch.zeros((), dtype=dt, device=dev)
         if embed:
-            grad_Win = torch.zeros_like(self.W_initial_linear.weight)
             has_bin = self.W_initial_linear.bias is not None
-            grad_bin = torch.zeros_like(self.W_initial_linear.bias) if has_bin else None
-        outputs = torch.zeros(B, T, self.n_output, dtype=dt, device=dev)
+            ga_seq = self._scratch('dlocal_ga', (T, B, self.W_initial_linear.weight.shape[0]), dt, dev)
+            u_seq = self._scratch('dlocal_u', (T, B, self.n_input), dt, dev)
+
         N = B * T * self.n_output
 
         for t in range(T):
-            u_t = inputs[:, t, :]                       # raw input (B, n_input)
+            u_t = inputs_T[t]
 
-            # Input embedding forward: a = W_in u (+ b_in); x = act(a).
-            if self.input_layer_active:
-                a_t = self.W_initial_linear(u_t)
-                x_t = self.act_fn(a_t)
+            # 1. Forward the whole stack with M_{t-1} (no M advance yet).
+            output, h, z, phi_p, embed_pre = self._forward_local_stack(u_t)
+            if need_outputs:
+                outputs[:, t, :] = output
+
+            # 2. Readout error.
+            m_t = masks_T[t]
+            if default_loss:
+                diff_t = m_t * output - m_t * labels_T[t]
+                grad_output = (2.0 / N) * m_t * diff_t
+                loss_sum = loss_sum + (diff_t * diff_t).sum()
             else:
-                a_t, x_t = None, u_t
+                grad_output = grad_output_seq[:, t, :]
 
-            # MP layer forward (consumes M_{t-1}); readout.
-            hidden_pre, _ = mp(x_t)
-            hidden = self.act_fn(hidden_pre)
-            output = torch.einsum('iI,BI->Bi', self.W_output, hidden) + self.b_output.unsqueeze(0)
-            outputs[:, t, :] = output
+            um = None if um_T is None else um_T[t]
 
-            # MP-layer eligibility E=dh/dW, R=dh/db from prev traces.
-            phi_prime = self.act_fn_p(hidden_pre)
-            if mode == 'exact':
-                E, R = mp.compute_exact_rowlocal_eligibility(x_t, phi_prime)
-            elif mode == 'diag':
-                E, R = mp.compute_diag_rflo_eligibility(x_t, phi_prime)
-            else:
-                E, R = mp.compute_direct_local_eligibility(x_t, phi_prime)
+            # 3. All same-time boundary signals, using the still-frozen M_{t-1}.
+            #    ell_h[n+1] credits MP layer n; ell_h[0] (only if the embedding is
+            #    trainable) credits the input embedding.
+            ell_h = self._same_time_boundary_signals(grad_output, phi_p,
+                                                      need_input_signal=embed)
 
-            # Output gradient + hidden learning signal (feedback matrix).
-            m_t, y_t = masks[:, t, :], labels[:, t, :]
-            grad_output = (2.0 / N) * m_t * (m_t * output - m_t * y_t)
-            ell = grad_output @ feedback                 # (B, n_hidden)
-
-            grad_W += torch.einsum('Bi,BiI->iI', ell, E)
-            grad_b += torch.einsum('Bi,Bi->i', ell, R)
-            grad_Wout += torch.einsum('Ba,Bi->ai', grad_output, hidden)
-            grad_bout += grad_output.sum(0)
-
-            # Input embedding, local (direct 3-factor) rule. Backproject ell
-            # through the modulated MP weights to the embedding output x, then
-            # through act'(a).
-            #   ell_x_I = sum_i ell_i * phi'(h~_i) * W_eff_iI ;  grad_a = ell_x * act'(a)
-            #   dL/dW_in = grad_a^T u ;  dL/db_in = sum_B grad_a
+            # 4. Trainable input embedding (3-factor direct rule); uses M_{t-1} via
+            #    ell_h[0], so it MUST precede the M updates.
             if embed:
-                W_eff = mp.get_modulated_weights()       # (B, i, I) = W + W⊙M_{t-1}
-                ell_pre = ell * phi_prime                # (B, i)  = dL/dh~_i
-                ell_x = torch.einsum('Bi,BiI->BI', ell_pre, W_eff)   # (B, I=embed dim)
-                grad_a = ell_x * self.act_fn_p(a_t)      # through x = act(a)
-                grad_Win += torch.einsum('Bo,BI->oI', grad_a, u_t)
-                if has_bin:
-                    grad_bin += grad_a.sum(0)
+                ga_seq[t] = ell_h[0] * self.act_fn_p(embed_pre)
+                u_seq[t] = u_t
 
-            # Advance traces then M.
-            um = None if update_masks is None else update_masks[:, t]
-            if mode == 'exact':
-                mp.update_exact_rowlocal_traces(x_t, E, R, update_mask=um)
-            elif mode == 'diag':
-                mp.update_diag_rflo_traces(x_t, E, R, update_mask=um)
-            mp.update_M_matrix(x_t, hidden, update_mask=um)
+            # 5. Per-layer local gradient + trace advance.
+            if use_compiled:
+                # Fused core computes grads AND advances this layer's M/A/Q.
+                for n, mp in enumerate(layers):
+                    eta_n, lam_n = eta_lam[n]
+                    grad_W_t, grad_b_t = mp.compiled_step_and_update(
+                        mode, h[n], h[n + 1], phi_p[n], ell_h[n + 1], eta_n, lam_n, um)
+                    grad_W[n] += grad_W_t
+                    grad_b[n] += grad_b_t
+            else:
+                for n, mp in enumerate(layers):
+                    eta_n, lam_n = eta_lam[n]
+                    grad_W_t, grad_b_t = step_fns[n](
+                        h[n], phi_p[n], ell_h[n + 1], eta_n, lam_n, um)
+                    grad_W[n] += grad_W_t
+                    grad_b[n] += grad_b_t
+                # 6. Only now advance every layer's M from M_{t-1} to M_t.
+                for n, mp in enumerate(layers):
+                    eta_n, lam_n = eta_lam[n]
+                    mp.update_M_matrix_local_fast(
+                        h[n], h[n + 1], eta=eta_n, lam=lam_n, update_mask=um)
 
-        loss, _ = loss_and_grad(outputs, labels, masks)
-        all_grads = {'W': grad_W, 'b': grad_b, 'W_output': grad_Wout, 'b_output': grad_bout}
+            go_seq[t] = grad_output
+            hid_seq[t] = h[-1]
+
+        grad_Wout = torch.einsum('TBa,TBi->ai', go_seq, hid_seq)
+        grad_bout = go_seq.sum(dim=(0, 1))
+
+        if default_loss:
+            loss = masked_mse_loss_only(outputs, labels, masks) if outputs is not None else (loss_sum / N)
+        else:
+            loss = prepass_loss   # from the pre-pass, same outputs → identical value
+
+        # Assemble grads under the same keys as _trainable_params: layer 0 → 'W'/'b',
+        # layer n≥1 → 'W{n}'/'b{n}'; readout 'W_output'/'b_output'; embedding 'W_in'/'b_in'.
+        all_grads = {'W_output': grad_Wout, 'b_output': grad_bout}
+        for n in range(L):
+            suffix = '' if n == 0 else str(n)
+            all_grads[f'W{suffix}'] = grad_W[n]
+            all_grads[f'b{suffix}'] = grad_b[n]
         if embed:
-            all_grads['W_in'] = grad_Win
+            all_grads['W_in'] = torch.einsum('TBo,TBI->oI', ga_seq, u_seq)
             if has_bin:
-                all_grads['b_in'] = grad_bin
+                all_grads['b_in'] = ga_seq.sum(dim=(0, 1))
 
         params = self._trainable_params()
         result = {k: all_grads[k] for k in params}
         result['loss'] = loss.detach()
-        result['outputs'] = outputs.detach()
+        result['outputs'] = outputs.detach() if return_outputs and outputs is not None else None
         return result
 
     def local_gradients(self, inputs, labels, masks, **kwargs):
-        """Exact row-local MP-layer gradients + direct 3-factor input embedding."""
+        """Exact intra-layer row-local eligibility per MP layer + direct same-time
+        inter-layer learning signals + direct 3-factor input embedding. The top
+        plastic layer's gradient is exact with exact readout feedback; hidden-layer
+        updates omit temporal paths through upper plastic layers (surrogates)."""
         return self._local_sequence_gradients(inputs, labels, masks, 'exact', **kwargs)
 
     def local_diag_rflo_gradients(self, inputs, labels, masks, **kwargs):
-        """Diagonal RFLO MP-layer gradients + direct 3-factor input embedding."""
+        """Diagonal RFLO eligibility per MP layer + direct same-time inter-layer
+        learning signals + direct 3-factor input embedding."""
         return self._local_sequence_gradients(inputs, labels, masks, 'diag', **kwargs)
 
     def local_direct_gradients(self, inputs, labels, masks, **kwargs):
-        """Direct/instantaneous MP-layer gradients + direct 3-factor input embedding."""
+        """Direct/instantaneous eligibility per MP layer + direct same-time
+        inter-layer learning signals + direct 3-factor input embedding. Treats
+        every M_{t-1} as a stop-gradient state (spatial backprop through the deep
+        feedforward net with frozen modulation)."""
         return self._local_sequence_gradients(inputs, labels, masks, 'direct', **kwargs)
 
     def sequence_gradients(self, inputs, labels, masks, **kwargs):

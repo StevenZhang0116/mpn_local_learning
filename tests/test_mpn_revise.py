@@ -55,8 +55,11 @@ import numpy as np
 import torch
 
 import _bootstrap  # prepends ../core + ../scripts to sys.path
-import mpn
-import mpn_revise
+# The reference implementation is core/mpn_archive.py; the efficiency-optimized
+# one (formerly mpn_revise) is now the default core/mpn.py. Alias them to the
+# names this test uses throughout: `mpn` = reference, `mpn_revise` = optimized.
+import mpn_archive as mpn
+import mpn as mpn_revise
 import tasks
 
 
@@ -247,7 +250,7 @@ def check_compile_local(dtype=torch.float32, rtol=1e-4, atol=1e-5):
     Wider tolerance than the mpn-vs-mpn_revise check because torch.compile fuses/
     reorders float ops; the first compiled call also triggers compilation (slow).
     Falls back to eager internally if compilation raises, so it never hard-fails."""
-    import mpn_revise as mr
+    import mpn as mr  # the efficiency-optimized impl (formerly mpn_revise)
     for net_type in ("dmpn", "mpn1"):
         for rule in ("local_diag_rflo", "local_direct"):
             _, net = build_pair(net_type, 5, 8, 3, dtype, seed=31)
@@ -322,7 +325,7 @@ def benchmark_seqmnist(net_type, rule, n_hidden=64, B=16, reps=5, warmup=2):
         _sync()
         return 1000.0 * (time.perf_counter() - t0) / reps
 
-    import mpn_revise as mr
+    import mpn as mr  # the efficiency-optimized impl (formerly mpn_revise)
     mr.set_compile_local(False)
     to, tr = timeit(net_o), timeit(net_r)
     speedup = to / tr if tr > 0 else float("nan")

@@ -83,6 +83,7 @@ class AddingProblemTask:
     # still computed and logged to the console.
     metric = "loss"
     y_label = "masked-MSE loss"
+    loss_and_grad = None            # default masked MSE (net's module-local fast path)
 
     def __init__(self, seq_len=200, n_marks=2, high=1.0, tol=0.04,
                  placement="segments"):

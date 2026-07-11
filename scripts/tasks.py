@@ -24,6 +24,16 @@ All tensors are (B, T, ·). The mask is a float 'cost' mask (B, T, n_out) — th
 loss/eligibility machinery already multiplies by it, so a task that only scores
 its final step just sets the mask to 1 there and 0 elsewhere.
 
+A Task also declares its OBJECTIVE via a `loss_and_grad` attribute (the
+(loss, dL/d output) contract of mpn.masked_mse_loss_and_output_grad):
+    None  -> the net's default masked MSE (ring / adding). Passing None keeps the
+             net on its module-local fast path (the local rules' single-pass
+             masked-MSE branch), so the default tasks are byte-for-byte unchanged.
+    fn    -> a task-specific loss (seq-MNIST uses masked cross-entropy on logits).
+             Any non-default loss routes the local rules through their two-pass
+             path (forward once for outputs, then loss_and_grad for grad_output).
+The objective is per-task by design; different tasks need not share one loss.
+
 `make_task(ruleset)` maps the RULESET string to the right Task:
     'seqmnist'         -> SeqMNISTTask(mode='row')    28 steps of 28 pixels
     'seqmnist_pixel'   -> SeqMNISTTask(mode='pixel')  784 steps of 1 pixel
@@ -38,6 +48,7 @@ import torch
 
 import mpn_tasks
 from adding_tasks import AddingProblemTask
+from mpn import masked_cross_entropy_loss_and_grad
 
 
 # ─── Multitask ring tasks (the original behaviour, unchanged) ─────────────────
@@ -50,6 +61,7 @@ class MultiTaskAdapter:
     # log-y (used by regression tasks where accuracy is uninformative).
     metric = "accuracy"
     y_label = "angle accuracy (%)"
+    loss_and_grad = None            # default masked MSE (net's module-local fast path)
 
     def init_params(self, task_params, train_params, net_params):
         task_params, train_params, net_params = mpn_tasks.convert_and_init_multitask_params(
@@ -107,9 +119,12 @@ def _read_idx_labels(path):
 
 
 class SeqMNISTTask:
-    """Sequential MNIST framed as masked-MSE onto a one-hot target, so it drives
-    the exact same loss/eligibility machinery as the ring tasks (the local rules
-    are derived for masked MSE — cross-entropy would not fit them).
+    """Sequential MNIST as a classification task, trained with masked softmax
+    CROSS-ENTROPY on the final step (loss_and_grad below). Cross-entropy is the
+    standard classification objective; the local rules consume any loss through
+    their (loss, dL/d output) seam, so — with the two-pass fix — CE fits them
+    exactly (it only enters via grad_output). The final-step readout is treated
+    as LOGITS (no softmax in the net forward; argmax accuracy is unchanged).
 
     Each 28x28 image is presented as a sequence:
       mode='row'   -> T=28 steps, 28 features/step (row by row).  [fast default]
@@ -124,6 +139,7 @@ class SeqMNISTTask:
     n_classes = 10
     metric = "accuracy"
     y_label = "classification accuracy (%)"
+    loss_and_grad = staticmethod(masked_cross_entropy_loss_and_grad)
 
     def __init__(self, mode="row"):
         assert mode in ("row", "pixel"), f"unknown seq-MNIST mode '{mode}'"

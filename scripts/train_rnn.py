@@ -39,7 +39,7 @@ RULESET = "seqmnist_pixel"           # single task to train on
 RULES_TO_RUN = ["bptt", "local_diag_rflo"]   # rules to compare
 FEEDBACK_MODE = "exact_readout"   # 'exact_readout' or 'random_fixed' (feedback align)
 N_RUNS = 3                    # independent seeds per rule
-N_HIDDEN = 200                # one_task.py: n_hidden = 200
+N_HIDDEN = 180                # one_task.py: n_hidden = 200
 N_DATASETS = 5000             # one_task.py: n_datasets = 3000 (heavy on CPU)
 BATCH = 128                   # one_task.py: n_batches = batch_size = 128
 LR = 1e-3                     # one_task.py: lr = 1e-3

@@ -524,6 +524,184 @@ def tier8_hebb_pre():
     return allok
 
 
+def _quartic_loss_and_grad(output, labels, mask):
+    """A non-MSE differentiable masked loss for the custom-loss tier: mean of
+    (mask*(out-lab))^4, with its analytic dL/d output. Differs from masked MSE so
+    the local rules must actually USE the supplied gradient (not the hard-coded
+    masked-MSE one) to match BPTT."""
+    N = output.numel()
+    d = mask * (output - labels)
+    return (d ** 4).sum() / N, (4.0 / N) * mask * (d ** 3)
+
+
+def tier9_custom_loss():
+    """Custom (non-MSE) loss through loss_and_grad must be HONORED by the local
+    rules, not just reported. Regression guard for the two-pass fix: previously the
+    local rules always accumulated masked-MSE gradients and used loss_and_grad only
+    for the scalar loss, so a custom loss gave a matching loss but WRONG grads.
+      (a) T=1: every local rule (exact/diag/direct) == BPTT for ANY differentiable
+          loss (no temporal plasticity path to omit) — this is the reporter's case.
+      (b) eta=0, T>1: local == BPTT for the custom loss (M carries no W->h->M credit).
+      (c) the reported loss equals BPTT's loss (both use the supplied loss).
+    Covers MultiPlasticNet AND DeepMultiPlasticNet."""
+    print("── Tier 9: custom loss honored by local rules ──────────────────────")
+    allok = True
+    lg = _quartic_loss_and_grad
+    keys = grad_keys(True, True)
+
+    def dmpn(seed, eta):
+        npar = {'n_neurons': [5, 7, 3], 'loss_type': 'MSE', 'activation': 'tanh',
+                'output_bias': True, 'output_matrix': '', 'dt': 40,
+                'input_layer_add': True, 'input_layer_add_trainable': True,
+                'linear_embed': 6, 'input_layer_bias': True,
+                'learning_rule': 'local_exact_rowlocal', 'feedback_mode': 'exact_readout',
+                'ml_params': {'bias': True, 'mp_type': 'mult', 'm_update_type': 'hebb_assoc',
+                              'm_activation': 'linear', 'modulation_bounds': False,
+                              'eta_type': 'scalar', 'eta_train': False, 'lam_type': 'scalar',
+                              'lam_train': False, 'm_time_scale': 400, 'W_freeze': False}}
+        torch.manual_seed(seed)
+        net = mpn.DeepMultiPlasticNet(npar, verbose=False).double()
+        with torch.no_grad():
+            net.mp_layers[0].eta.fill_(eta)
+            net.mp_layers[0].lam.fill_(0.6 * net.mp_layers[0].lam_clamp)
+        return net
+
+    # (a) T=1: exact / diag / direct == BPTT for the quartic loss (single-MP net).
+    for name, rule in (("exact", "local_exact_rowlocal"),
+                       ("diag", "local_diag_rflo"), ("direct", "local_direct")):
+        net = build_net(5, 7, 3, 'tanh', True, True, 'scalar', 'scalar', rule, seed=1)
+        inp, lab, msk, _ = make_data(6, 1, 5, 3)
+        ref = net.bptt_gradients(inp, lab, msk, loss_and_grad=lg)
+        loc = net.sequence_gradients(inp, lab, msk, loss_and_grad=lg)
+        ok, d = compare(loc, ref, keys)
+        lgap = (ref['loss'] - loc['loss']).abs().item()
+        ok = ok and lgap < 1e-10
+        allok &= ok
+        print(f"  [{'PASS' if ok else 'FAIL'}] T=1 custom {name:6} == BPTT    "
+              f"{fmt(d, keys)}  loss_gap={lgap:.1e}")
+
+    # (b) eta=0, T>1: exact local == BPTT for the quartic loss.
+    net = build_net(5, 7, 3, 'tanh', True, True, 'scalar', 'scalar',
+                    'local_exact_rowlocal', seed=2)
+    with torch.no_grad():
+        net.mp_layer.eta.zero_()
+    inp, lab, msk, _ = make_data(6, 10, 5, 3)
+    ref = net.bptt_gradients(inp, lab, msk, loss_and_grad=lg)
+    loc = net.sequence_gradients(inp, lab, msk, loss_and_grad=lg)
+    ok_b, d_b = compare(loc, ref, keys)
+    allok &= ok_b
+    print(f"  [{'PASS' if ok_b else 'FAIL'}] eta=0 custom exact == BPTT   {fmt(d_b, keys)}")
+
+    # (c) deep net, T=1: exact-local (incl. W_in) == BPTT for the quartic loss.
+    net = dmpn(3, 0.12)
+    inp, lab, msk, _ = make_data(6, 1, 5, 3)
+    ref = net.bptt_gradients(inp, lab, msk, loss_and_grad=lg)
+    loc = net.sequence_gradients(inp, lab, msk, loss_and_grad=lg)
+    dkeys = [k for k in ref if k not in ('loss', 'outputs')]
+    ok_c, d_c = compare(loc, ref, dkeys)
+    allok &= ok_c
+    print(f"  [{'PASS' if ok_c else 'FAIL'}] dmpn T=1 custom == BPTT      {fmt(d_c, dkeys)}")
+    return allok
+
+
+def _onehot_final_step(B, T, n_out, seed=0):
+    """One-hot target on the final step + a {0,1} final-step cost mask (all
+    channels), the seq-MNIST convention. Random logits as 'output' come from the
+    net; here we only build labels/mask."""
+    g = torch.Generator().manual_seed(seed)
+    lab = torch.zeros(B, T, n_out, dtype=torch.float64)
+    msk = torch.zeros(B, T, n_out, dtype=torch.float64)
+    cls = torch.randint(0, n_out, (B,), generator=g)
+    lab[torch.arange(B), T - 1, cls] = 1.0
+    msk[:, T - 1, :] = 1.0
+    return lab, msk
+
+
+def tier10_cross_entropy():
+    """Masked cross-entropy (mpn.masked_cross_entropy_loss_and_grad), the seq-MNIST
+    objective, is a proper non-default loss the local rules honor via the two-pass
+    path. Guards the CE loss AND its use as a task loss.
+      (a) the analytic grad_output equals autograd d(loss)/d(logits), and the loss
+          equals F.cross_entropy on the scored (final) step;
+      (b) T=1: every local rule (exact/diag/direct) == BPTT under CE;
+      (c) eta=0, T>1: exact local == BPTT under CE;
+      (d) deep net, T=1: exact-local (incl. W_in) == BPTT under CE.
+    A one-hot final-step target + {0,1} final-step mask is used throughout."""
+    print("── Tier 10: masked cross-entropy (seq-MNIST objective) ─────────────")
+    import torch.nn.functional as F
+    ce = mpn.masked_cross_entropy_loss_and_grad
+    allok = True
+    keys = grad_keys(True, True)
+
+    # (a) analytic grad + loss value vs torch references.
+    B, T, C = 6, 4, 5
+    logits = torch.randn(B, T, C, dtype=torch.float64, requires_grad=True)
+    lab, msk = _onehot_final_step(B, T, C, seed=1)
+    loss, grad = ce(logits, lab, msk)
+    loss.backward()
+    g_rel = (logits.grad - grad).abs().max().item()
+    ref_ce = F.cross_entropy(logits[:, T - 1, :].detach(), lab[:, T - 1, :].argmax(-1),
+                             reduction='mean')
+    l_gap = (loss.detach() - ref_ce).abs().item()
+    ok_a = g_rel < 1e-10 and l_gap < 1e-10
+    allok &= ok_a
+    print(f"  [{'PASS' if ok_a else 'FAIL'}] grad==autograd, loss==F.CE   "
+          f"grad_maxdiff={g_rel:.1e}  loss_gap={l_gap:.1e}")
+
+    # (b) T=1: exact / diag / direct == BPTT under CE (n_out=3 classes).
+    for name, rule in (("exact", "local_exact_rowlocal"),
+                       ("diag", "local_diag_rflo"), ("direct", "local_direct")):
+        net = build_net(5, 7, 3, 'tanh', True, True, 'scalar', 'scalar', rule, seed=1)
+        inp, _, _, _ = make_data(6, 1, 5, 3)
+        lab, msk = _onehot_final_step(6, 1, 3, seed=2)
+        ref = net.bptt_gradients(inp, lab, msk, loss_and_grad=ce)
+        loc = net.sequence_gradients(inp, lab, msk, loss_and_grad=ce)
+        ok, d = compare(loc, ref, keys)
+        lgap = (ref['loss'] - loc['loss']).abs().item()
+        ok = ok and lgap < 1e-10
+        allok &= ok
+        print(f"  [{'PASS' if ok else 'FAIL'}] T=1 CE {name:6} == BPTT       "
+              f"{fmt(d, keys)}  loss_gap={lgap:.1e}")
+
+    # (c) eta=0, T>1: exact local == BPTT under CE.
+    net = build_net(5, 7, 3, 'tanh', True, True, 'scalar', 'scalar',
+                    'local_exact_rowlocal', seed=2)
+    with torch.no_grad():
+        net.mp_layer.eta.zero_()
+    inp, _, _, _ = make_data(6, 10, 5, 3)
+    lab, msk = _onehot_final_step(6, 10, 3, seed=3)
+    ref = net.bptt_gradients(inp, lab, msk, loss_and_grad=ce)
+    loc = net.sequence_gradients(inp, lab, msk, loss_and_grad=ce)
+    ok_c, d_c = compare(loc, ref, keys)
+    allok &= ok_c
+    print(f"  [{'PASS' if ok_c else 'FAIL'}] eta=0 CE exact == BPTT       {fmt(d_c, keys)}")
+
+    # (d) deep net, T=1: exact-local (incl. W_in) == BPTT under CE.
+    torch.manual_seed(4)
+    npar = {'n_neurons': [5, 7, 3], 'loss_type': 'MSE', 'activation': 'tanh',
+            'output_bias': True, 'output_matrix': '', 'dt': 40,
+            'input_layer_add': True, 'input_layer_add_trainable': True,
+            'linear_embed': 6, 'input_layer_bias': True,
+            'learning_rule': 'local_exact_rowlocal', 'feedback_mode': 'exact_readout',
+            'ml_params': {'bias': True, 'mp_type': 'mult', 'm_update_type': 'hebb_assoc',
+                          'm_activation': 'linear', 'modulation_bounds': False,
+                          'eta_type': 'scalar', 'eta_train': False, 'lam_type': 'scalar',
+                          'lam_train': False, 'm_time_scale': 400, 'W_freeze': False}}
+    net = mpn.DeepMultiPlasticNet(npar, verbose=False).double()
+    with torch.no_grad():
+        net.mp_layers[0].eta.fill_(0.12)
+        net.mp_layers[0].lam.fill_(0.6 * net.mp_layers[0].lam_clamp)
+    inp, _, _, _ = make_data(6, 1, 5, 3)
+    lab, msk = _onehot_final_step(6, 1, 3, seed=5)
+    ref = net.bptt_gradients(inp, lab, msk, loss_and_grad=ce)
+    loc = net.sequence_gradients(inp, lab, msk, loss_and_grad=ce)
+    dkeys = [k for k in ref if k not in ('loss', 'outputs')]
+    ok_d, d_d = compare(loc, ref, dkeys)
+    allok &= ok_d
+    print(f"  [{'PASS' if ok_d else 'FAIL'}] dmpn T=1 CE == BPTT          {fmt(d_d, dkeys)}")
+    return allok
+
+
 def main():
     torch.set_default_dtype(torch.float64)
     print("Validating local-learning rules vs autograd (BPTT), float64\n")
@@ -536,6 +714,8 @@ def main():
         tier6_deep_input_embedding(),
         tier7_rnn_rflo(),
         tier8_hebb_pre(),
+        tier9_custom_loss(),
+        tier10_cross_entropy(),
         tier4_real_task(),
     ]
     print("\n" + ("ALL CHECKS PASSED" if all(results) else "SOME CHECKS FAILED"))

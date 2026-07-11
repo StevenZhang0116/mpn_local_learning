@@ -31,6 +31,8 @@ network, there is no separate per-layer control.
 
 Trainable params: W_input, W_rec, W_output, b_hidden, (b_output if enabled).
 """
+import time
+
 import torch
 
 from net_helpers import BaseNetwork
@@ -148,8 +150,16 @@ class LeakyRNN(BaseNetwork):
     def bptt_gradients(self, inputs, labels, masks,
                        loss_and_grad=masked_mse_loss_and_output_grad):
         """Full BPTT gradients via autograd through the unrolled recurrence.
-        Returns {param_name: grad, ..., 'loss', 'outputs'}."""
+        Returns {param_name: grad, ..., 'loss', 'outputs'}. Records a fwd/bwd
+        wall-time split in self._bptt_fwd_s (the unrolled forward + loss) and
+        self._bptt_bwd_s (torch.autograd.grad), CUDA-synced on GPU, for the
+        train_common timing readout. (RFLO is forward-mode and has no backward, so
+        only BPTT sets these.)"""
         B, T, _ = inputs.shape
+        _cuda = self.W_output.is_cuda
+        if _cuda:
+            torch.cuda.synchronize()
+        _t0 = time.perf_counter()
         h = torch.zeros(B, self.n_hidden, device=inputs.device, dtype=inputs.dtype)
         outs = []
         for t in range(T):
@@ -159,7 +169,15 @@ class LeakyRNN(BaseNetwork):
 
         loss, _ = loss_and_grad(outputs, labels, masks)
         params = self._trainable_params()
+        if _cuda:
+            torch.cuda.synchronize()
+        _t1 = time.perf_counter()
         grads = torch.autograd.grad(loss, list(params.values()))
+        if _cuda:
+            torch.cuda.synchronize()
+        _t2 = time.perf_counter()
+        self._bptt_fwd_s = _t1 - _t0
+        self._bptt_bwd_s = _t2 - _t1
         result = {k: g.detach().clone() for k, g in zip(params, grads)}
         result['loss'] = loss.detach()
         result['outputs'] = outputs.detach()
