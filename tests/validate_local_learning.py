@@ -209,7 +209,7 @@ def tier3_diag_matches_zeroed_reference():
         ("tanh, B=8, scalar",   'tanh', 8, 'scalar', 'scalar', 'exact_readout', False),
         ("tanh, B=8, matrix",   'tanh', 8, 'matrix', 'matrix', 'exact_readout', False),
         ("tanh, masks",         'tanh', 8, 'matrix', 'matrix', 'exact_readout', True),
-        ("tanh, random feedbk", 'tanh', 8, 'scalar', 'scalar', 'random_fixed',  False),
+        ("tanh, random feedbk", 'tanh', 8, 'scalar', 'scalar', 'layerwise_fa',  False),
     ]
     for i, (name, act, B, et, lt, fb, um) in enumerate(cases):
         net = build_net(5, 7, 3, act, True, True, et, lt, 'local_diag_rflo', fb, seed=i)
@@ -321,6 +321,10 @@ def tier4_real_task():
     # here regardless of train_mpn's current default RULESET (which may be a
     # non-ring task like seq-MNIST that generate_trials_wrap doesn't handle).
     tm.RULESET = "delaygo"
+    # This tier's invariant is exact-local == BPTT on the hidden W, which only holds
+    # with exact_readout feedback (the FA modes deliberately perturb it). Pin it here
+    # so the check is independent of train_mpn's current FEEDBACK_MODE global.
+    tm.FEEDBACK_MODE = "exact_readout"
     task_params, train_params, net_params = tm.build_params()
     # Correctness is size-independent; shrink hidden/embedding so long-sequence
     # tasks (e.g. contextdelaydm1) fit under a tight memory ceiling. This still
@@ -702,6 +706,134 @@ def tier10_cross_entropy():
     return allok
 
 
+def tier11_feedback_modes():
+    """Deep-net feedback modes (mpn._FEEDBACK_MODES), the FA revision:
+      exact_readout — true same-time spatial gradient (top layer exact vs BPTT).
+      layerwise_fa  — fixed random matrix at EVERY boundary (weight-transport-free).
+      direct_fa     — output error projected directly onto every hidden layer.
+    Invariants checked:
+      (a) the deleted modes ('random_top' / legacy 'random_fixed') now RAISE
+          ValueError — the vocabulary is exactly _FEEDBACK_MODES.
+      (b) readout grads (W_output, b_output) == BPTT for all three modes — the
+          readout gradient depends only on grad_output and h[L], not feedback_mode.
+          [deep stack: two MP layers.]
+      (c) single MP layer (one boundary): layerwise_fa AND direct_fa, with their
+          top random matrix set to W_output, reproduce exact_readout EXACTLY (this
+          is the ordinary-FA reduction — the only boundary is readout→hidden).
+      (d) deep stack: layerwise_fa / direct_fa give finite grads for every param and
+          DIFFER from exact_readout on the hidden weights (they drop weight transport).
+      (e) single MP layer: layerwise_fa == direct_fa given the same top matrix (one
+          boundary → both are ordinary feedback alignment).
+    """
+    print("── Tier 11: deep-net feedback modes (feedback alignment) ────────────")
+    allok = True
+
+    def build(nn, fb, seed=0, m_update='hebb_assoc'):
+        torch.manual_seed(seed)
+        npar = {'n_neurons': nn, 'loss_type': 'MSE', 'activation': 'tanh',
+                'output_bias': True, 'output_matrix': '', 'dt': 40,
+                'input_layer_add': False, 'input_layer_add_trainable': False,
+                'learning_rule': 'local_exact_rowlocal', 'feedback_mode': fb,
+                'ml_params': {'bias': True, 'mp_type': 'mult', 'm_update_type': m_update,
+                              'm_activation': 'linear', 'modulation_bounds': False,
+                              'eta_type': 'scalar', 'eta_train': False, 'lam_type': 'scalar',
+                              'lam_train': False, 'm_time_scale': 400, 'W_freeze': False}}
+        net = mpn.DeepMultiPlasticNet(npar, verbose=False).double()
+        with torch.no_grad():
+            for m in net.mp_layers:
+                m.eta.fill_(0.1)
+                m.lam.fill_(0.6 * m.lam_clamp)
+        return net
+
+    def sync_forward(src, dst):
+        """Copy every trainable forward param src->dst so the two nets share
+        identical weights. Needed because different feedback modes draw a
+        different number of RNG values at init (the random modes draw extra
+        feedback matrices), so a shared seed does NOT give shared weights. The
+        fixed feedback buffers (B_feedback/B_inter/B_direct) are NOT trainable
+        params, so they are left untouched."""
+        with torch.no_grad():
+            sp, dp = src._trainable_params(), dst._trainable_params()
+            for k in dp:
+                dp[k].copy_(sp[k])
+
+    ARCH = [5, 7, 6, 3]                    # two MP layers (widths 7 then 6)
+    inp, lab, msk, _ = make_data(6, 12, ARCH[0], ARCH[-1])
+    rkeys = ['W_output', 'b_output']
+
+    # (a) the deleted modes raise ValueError (vocabulary == _FEEDBACK_MODES).
+    ok_a = True
+    for dead in ('random_top', 'random_fixed'):
+        try:
+            build(ARCH, dead, seed=1)
+            ok_a = False
+        except ValueError:
+            pass
+    allok &= ok_a
+    print(f"  [{'PASS' if ok_a else 'FAIL'}] deleted modes (random_top/random_fixed) raise ValueError")
+
+    # (b) readout grads == BPTT for every surviving mode.
+    ok_b = True
+    for fb in ('exact_readout', 'layerwise_fa', 'direct_fa'):
+        net = build(ARCH, fb, seed=2)
+        ref = net.bptt_gradients(inp, lab, msk)
+        loc = net.local_gradients(inp, lab, msk)
+        okm, dm = compare(loc, ref, rkeys)
+        ok_b &= okm
+        print(f"  [{'PASS' if okm else 'FAIL'}] {fb:<14} readout == BPTT   {fmt(dm, rkeys)}")
+    allok &= ok_b
+
+    # (c) single MP layer (one boundary): layerwise_fa / direct_fa with the top
+    #     random matrix := W_output reproduce exact_readout EXACTLY (ordinary FA).
+    SARCH = [5, 7, 3]                       # one MP layer → one hidden boundary
+    net_ex = build(SARCH, 'exact_readout', seed=3)
+    g_ex = net_ex.local_gradients(inp, lab, msk)
+    keys_s = [k for k in g_ex if k not in ('loss', 'outputs')]
+    ok_c = True
+    for fb in ('layerwise_fa', 'direct_fa'):
+        net = build(SARCH, fb, seed=3)
+        sync_forward(net_ex, net)                        # identical forward weights
+        top = net.B_feedback if fb == 'layerwise_fa' else getattr(net, net._B_direct_names[-1])
+        with torch.no_grad():
+            top.copy_(net.W_output)                      # kill the randomness at the only boundary
+        okm, dm = compare(net.local_gradients(inp, lab, msk), g_ex, keys_s)
+        ok_c &= okm
+        print(f"  [{'PASS' if okm else 'FAIL'}] single-layer {fb:<12}(B:=W_out) == exact_readout   {fmt(dm, ['W'])}")
+    allok &= ok_c
+
+    # (d) deep: layerwise_fa / direct_fa finite everywhere + differ from exact on hidden W.
+    ok_d = True
+    net_ex4 = build(ARCH, 'exact_readout', seed=4)
+    g_ex4 = net_ex4.local_gradients(inp, lab, msk)
+    for fb in ('layerwise_fa', 'direct_fa'):
+        net = build(ARCH, fb, seed=4)
+        sync_forward(net_ex4, net)          # same forward weights → the ONLY difference is feedback
+        g = net.local_gradients(inp, lab, msk)
+        finite = all(torch.isfinite(g[k]).all() for k in g if k not in ('loss', 'outputs'))
+        w_rel = (g['W'] - g_ex4['W']).abs().max().item() / max(g_ex4['W'].abs().max().item(), 1e-12)
+        okm = finite and (w_rel > 1e-3)
+        ok_d &= okm
+        print(f"  [{'PASS' if okm else 'FAIL'}] {fb:<14} finite grads, hidden W differs   W:rel={w_rel:.2e} (>1e-3)")
+    allok &= ok_d
+
+    # (e) single MP layer: layerwise_fa == direct_fa given identical forward weights
+    #     AND the same top random matrix (one boundary → both are ordinary FA).
+    net_lw = build(SARCH, 'layerwise_fa', seed=5)
+    B_shared = net_lw.B_feedback.detach().clone()
+    grads_e = {}
+    for fb in ('layerwise_fa', 'direct_fa'):
+        net = build(SARCH, fb, seed=5)
+        sync_forward(net_lw, net)           # identical forward weights
+        top = net.B_feedback if fb == 'layerwise_fa' else getattr(net, net._B_direct_names[-1])
+        with torch.no_grad():
+            top.copy_(B_shared)             # identical top random matrix for both
+        grads_e[fb] = net.local_gradients(inp, lab, msk)
+    ok_e, _ = compare(grads_e['direct_fa'], grads_e['layerwise_fa'], keys_s)
+    allok &= ok_e
+    print(f"  [{'PASS' if ok_e else 'FAIL'}] single-layer: layerwise_fa == direct_fa")
+    return allok
+
+
 def main():
     torch.set_default_dtype(torch.float64)
     print("Validating local-learning rules vs autograd (BPTT), float64\n")
@@ -716,6 +848,7 @@ def main():
         tier8_hebb_pre(),
         tier9_custom_loss(),
         tier10_cross_entropy(),
+        tier11_feedback_modes(),
         tier4_real_task(),
     ]
     print("\n" + ("ALL CHECKS PASSED" if all(results) else "SOME CHECKS FAILED"))

@@ -148,6 +148,33 @@ from net_helpers import BaseNetwork, BaseNetworkFunctions
 from net_helpers import rand_weight_init, get_activation_function
 
 
+# ─── Feedback (learning-signal) modes ─────────────────────────────────────────
+# How the hidden layers' learning signal ("ell", the surrogate dL/dh) is formed.
+# The differences only matter for a DEEP MP stack; for a single hidden layer the
+# two random variants coincide (one boundary → one random matrix), which is
+# exactly ordinary feedback alignment.
+#
+#   'exact_readout'  actual readout + actual (modulated) lower weights — the true
+#                    same-time spatial gradient (weight transport everywhere).
+#   'layerwise_fa'   conventional recursive feedback alignment: a fixed random matrix
+#                    at EVERY adjacent boundary (readout→top via B_feedback, each
+#                    inter-hidden boundary via B_inter[n]). No actual W or M is used
+#                    in the feedback pathway, removing weight transport at every layer.
+#   'direct_fa'      direct feedback alignment: the readout error is projected DIRECTLY
+#                    to every hidden layer through its own random matrix B_direct[k]
+#                    (no sequential backward chain at all).
+_FEEDBACK_MODES = ('exact_readout', 'layerwise_fa', 'direct_fa')
+
+
+def canonical_feedback_mode(mode):
+    """Validate a feedback_mode string against _FEEDBACK_MODES, returning it
+    unchanged. Raises ValueError for an unrecognized mode."""
+    if mode not in _FEEDBACK_MODES:
+        raise ValueError(
+            f"unknown feedback_mode '{mode}'; expected one of {_FEEDBACK_MODES}")
+    return mode
+
+
 def masked_mse_loss_and_output_grad(output, labels, mask):
     """Masked MSE identical to net_helpers.compute_loss (float 'cost' mask, mean
     reduction over all B*T*n_out elements) plus its analytic output gradient.
@@ -1186,19 +1213,22 @@ class MultiPlasticNet(MultiPlasticNetBase):
                          'local_direct'), f"unknown learning_rule '{_rule}'"
         self.learning_rule = _rule
 
-        # Learning signal for the hidden layer: 'exact_readout' uses W_output
-        # (true gradient); 'random_fixed' uses a fixed random matrix B_feedback
-        # (feedback alignment). Buffer registered in super().__init__ once
-        # W_output's shape is known.
-        self.feedback_mode = net_params.get('feedback_mode', 'exact_readout')
-        assert self.feedback_mode in ('exact_readout', 'random_fixed'), \
-            f"unknown feedback_mode '{self.feedback_mode}'"
+        # Learning signal for the hidden layer. This net has a SINGLE hidden
+        # boundary (readout → hidden), so both random-feedback variants
+        # ('layerwise_fa', 'direct_fa') coincide — each just replaces the readout
+        # transpose with one fixed random matrix B_feedback, which IS ordinary
+        # feedback alignment. Only 'exact_readout' (true gradient via W_output) is
+        # distinct here. Buffer registered in super().__init__ once W_output's
+        # shape is known.
+        self.feedback_mode = canonical_feedback_mode(
+            net_params.get('feedback_mode', 'exact_readout'))
 
         super().__init__(net_params, self.n_hidden, verbose=verbose)
 
         # Fixed random feedback matrix for feedback alignment (same shape as
-        # W_output, never trained). Only allocated when requested.
-        if self.feedback_mode == 'random_fixed':
+        # W_output, never trained). Allocated for any non-exact mode (they all
+        # reduce to one random boundary for a single hidden layer).
+        if self.feedback_mode != 'exact_readout':
             self.register_buffer('B_feedback', torch.tensor(
                 rand_weight_init(self.n_hidden, self.n_output,
                                  init_type=net_params.get('B_feedback_init', 'xavier')),
@@ -1381,6 +1411,8 @@ class MultiPlasticNet(MultiPlasticNetBase):
         elif mode == 'diag':
             mp.reset_diag_rflo_state(B=B)
 
+        # Single hidden boundary: exact readout uses W_output, the random modes
+        # use the one fixed B_feedback (they coincide here — ordinary FA).
         feedback = self.W_output if self.feedback_mode == 'exact_readout' else self.B_feedback
         step_fn = mp.step_fn_for(mode)      # resolve the per-step rule ONCE (no in-loop branch)
         # Tier-B: if compilation is on and this mode/config supports it, use the
@@ -1510,11 +1542,20 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
     already iterates over self.mp_layers. The local rules (local_*) ALSO support
     any number of MP layers: each layer keeps its own intra-layer eligibility
     (exact row-local / diagonal RFLO / direct) and is credited by a same-time
-    inter-layer learning signal backprojected through the modulated weights of the
-    layers above it (see _same_time_boundary_signals). Those hidden-layer updates
-    are surrogates — they omit temporal paths through the plastic state of the
-    layers above them — even when the intra-layer eligibility is exact; with exact
-    readout feedback the TOP plastic layer's gradient is exact.
+    inter-layer learning signal (see _same_time_boundary_signals). Those hidden-
+    layer updates are surrogates — they omit temporal paths through the plastic
+    state of the layers above them — even when the intra-layer eligibility is exact.
+
+    feedback_mode selects HOW the inter-layer learning signal is formed (see the
+    module-level _FEEDBACK_MODES table). It only matters for a DEEP stack (L>1):
+      'exact_readout'  true same-time spatial gradient (weight transport
+                       everywhere); the TOP plastic layer's gradient is exact.
+      'layerwise_fa'   conventional recursive feedback alignment — a fixed random
+                       matrix at EVERY boundary, so the whole feedback pathway is
+                       weight-transport-free.
+      'direct_fa'      direct feedback alignment — the readout error is projected
+                       directly onto every hidden layer through its own random matrix.
+    For a single MP layer both random modes coincide with ordinary FA.
     """
 
     def __init__(self, net_params, verbose=False):
@@ -1543,24 +1584,26 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
         assert _rule in ('bptt', 'local_exact_rowlocal', 'local_diag_rflo',
                          'local_direct'), f"unknown learning_rule '{_rule}'"
         self.learning_rule = _rule
-        self.feedback_mode = cfg.get('feedback_mode', 'exact_readout')
-        assert self.feedback_mode in ('exact_readout', 'random_fixed'), \
-            f"unknown feedback_mode '{self.feedback_mode}'"
+        # feedback_mode governs how each hidden layer's learning signal is formed
+        # in the local rules (see the _FEEDBACK_MODES table and
+        # _same_time_boundary_signals). B_feedback_init is stashed for the
+        # per-layer FA buffers built after the MP layers exist.
+        self.feedback_mode = canonical_feedback_mode(cfg.get('feedback_mode', 'exact_readout'))
+        self._B_feedback_init = cfg.get('B_feedback_init', 'xavier')
 
         super().__init__(cfg, cfg['n_neurons'][-2], output_matrix=self.output_matrix, verbose=verbose)
 
-        # Fixed random feedback matrix for the TOP-layer learning signal
-        # (feedback alignment). Must match W_output's shape — (n_output, top_hidden)
-        # where top_hidden = last plastic-layer width = cfg['n_neurons'][-2], NOT the
-        # first hidden width self.n_hidden (which is wrong for a deep unequal-width
-        # stack). For a single MP layer the two coincide, so the single-layer init is
-        # RNG-identical to before. Only the top boundary uses random feedback; the
-        # inter-layer boundary signals always backproject through the modulated
-        # weights (per-boundary feedback alignment is not yet implemented).
-        if self.feedback_mode == 'random_fixed':
+        # Fixed random feedback matrix for the TOP (readout → top-hidden) boundary,
+        # used by 'layerwise_fa' (top + every inter-layer boundary). Must match
+        # W_output's shape — (n_output, top_hidden) where top_hidden = last
+        # plastic-layer width = cfg['n_neurons'][-2], NOT the first hidden width
+        # self.n_hidden (wrong for a deep unequal-width stack). 'direct_fa' does NOT
+        # use B_feedback (it projects the output error directly to every layer,
+        # incl. the top).
+        if self.feedback_mode == 'layerwise_fa':
             self.register_buffer('B_feedback', torch.tensor(
                 rand_weight_init(cfg['n_neurons'][-2], self.n_output,
-                                 init_type=cfg.get('B_feedback_init', 'xavier')),
+                                 init_type=self._B_feedback_init),
                 dtype=self.W_output.dtype))
 
         # Creates all the MP layers
@@ -1635,6 +1678,41 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
 
             self.mp_layers.append(getattr(self, 'mp_layer{}'.format(mpl_idx)))
             self.params.extend([param+str(mpl_idx) for param in self.mp_layers[-1].params])
+
+        # ── Per-boundary fixed random feedback for layerwise / direct FA ──────
+        # (built AFTER the MP layers so their widths are known; B_feedback for the
+        # top boundary is already registered above.) Buffers are registered under
+        # names, and only the NAMES are cached in a list — never the tensor objects,
+        # so .to()/.double() moves are always seen via getattr at use time.
+        #
+        #   layerwise_fa: a fixed random B_inter[n] (shape = layers[n].W.shape =
+        #     (post, pre)) at EVERY backprojected boundary, replacing the modulated-
+        #     weight transpose. With the top B_feedback this makes the ENTIRE
+        #     feedback pathway weight-transport-free (conventional recursive FA).
+        #   direct_fa: a fixed random B_direct[k] projecting the readout error
+        #     DIRECTLY onto h[k] for every k (no sequential backward chain).
+        #     B_direct[k] maps (n_output) -> dim(h[k]); k == L reproduces the
+        #     readout -> top-hidden role that B_feedback plays in the other modes.
+        self._B_inter_names = []
+        self._B_direct_names = []
+        L = len(self.mp_layers)
+        if self.feedback_mode == 'layerwise_fa':
+            for n, mp in enumerate(self.mp_layers):
+                name = f'B_inter{n}'                 # shape (post, pre) == mp.W.shape
+                self.register_buffer(name, torch.tensor(
+                    rand_weight_init(mp.n_input, mp.n_output, init_type=self._B_feedback_init),
+                    dtype=self.W_output.dtype))
+                self._B_inter_names.append(name)
+        elif self.feedback_mode == 'direct_fa':
+            # dim(h[k]) = input width of layer k for k < L, output width of the top
+            # layer for k == L. Register B_direct[0..L] (index 0 credits the embedding).
+            hdims = [mp.n_input for mp in self.mp_layers] + [self.mp_layers[-1].n_output]
+            for k, dim_hk in enumerate(hdims):
+                name = f'B_direct{k}'                # shape (n_output, dim(h[k]))
+                self.register_buffer(name, torch.tensor(
+                    rand_weight_init(dim_hk, self.n_output, init_type=self._B_feedback_init),
+                    dtype=self.W_output.dtype))
+                self._B_direct_names.append(name)
 
 
     def forward(self, inputs, run_mode='minimal', verbose=False):
@@ -1773,39 +1851,61 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
     def _same_time_boundary_signals(self, grad_output, phi_p, need_input_signal):
         """Same-time layer-boundary learning signals using the frozen M_{t-1}.
 
-        ell_h[n] approximates dL/dh[n] (the signal at the INPUT boundary of MP
-        layer n). The top signal is exact readout feedback (or the fixed random
-        matrix); each lower boundary is obtained by ordinary spatial backprop of
-        the layer above's preactivation signal through its modulated weights:
+        ell_h[n] is the surrogate dL/dh[n] (the signal at the INPUT boundary of MP
+        layer n). How it is formed depends on self.feedback_mode (see _FEEDBACK_MODES):
 
-            ell_h[L]   = grad_output @ W_output          (or @ B_feedback)
-            ell_h[n]   = W_eff^{(n)T} ( ell_h[n+1] ⊙ phi'(z[n]) )   for n < L
+          exact_readout — true same-time spatial gradient:
+            ell_h[L] = grad_output @ W_output
+            ell_h[n] = W_eff^{(n)T} ( ell_h[n+1] ⊙ phi'(z[n]) )      for n < L
+          layerwise_fa — conventional recursive feedback alignment: a fixed random
+            matrix at EVERY boundary (no actual W or M in the feedback pathway):
+            ell_h[L] = grad_output @ B_feedback
+            ell_h[n] = ( ell_h[n+1] ⊙ phi'(z[n]) ) @ B_inter[n]      for n < L
+          direct_fa — direct feedback alignment: the readout error is projected
+            DIRECTLY onto every hidden layer through its own fixed random matrix
+            (no backward chain, no phi'/M in the feedback pathway):
+            ell_h[k] = grad_output @ B_direct[k]                      for all k
 
-        This drops temporal paths through the plastic state of upper layers but
-        keeps the same-time spatial gradient. Layer n's eligibility routine is fed
-        ell_h[n+1] (its OUTPUT-boundary signal) — NOT premultiplied by phi'.
+        For exact_readout / layerwise_fa the recursion drops temporal paths through
+        the plastic state of upper layers but keeps the same-time spatial structure.
+        Layer n's eligibility routine is fed ell_h[n+1] (its OUTPUT-boundary signal)
+        — NOT premultiplied by phi'.
 
         Returns ell_h, a length-(L+1) list. ell_h[1..L] are always filled (every
         MP layer's step needs its output signal); ell_h[0] is filled only when
-        need_input_signal (the trainable input embedding) — for a single MP layer
-        with no embedding this computes exactly one matmul, matching the old path.
+        need_input_signal (the trainable input embedding). For a single MP layer
+        with no embedding, exact_readout / layerwise_fa compute exactly one matmul.
         """
         L = len(self.mp_layers)
         ell_h = [None] * (L + 1)
 
-        if self.feedback_mode == 'exact_readout':
-            ell_h[L] = grad_output @ self.W_output
-        else:
-            ell_h[L] = grad_output @ self.B_feedback
+        # direct_fa: every boundary is an independent random projection of the
+        # readout error — no backward chain, no phi'/M in the feedback pathway.
+        if self.feedback_mode == 'direct_fa':
+            for k in range(1, L + 1):
+                ell_h[k] = grad_output @ getattr(self, self._B_direct_names[k])
+            if need_input_signal:
+                ell_h[0] = grad_output @ getattr(self, self._B_direct_names[0])
+            return ell_h
 
-        # Fill ell_h[L-1 .. 1] (each MP layer n uses ell_h[n+1]); then ell_h[0]
-        # only if the embedding needs it (backprojected through layer 0).
+        # exact_readout vs layerwise_fa: the former uses the exact (modulated)
+        # weight transpose at every boundary (weight transport), the latter a fixed
+        # random matrix at every boundary (transport-free). Top boundary first, then
+        # recurse down; ell_h[0] only when the trainable embedding needs it.
+        layerwise = (self.feedback_mode == 'layerwise_fa')
+        ell_h[L] = grad_output @ (self.B_feedback if layerwise else self.W_output)
         for n in range(L - 1, 0, -1):
             delta_n = ell_h[n + 1] * phi_p[n]
-            ell_h[n] = self.mp_layers[n].backproject_through_modulated_weights_fast(delta_n)
+            if layerwise:
+                ell_h[n] = delta_n @ getattr(self, self._B_inter_names[n])
+            else:
+                ell_h[n] = self.mp_layers[n].backproject_through_modulated_weights_fast(delta_n)
         if need_input_signal:
             delta_0 = ell_h[1] * phi_p[0]
-            ell_h[0] = self.mp_layers[0].backproject_through_modulated_weights_fast(delta_0)
+            if layerwise:
+                ell_h[0] = delta_0 @ getattr(self, self._B_inter_names[0])
+            else:
+                ell_h[0] = self.mp_layers[0].backproject_through_modulated_weights_fast(delta_0)
 
         return ell_h
 

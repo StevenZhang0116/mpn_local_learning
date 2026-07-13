@@ -37,7 +37,10 @@ import train_common as tc
 SEED = 42
 RULESET = "seqmnist_pixel"           # single task to train on
 RULES_TO_RUN = ["bptt", "local_diag_rflo"]   # rules to compare
-FEEDBACK_MODE = "exact_readout"   # 'exact_readout' or 'random_fixed' (feedback align)
+# 'exact_readout' = true gradient; the random modes ('layerwise_fa', 'direct_fa')
+# both coincide with ordinary feedback alignment for this single-hidden-layer RNN.
+# See mpn._FEEDBACK_MODES.
+FEEDBACK_MODE = "exact_readout"
 N_RUNS = 3                    # independent seeds per rule
 N_HIDDEN = 180                # one_task.py: n_hidden = 200
 N_DATASETS = 5000             # one_task.py: n_datasets = 3000 (heavy on CPU)
@@ -163,8 +166,11 @@ def _parse_args():
     p.add_argument("--runs", type=int, default=N_RUNS, help="independent seeds")
     p.add_argument("--hidden", type=int, default=N_HIDDEN, help="hidden units")
     p.add_argument("--steps", type=int, default=N_DATASETS, help="training batches")
-    p.add_argument("--feedback", choices=["exact_readout", "random_fixed"],
-                   default=FEEDBACK_MODE, help="hidden learning-signal feedback")
+    p.add_argument("--feedback",
+                   choices=["exact_readout", "layerwise_fa", "direct_fa"],
+                   default=FEEDBACK_MODE,
+                   help="hidden learning-signal feedback (both random modes "
+                        "coincide for this single-hidden RNN)")
     return p.parse_args()
 
 

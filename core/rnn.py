@@ -38,6 +38,7 @@ import torch
 from net_helpers import BaseNetwork
 from net_helpers import rand_weight_init, get_activation_function
 from mpn import masked_mse_loss_and_output_grad  # one shared masked-MSE definition
+from mpn import canonical_feedback_mode           # shared feedback-mode vocabulary
 
 
 class LeakyRNN(BaseNetwork):
@@ -66,9 +67,11 @@ class LeakyRNN(BaseNetwork):
         self.learning_rule = net_params.get('learning_rule', 'bptt')
         assert self.learning_rule in ('bptt', 'local_diag_rflo'), \
             f"unknown learning_rule '{self.learning_rule}'"
-        self.feedback_mode = net_params.get('feedback_mode', 'exact_readout')
-        assert self.feedback_mode in ('exact_readout', 'random_fixed'), \
-            f"unknown feedback_mode '{self.feedback_mode}'"
+        # A vanilla RNN has ONE hidden layer, so both random-feedback variants
+        # ('layerwise_fa', 'direct_fa') are the same single-boundary feedback
+        # alignment; only 'exact_readout' is distinct. Validated via the shared helper.
+        self.feedback_mode = canonical_feedback_mode(
+            net_params.get('feedback_mode', 'exact_readout'))
 
         self.param_clamping = False
 
@@ -103,7 +106,8 @@ class LeakyRNN(BaseNetwork):
             dtype=torch.float))
 
         # Fixed random feedback matrix (same shape as W_output = (n_output, n_hidden)).
-        if self.feedback_mode == 'random_fixed':
+        # Allocated for any non-exact mode (they all coincide for one hidden layer).
+        if self.feedback_mode != 'exact_readout':
             self.register_buffer('B_feedback', torch.tensor(
                 rand_weight_init(self.n_hidden, self.n_output,
                                  init_type=net_params.get('B_feedback_init', 'xavier')),

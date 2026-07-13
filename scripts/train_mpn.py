@@ -69,7 +69,11 @@ NET_TYPE = "dmpn"
 # Overridable with --compile-local.
 COMPILE_LOCAL = False
 RULES_TO_RUN = ["bptt", "local_diag_rflo", "local_direct"]   # rules to compare
-FEEDBACK_MODE = "exact_readout"   # 'exact_readout' or 'random_fixed' (feedback align)
+# Hidden learning-signal feedback (deep stacks only; both random modes coincide
+# for a single hidden layer). 'exact_readout' = true gradient; 'layerwise_fa' =
+# recursive per-boundary feedback alignment; 'direct_fa' = direct feedback
+# alignment. See mpn._FEEDBACK_MODES.
+FEEDBACK_MODE = "layerwise_fa"
 N_RUNS = 3                    # independent seeds per rule
 # Hidden width(s) of the MP-layer stack. A single int → one MP layer (the classic
 # in→hidden→out net). A list of ints → one MP layer per width, i.e. a DEEP MP
@@ -351,8 +355,11 @@ def _parse_args():
                         "(dmpn only), e.g. --hidden 150 100. Default: the N_HIDDEN "
                         "global.")
     p.add_argument("--steps", type=int, default=N_DATASETS, help="training batches")
-    p.add_argument("--feedback", choices=["exact_readout", "random_fixed"],
-                   default=FEEDBACK_MODE, help="hidden learning-signal feedback")
+    p.add_argument("--feedback",
+                   choices=["exact_readout", "layerwise_fa", "direct_fa"],
+                   default=FEEDBACK_MODE,
+                   help="hidden learning-signal feedback (deep stacks only; both "
+                        "random modes coincide for one hidden layer)")
     p.add_argument("--compile-local", action="store_true", default=COMPILE_LOCAL,
                    help="torch.compile the fused local per-step core (direct/diag, "
                         "hebb_assoc). Default: %(default)s.")
