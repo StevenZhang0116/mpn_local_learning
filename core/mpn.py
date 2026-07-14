@@ -29,10 +29,10 @@ What is optimized (vs mpn_archive.py), all result-preserving:
       (ℓ_pre@W + bmm(ℓ_pre, W⊙M), no W_eff).
     - eta/lam expanded once per unroll; batched readout/embedding grads; streams
       the scalar loss and supports return_outputs=False to skip storing outputs.
-    - Tier-A overhead cuts (long-unroll): the mode branch is hoisted OUT of the
-      per-step loop (step_fn_for(mode) → _local_step_{direct,diag,exact} resolved
-      once); inputs/labels/masks are made time-major + contiguous so per-step reads
-      are contiguous (B,·) rows; the readout/embedding scratch buffers (go/hid/ga/u)
+    - Long-unroll overhead cuts: the mode branch is hoisted OUT of the per-step
+      loop (step_fn_for(mode) → _local_step_{direct,diag,exact} resolved once);
+      inputs/labels/masks are made time-major + contiguous so per-step reads are
+      contiguous (B,·) rows; the readout/embedding scratch buffers (go/hid/ga/u)
       are persistent (self._scratch, reused across calls, never checkpointed) and
       time-major so writes are contiguous. All calc-preserving.
   Measured: local_direct ~2.0×, local_diag_rflo ~1.6×, BPTT ~1.4× vs archive (CPU).
@@ -49,100 +49,6 @@ import math
 import numpy as np
 import copy
 import time
-import os
-
-
-# ─── Tier-B: optional torch.compile of the local per-step core (opt-in) ───────
-# The direct/diag local rules have a fixed per-timestep computation with no
-# data-dependent Python control flow, which makes it a clean torch.compile /
-# CUDA-graph target: compiling fuses the elementwise ops and cuts launch overhead
-# over a long unroll (T=784 seq-MNIST-pixel). To keep this safe when it cannot be
-# validated (no GPU in dev), it is:
-#   * OPT-IN and default OFF (set MPN_COMPILE_LOCAL=1 or call
-#     mpn.set_compile_local(True)); the eager path is untouched when off;
-#   * a PURE-FUNCTIONAL core (no self / no in-place attribute writes inside the
-#     compiled region) so the same function runs eager and compiled — one source
-#     of truth, CPU-verifiable — with the network doing the state assignment;
-#   * wrapped in a try/except that falls back to the eager core if compilation
-#     raises, so a compile failure can never break a training run.
-COMPILE_LOCAL = os.environ.get("MPN_COMPILE_LOCAL", "0") == "1"
-_COMPILED = {}   # (fn_name -> compiled callable) cache
-
-
-def set_compile_local(flag: bool):
-    """Enable/disable torch.compile of the local per-step cores at runtime.
-    Clears the compiled-fn cache so the next call recompiles as needed."""
-    global COMPILE_LOCAL
-    COMPILE_LOCAL = bool(flag)
-    _COMPILED.clear()
-
-
-def _maybe_compile(fn):
-    """Return fn, or a torch.compile'd version cached by name when COMPILE_LOCAL
-    is on. Falls back to the eager fn if torch.compile raises (e.g. unsupported
-    backend) so the caller never has to care."""
-    if not COMPILE_LOCAL:
-        return fn
-    key = fn.__name__
-    cached = _COMPILED.get(key)
-    if cached is None:
-        try:
-            cached = torch.compile(fn, dynamic=False)
-        except Exception as e:   # pragma: no cover - environment dependent
-            print(f"[mpn] torch.compile({key}) failed ({e}); using eager.")
-            cached = fn
-        _COMPILED[key] = cached
-    return cached
-
-
-# ─── Pure-functional local per-step cores (no self, no in-place attr writes) ──
-# These implement exactly the same math as MultiPlasticLayer._local_step_{direct,
-# diag} + update_M_matrix_local_fast, but as pure tensor->tensor functions so they
-# can be torch.compile'd. Each returns the per-step grads AND the NEW state
-# (M_new for direct; M_new/A_new/Q_new for diag); the layer assigns state. Bias
-# eligibility R / phi' need not be returned (self.E/self.R were dead diagnostics).
-
-def _core_direct_step(x, hidden, phi_prime, ell, M, W, eta, lam, um):
-    """Full fused direct step: grads (using M_{t-1}) + the hebb_assoc M update.
-    grad_W = sum_B (ell*phi')_i (1+M_iI) x_I ; grad_b = sum_B (ell*phi')_i ;
-    M_new = lam*M + eta*(hiddenᵀx). Returns (grad_W_t, grad_b_t, M_new).
-    Used only for hebb_assoc (a=1); hebb_pre keeps the eager path (its M update
-    uses a post-independent constant, handled by update_M_matrix_local_fast)."""
-    ell_phi = ell * phi_prime
-    grad_W_t = (ell_phi.unsqueeze(-1) * (1.0 + M) * x.unsqueeze(1)).sum(0)
-    grad_b_t = ell_phi.sum(0)
-    outer = hidden.unsqueeze(-1) * x.unsqueeze(1)                 # (B,i,I) hebb_assoc
-    M_new = lam.unsqueeze(0) * M + eta.unsqueeze(0) * outer
-    if um is not None:
-        m = um.view(-1, 1, 1)
-        M_new = m * M_new + (1.0 - m) * M
-    return grad_W_t, grad_b_t, M_new
-
-
-def _core_diag_step(x, hidden, phi_prime, ell, M, A, Q, W, eta, lam, a, um):
-    """Full fused diagonal-RFLO step: grad_W/grad_b (from t-1 traces) + A,Q,M
-    updates. Same math as _local_step_diag + update_M_matrix_local_fast. Returns
-    (grad_W_t, grad_b_t, M_new, A_new, Q_new)."""
-    W0 = W.unsqueeze(0)
-    factor = 1.0 + M + W0 * A                                    # (B,i,I)
-    ell_phi = ell * phi_prime
-
-    grad_W_t = (ell_phi.unsqueeze(-1) * x.unsqueeze(1) * factor).sum(0)
-
-    row_recurrent_b = torch.bmm(Q * W0, x.unsqueeze(-1)).squeeze(-1)
-    R = phi_prime * (1.0 + row_recurrent_b)
-    grad_b_t = torch.einsum('Bi,Bi->i', ell, R)
-
-    A_new = lam.unsqueeze(0) * A + a * eta.unsqueeze(0) * phi_prime.unsqueeze(-1) * x.square().unsqueeze(1) * factor
-    Q_new = lam.unsqueeze(0) * Q + a * eta.unsqueeze(0) * R.unsqueeze(-1) * x.unsqueeze(1)
-    outer = hidden.unsqueeze(-1) * x.unsqueeze(1)                 # hebb_assoc M update
-    M_new = lam.unsqueeze(0) * M + eta.unsqueeze(0) * outer
-    if um is not None:
-        m3 = um.view(-1, 1, 1)
-        A_new = m3 * A_new + (1.0 - m3) * A
-        Q_new = m3 * Q_new + (1.0 - m3) * Q
-        M_new = m3 * M_new + (1.0 - m3) * M
-    return grad_W_t, grad_b_t, M_new, A_new, Q_new
 
 from net_helpers import BaseNetwork, BaseNetworkFunctions
 from net_helpers import rand_weight_init, get_activation_function
@@ -745,42 +651,6 @@ class MultiPlasticLayer(BaseNetworkFunctions):
         return {'direct': self._local_step_direct,
                 'diag': self._local_step_diag,
                 'exact': self._local_step_exact}[mode]
-
-    # ── torch.compile fast path (opt-in; see set_compile_local / COMPILE_LOCAL) ──
-    def can_compile_step(self, mode):
-        """True if this layer/mode can use the compiled pure-functional core: only
-        direct/diag with the hebb_assoc M update (hebb_pre's M update uses a
-        post-independent constant, kept on the eager path)."""
-        return (COMPILE_LOCAL and mode in ('direct', 'diag')
-                and self.m_update_type == 'hebb_assoc')
-
-    def compiled_step_and_update(self, mode, x, hidden, phi_prime, ell, eta, lam,
-                                 update_mask=None):
-        """Run the fused (compiled) core for `mode`, ASSIGN the returned state
-        (M, and A/Q for diag), and return (grad_W_t, grad_b_t). Same result as
-        step_fn_for(mode)(...) followed by update_M_matrix_local_fast(...), but the
-        grads + all trace/M updates happen inside one compiled region."""
-        if mode == 'direct':
-            core = _maybe_compile(_core_direct_step)
-            grad_W_t, grad_b_t, M_new = core(
-                x, hidden, phi_prime, ell, self.M, self.W, eta, lam, update_mask)
-            self.M_pre = M_new
-            self.M = M_new
-            self.E, self.R = None, phi_prime
-        else:  # 'diag'
-            core = _maybe_compile(_core_diag_step)
-            grad_W_t, grad_b_t, M_new, A_new, Q_new = core(
-                x, hidden, phi_prime, ell, self.M, self.A, self.Q, self.W,
-                eta, lam, self._assoc, update_mask)
-            self.A, self.Q = A_new, Q_new
-            self.M_pre = M_new
-            self.M = M_new
-            self.E, self.R = None, None
-        # Plasticity-freeze (rare) still handled here to match the eager path.
-        if getattr(self, '_plasticity_freeze_mask', None) is not None:
-            self.M[:, self._plasticity_freeze_mask[0],
-                      self._plasticity_freeze_mask[1]] = self._M_frozen_vals
-        return grad_W_t, grad_b_t
 
     def local_grad_step_fast(self, x, phi_prime, ell, mode, eta=None, lam=None,
                              update_mask=None):
@@ -1437,9 +1307,6 @@ class MultiPlasticNet(MultiPlasticNetBase):
         # use the one fixed B_feedback (they coincide here — ordinary FA).
         feedback = self.W_output if self.feedback_mode == 'exact_spatial' else self.B_feedback
         step_fn = mp.step_fn_for(mode)      # resolve the per-step rule ONCE (no in-loop branch)
-        # Tier-B: if compilation is on and this mode/config supports it, use the
-        # fused compiled core (grads + M/A/Q update in one region); else eager.
-        use_compiled = mp.can_compile_step(mode)
 
         grad_W = torch.zeros_like(mp.W)
         grad_b = torch.zeros_like(mp.b)
@@ -1486,13 +1353,8 @@ class MultiPlasticNet(MultiPlasticNetBase):
             phi_prime = self.act_fn_p(hidden_pre)
             um = None if um_T is None else um_T[t]
 
-            if use_compiled:
-                # Fused core computes grads AND advances M/A/Q — no separate update.
-                grad_W_t, grad_b_t = mp.compiled_step_and_update(
-                    mode, x_t, hidden, phi_prime, ell, eta, lam, um)
-            else:
-                grad_W_t, grad_b_t = step_fn(x_t, phi_prime, ell, eta, lam, um)
-                mp.update_M_matrix_local_fast(x_t, hidden, eta=eta, lam=lam, update_mask=um)
+            grad_W_t, grad_b_t = step_fn(x_t, phi_prime, ell, eta, lam, um)
+            mp.update_M_matrix_local_fast(x_t, hidden, eta=eta, lam=lam, update_mask=um)
             grad_W += grad_W_t
             grad_b += grad_b_t
 
@@ -2187,11 +2049,6 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
 
         embed = self._has_trainable_embed()
         step_fns = [mp.step_fn_for(mode) for mp in layers]   # per-layer rule, resolved once
-        # Tier-B fused compiled core (opt-in). Safe for a deep stack too: all
-        # boundary signals are computed up front, and each layer's compiled step
-        # reads/advances only its OWN M/traces, so advancing M[n] inside the
-        # per-layer loop never disturbs another layer's step.
-        use_compiled = all(mp.can_compile_step(mode) for mp in layers)
 
         grad_W = [torch.zeros_like(mp.W) for mp in layers]
         grad_b = [torch.zeros_like(mp.b) for mp in layers]
@@ -2252,26 +2109,17 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
                 u_seq[t] = u_t
 
             # 5. Per-layer local gradient + trace advance.
-            if use_compiled:
-                # Fused core computes grads AND advances this layer's M/A/Q.
-                for n, mp in enumerate(layers):
-                    eta_n, lam_n = eta_lam[n]
-                    grad_W_t, grad_b_t = mp.compiled_step_and_update(
-                        mode, h[n], h[n + 1], phi_p[n], ell_h[n + 1], eta_n, lam_n, um)
-                    grad_W[n] += grad_W_t
-                    grad_b[n] += grad_b_t
-            else:
-                for n, mp in enumerate(layers):
-                    eta_n, lam_n = eta_lam[n]
-                    grad_W_t, grad_b_t = step_fns[n](
-                        h[n], phi_p[n], ell_h[n + 1], eta_n, lam_n, um)
-                    grad_W[n] += grad_W_t
-                    grad_b[n] += grad_b_t
-                # 6. Only now advance every layer's M from M_{t-1} to M_t.
-                for n, mp in enumerate(layers):
-                    eta_n, lam_n = eta_lam[n]
-                    mp.update_M_matrix_local_fast(
-                        h[n], h[n + 1], eta=eta_n, lam=lam_n, update_mask=um)
+            for n, mp in enumerate(layers):
+                eta_n, lam_n = eta_lam[n]
+                grad_W_t, grad_b_t = step_fns[n](
+                    h[n], phi_p[n], ell_h[n + 1], eta_n, lam_n, um)
+                grad_W[n] += grad_W_t
+                grad_b[n] += grad_b_t
+            # 6. Only now advance every layer's M from M_{t-1} to M_t.
+            for n, mp in enumerate(layers):
+                eta_n, lam_n = eta_lam[n]
+                mp.update_M_matrix_local_fast(
+                    h[n], h[n + 1], eta=eta_n, lam=lam_n, update_mask=um)
 
             go_seq[t] = grad_output
             hid_seq[t] = h[-1]

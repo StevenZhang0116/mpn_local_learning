@@ -16,12 +16,9 @@ ops and so are only identical up to round-off:
     (step_fn_for(mode)) WITHOUT materializing the (B,i,I) E tensor; the clean local
     M update takes a fast path (update_M_matrix_local_fast); the dmpn input
     embedding backprojection avoids building W_eff. All reorderings.
-  - Tier-A overhead cuts: mode branch hoisted out of the per-step loop; time-major
-    contiguous input/label/mask slicing; persistent (reused) time-major scratch
-    buffers for the readout/embedding contractions. Calc-preserving.
-  - Tier-B (opt-in): torch.compile of a pure-functional fused per-step core for
-    direct/diag (mpn_revise.set_compile_local(True) / MPN_COMPILE_LOCAL=1); default
-    OFF, eager fallback if compilation raises. Reordering, checked within tolerance.
+  - Long-unroll overhead cuts: mode branch hoisted out of the per-step loop;
+    time-major contiguous input/label/mask slicing; persistent (reused) time-major
+    scratch buffers for the readout/embedding contractions. Calc-preserving.
 
 So we compare with torch.allclose at a tolerance (float64: 1e-9; float32: 1e-5),
 checking the WHOLE forward (rolled-out outputs) and the WHOLE backward (loss +
@@ -35,7 +32,6 @@ Coverage:
   - return_outputs=False must NOT change any gradient (only skips storing outputs);
   - persistent-scratch reuse safety (repeated calls identical; returned outputs not
     clobbered by a later call's scratch writes);
-  - Tier-B torch.compile fused core matches the eager path within tolerance (opt-in);
   - REAL sequential-MNIST-pixel (T=784, 1 feature/step) alignment — the long-unroll
     stress case (skipped cleanly if the MNIST idx files are absent);
   - a seq-MNIST-pixel timing benchmark (mpn vs mpn_revise) at the training batch
@@ -244,34 +240,6 @@ def check_scratch_reuse_safe(dtype=torch.float64):
                   outputs_intact and grads_repro)
 
 
-def check_compile_local(dtype=torch.float32, rtol=1e-4, atol=1e-5):
-    """Tier-B: torch.compile of the fused per-step core (opt-in via
-    mpn_revise.set_compile_local) must match the eager path within tolerance.
-    Only direct/diag with hebb_assoc take the compiled core (see can_compile_step);
-    the M/A/Q traces + grads are produced by the compiled region. Runs the SAME net
-    eager then compiled (fresh state each call via reset_state) and compares grads.
-    Wider tolerance than the mpn-vs-mpn_revise check because torch.compile fuses/
-    reorders float ops; the first compiled call also triggers compilation (slow).
-    Falls back to eager internally if compilation raises, so it never hard-fails."""
-    import mpn as mr  # the efficiency-optimized impl (formerly mpn_revise)
-    for net_type in ("dmpn", "mpn1"):
-        for rule in ("local_diag_rflo", "local_direct"):
-            _, net = build_pair(net_type, 5, 8, 3, dtype, seed=31)
-            net.learning_rule = rule
-            inputs, labels, masks = make_data(4, 9, net.n_input, net.n_output, dtype, seed=32)
-            mr.set_compile_local(False)
-            ge = net.sequence_gradients(inputs, labels, masks)
-            mr.set_compile_local(True)
-            try:
-                gc = net.sequence_gradients(inputs, labels, masks)   # same net → reset_state
-            finally:
-                mr.set_compile_local(False)
-            keys = [k for k in ge if k not in ("loss", "outputs")]
-            worst = max((ge[k] - gc[k]).abs().max().item() for k in keys)
-            ok = all(close(ge[k], gc[k], rtol, atol)[0] for k in keys)
-            check(f"{net_type}/{rule}: torch.compile core matches eager", ok, f"max|Δ|={worst:.1e}")
-
-
 def _seqmnist_batch(task, B, dtype, seed=0):
     """A real seq-MNIST-pixel batch (B, 784, 1) via the task adapter, plus the
     one-hot labels / final-step mask. Returns (inputs, labels, mask)."""
@@ -328,23 +296,10 @@ def benchmark_seqmnist(net_type, rule, n_hidden=64, B=16, reps=5, warmup=2):
         _sync()
         return 1000.0 * (time.perf_counter() - t0) / reps
 
-    import mpn as mr  # the efficiency-optimized impl (formerly mpn_revise)
-    mr.set_compile_local(False)
     to, tr = timeit(net_o), timeit(net_r)
     speedup = to / tr if tr > 0 else float("nan")
-    line = (f"  {net_type}/{rule:16} T={inputs.shape[1]} h={n_hidden} B={B}: "
-            f"orig {to:8.1f} ms  revise {tr:8.1f} ms  ({speedup:.2f}x)")
-    # Tier-B: also time the torch.compile'd local core (direct/diag hebb_assoc).
-    if net_r.mp_layers[0].m_update_type == "hebb_assoc" and rule in ("local_diag_rflo", "local_direct"):
-        mr.set_compile_local(True)
-        try:
-            tc_ = timeit(net_r)   # first call compiles (warmup absorbs it)
-            line += f"  revise+compile {tc_:8.1f} ms ({to / tc_:.2f}x)"
-        except Exception as e:
-            line += f"  [compile failed: {e}]"
-        finally:
-            mr.set_compile_local(False)
-    print(line)
+    print(f"  {net_type}/{rule:16} T={inputs.shape[1]} h={n_hidden} B={B}: "
+          f"orig {to:8.1f} ms  revise {tr:8.1f} ms  ({speedup:.2f}x)")
 
 
 RULES = ["bptt", "local_exact_rowlocal", "local_diag_rflo", "local_direct"]
@@ -375,14 +330,10 @@ if __name__ == "__main__":
     print("── return_outputs=False self-consistency (float64) ──")
     check_return_outputs_flag(torch.float64)
 
-    # Tier-A persistent-scratch reuse: repeated calls must be identical and a
-    # returned outputs tensor must not be clobbered by a later call's scratch.
+    # Persistent-scratch reuse: repeated calls must be identical and a returned
+    # outputs tensor must not be clobbered by a later call's scratch.
     print("── persistent-scratch reuse safety (float64) ──")
     check_scratch_reuse_safe(torch.float64)
-
-    # Tier-B torch.compile of the fused per-step core must match eager (opt-in).
-    print("── torch.compile local core matches eager (float32, opt-in path) ──")
-    check_compile_local(torch.float32)
 
     # Real data, long sequence: seq-MNIST-pixel (T=784, 1 feature/step). This is
     # the true stress test for accumulation over a long unroll. Skips cleanly if

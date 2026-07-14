@@ -64,11 +64,6 @@ RULESET = "contextdelaydm1"           # single task to train on
 # RNN-comparable); 'mpn1' = MultiPlasticNet (single MP layer, no embedding).
 # Overridable with --net on the command line (see main()).
 NET_TYPE = "dmpn"
-# Tier-B: torch.compile the fused local per-step core (direct/diag, hebb_assoc)
-# in mpn. Off by default (compilation has warm-up cost and needs a working GPU
-# compiler); flip on for long-unroll GPU runs where the fusion pays off.
-# Overridable with --compile-local.
-COMPILE_LOCAL = False
 RULES_TO_RUN = ["bptt", "local_diag_rflo", "local_direct"]   # rules to compare
 # Hidden learning-signal feedback. 'exact_spatial' = exact same-time spatial
 # gradient (weight transport; top plastic layer exact vs BPTT under
@@ -309,8 +304,6 @@ def _cfg():
     """Package the current module globals + MPN-specific hooks into a RunConfig.
     Built fresh on each call so notebooks/validate/--net can override globals
     (e.g. NET_TYPE, N_HIDDEN, FEEDBACK_MODE) before any path/build helper below."""
-    # Apply the Tier-B torch.compile toggle to the local per-step cores.
-    mpn.set_compile_local(COMPILE_LOCAL)
     net_cls = _net_class()
     desc = "deep MPN" if NET_TYPE == "dmpn" else "MPN"
     # NET_TYPE is part of the prefix so dmpn/mpn1 runs don't overwrite each other.
@@ -398,15 +391,12 @@ def _parse_args():
                         "MP-layer rule: 'match' = per-rule native (default), 'exact' "
                         "= always BPTT gradient, 'three_factor' = always the direct "
                         "local rule. Default: %(default)s.")
-    p.add_argument("--compile-local", action="store_true", default=COMPILE_LOCAL,
-                   help="torch.compile the fused local per-step core (direct/diag, "
-                        "hebb_assoc). Default: %(default)s.")
     return p.parse_args()
 
 
 def main():
     global NET_TYPE, RULESET, N_RUNS, N_HIDDEN, N_DATASETS, FEEDBACK_MODE
-    global COMPILE_LOCAL, FEEDBACK_NORMALIZE, INPUT_MODE
+    global FEEDBACK_NORMALIZE, INPUT_MODE
     args = _parse_args()
     NET_TYPE = args.net
     RULESET = args.task
@@ -418,7 +408,6 @@ def main():
     FEEDBACK_MODE = args.feedback
     FEEDBACK_NORMALIZE = args.feedback_normalize
     INPUT_MODE = args.input_mode
-    COMPILE_LOCAL = args.compile_local
     tc.run_experiment(_cfg())
 
 
