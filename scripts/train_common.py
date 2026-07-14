@@ -148,6 +148,12 @@ def config_path(cfg):
     return os.path.join(cfg.fig_dir, f"{cfg.file_prefix}_{param_tag(cfg)}_runs{cfg.n_runs}.json")
 
 
+def align_fig_path(cfg):
+    """Gradient-alignment-vs-BPTT figure path (figure dir, '_gradalign' suffix)."""
+    return os.path.join(cfg.fig_dir,
+                        f"{cfg.file_prefix}_{param_tag(cfg)}_runs{cfg.n_runs}_gradalign.png")
+
+
 def ckpt_path(cfg, rule, seed):
     return os.path.join(cfg.ckpt_dir, f"{cfg.ckpt_prefix}_{param_tag(cfg)}_{rule}_seed{seed}.pt")
 
@@ -275,8 +281,13 @@ def eval_outputs_chunked(cfg, net, v_inputs, chunk):
 def run_seed(cfg, seed, record_steps):
     """Train all cfg.rules_to_run in lockstep for one seed: identical init
     (deepcopy of one base net), identical per-step data, identical held-out
-    validation set. Returns {rule: {'train': [...], 'valid': [...]}} sampled at
-    record_steps. Saves each trained net if cfg.save_nets."""
+    validation set. Returns (curves, align_curves):
+      curves[rule][split]        -> list over record_steps (train/valid metric)
+      align_curves[rule][key]    -> list over record_steps of the cosine similarity
+                                    between this (non-bptt) rule's gradient and the
+                                    exact BPTT gradient for weight `key` ({} if the
+                                    alignment diagnostic is off / no non-bptt rules).
+    Saves each trained net if cfg.save_nets."""
     np.random.seed(seed)
     torch.manual_seed(seed)
 
@@ -320,6 +331,11 @@ def run_seed(cfg, seed, record_steps):
     align_on = cfg.log_grad_align and any(r != "bptt" for r in cfg.rules_to_run)
     align_keys = (_grad_align_keys(next(iter(nets.values()))._trainable_params())
                   if align_on else [])
+    # Persisted alignment: per (non-bptt rule, weight-key) list of cosines over the
+    # record steps (parallels `curves`; returned so run_experiment can aggregate +
+    # save it). Only non-bptt rules populate it (bptt IS the reference).
+    align_curves = {r: {k: [] for k in align_keys}
+                    for r in cfg.rules_to_run if r != "bptt"} if align_on else {}
     def _short(k):
         return {"W_in": "Win", "W_input": "Win", "W_rec": "Wrec",
                 "W_output": "Wout"}.get(k, k)
@@ -453,6 +469,11 @@ def run_seed(cfg, seed, record_steps):
                 # Per-layer cosine vs BPTT (blank for bptt itself: it IS the ref).
                 if align_on:
                     al = step_align.get(r, {})
+                    # Persist this record step's cosines for the non-bptt rules
+                    # (nan when a key was absent), aligned with record_steps.
+                    if r in align_curves:
+                        for k in align_keys:
+                            align_curves[r][k].append(al.get(k, float("nan")))
                     align_cols = "   " + " ".join(
                         f"{al[k]:>9.4f}" if (r != 'bptt' and k in al and al[k] == al[k])
                         else f"{'—':>9}" for k in align_keys)
@@ -496,7 +517,7 @@ def run_seed(cfg, seed, record_steps):
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-    return curves
+    return curves, align_curves
 
 
 # ─── Plotting / persistence ───────────────────────────────────────────────────
@@ -535,10 +556,54 @@ def plot(cfg, record_steps, agg, rules, title_suffix, save_to):
     print(f"\nSaved figure: {save_to}")
 
 
-def save_plot_data(cfg, record_steps, runs, agg, path=None):
+def plot_alignment(cfg, record_steps, align_agg, align_keys, save_to):
+    """Gradient-alignment-vs-BPTT figure: cosine similarity between each non-bptt
+    rule's gradient and the exact BPTT gradient, per weight matrix, over training.
+    One subplot per weight-key (input embedding, each MP layer, readout); within a
+    subplot one mean±std curve per non-bptt rule. cos=1 → the local rule points
+    exactly along the true gradient; lower → more approximation. No-op if empty."""
+    rules = list(align_agg.keys())
+    if not rules or not align_keys:
+        return
+    steps = np.asarray(record_steps)
+    ncols = len(align_keys)
+    fig, axes = plt.subplots(1, ncols, figsize=(4.0 * ncols, 3.6),
+                             squeeze=False, sharey=True)
+    for j, key in enumerate(align_keys):
+        ax = axes[0][j]
+        for r in rules:
+            ms = align_agg.get(r, {}).get(key)
+            if ms is None:
+                continue
+            mean, std = np.asarray(ms["mean"]), np.asarray(ms["std"])
+            c = cfg.rule_color.get(r)
+            ax.plot(steps, mean, color=c, lw=2, label=cfg.rule_label.get(r, r))
+            ax.fill_between(steps, mean - std, mean + std, color=c, alpha=0.15)
+        ax.axhline(1.0, color="0.7", lw=0.8, ls=":")   # perfect alignment
+        ax.set_title(key, fontsize=10)
+        ax.set_xlabel("training step")
+        ax.set_ylim(-0.05, 1.05)
+        ax.grid(alpha=0.3)
+    axes[0][0].set_ylabel("cosine(grad, BPTT grad)")
+    axes[0][-1].legend(frameon=False, loc="lower right")
+    fig.suptitle(f"{cfg.title}: gradient alignment vs BPTT "
+                 f"(mean ± std over {cfg.n_runs} runs, {arch_suffix(cfg)})", y=1.03)
+    fig.tight_layout()
+    os.makedirs(os.path.dirname(save_to), exist_ok=True)
+    fig.savefig(save_to, dpi=150, bbox_inches="tight")
+    print(f"Saved gradient-alignment figure: {save_to}")
+
+
+def save_plot_data(cfg, record_steps, runs, agg, path=None,
+                   align_runs=None, align_agg=None):
     """Save the arrays behind the figure to an .npz so it can be replotted later
     without retraining. Stores per-seed curves (runs), aggregated mean/std (agg),
-    the x-axis (record_steps), and run metadata. Use replot_from_npz() to reload."""
+    the x-axis (record_steps), and run metadata. When align_runs/align_agg are given
+    (gradient alignment vs BPTT), stores per-(rule,weight-key) cosine curves too:
+      align_runs__{rule}__{key}   (n_runs, n_points) per-seed cosines
+      align_mean/std__{rule}__{key}   (n_points,) across-seed mean/std
+      align_keys                  the ordered weight-key list (for replotting)
+    Use replot_from_npz() to reload."""
     path = path or data_path(cfg)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     out = {
@@ -561,6 +626,19 @@ def save_plot_data(cfg, record_steps, runs, agg, path=None):
             out[f"runs__{r}__{split}"] = np.asarray(runs[r][split], dtype=float)
             out[f"mean__{r}__{split}"] = np.asarray(agg[r][split]["mean"], dtype=float)
             out[f"std__{r}__{split}"] = np.asarray(agg[r][split]["std"], dtype=float)
+    # Gradient-alignment-vs-BPTT arrays (only when the diagnostic ran).
+    if align_agg:
+        akeys = []
+        for r, per_key in align_agg.items():
+            for k, ms in per_key.items():
+                out[f"align_mean__{r}__{k}"] = np.asarray(ms["mean"], dtype=float)
+                out[f"align_std__{r}__{k}"] = np.asarray(ms["std"], dtype=float)
+                if align_runs is not None:
+                    out[f"align_runs__{r}__{k}"] = np.asarray(align_runs[r][k], dtype=float)
+                if k not in akeys:
+                    akeys.append(k)
+        out["align_keys"] = np.asarray(akeys)
+        out["align_rules"] = np.asarray(list(align_agg.keys()))
     np.savez(path, **out)
     print(f"Saved plot data: {path}")
 
@@ -673,14 +751,21 @@ def run_experiment(cfg):
         record_steps.append(cfg.n_datasets - 1)
 
     # runs[rule][split] -> list (over seeds) of accuracy curves.
+    # align_runs[rule][key] -> list (over seeds) of per-record-step cosine curves
+    # (gradient alignment vs BPTT); empty for bptt and when the diagnostic is off.
     runs = {r: {"train": [], "valid": []} for r in cfg.rules_to_run}
+    align_runs = {}
     seeds = [cfg.seed + k for k in range(cfg.n_runs)]
     for run_idx, seed in enumerate(seeds):
         print(f"── Run {run_idx + 1}/{cfg.n_runs}  (seed {seed}) ──")
-        curves = run_seed(cfg, seed, record_steps)
+        curves, align_curves = run_seed(cfg, seed, record_steps)
         for r in cfg.rules_to_run:
             runs[r]["train"].append(curves[r]["train"])
             runs[r]["valid"].append(curves[r]["valid"])
+        for r, per_key in align_curves.items():
+            ar = align_runs.setdefault(r, {})
+            for k, series in per_key.items():
+                ar.setdefault(k, []).append(series)
 
     # Aggregate mean/std across seeds (ignoring any nan accuracies).
     agg = {}
@@ -691,7 +776,17 @@ def run_experiment(cfg):
             agg[r][split] = {"mean": np.nanmean(arr, axis=0),
                              "std": np.nanstd(arr, axis=0)}
 
-    save_plot_data(cfg, record_steps, runs, agg)
+    # Aggregate the alignment cosines the same way (per rule × weight-key).
+    align_agg = {}
+    for r, per_key in align_runs.items():
+        align_agg[r] = {}
+        for k, seed_series in per_key.items():
+            arr = np.asarray(seed_series, dtype=float)      # (n_runs, n_points)
+            align_agg[r][k] = {"mean": np.nanmean(arr, axis=0),
+                               "std": np.nanstd(arr, axis=0)}
+
+    save_plot_data(cfg, record_steps, runs, agg, align_runs=align_runs,
+                   align_agg=align_agg)
     save_config(cfg)   # JSON of the training + network setup, next to the figure
     # Append notes to the figure title only when the feature is on / non-default, so
     # existing (norm-off, match) figure titles are unchanged.
@@ -701,6 +796,13 @@ def run_experiment(cfg):
     plot(cfg, record_steps, agg, cfg.rules_to_run,
          f"(mean ± std over {cfg.n_runs} runs, {arch_suffix(cfg)}{fbnorm_note}{inmode_note})",
          fig_path(cfg))
+
+    # Gradient-alignment-vs-BPTT figure (only when the diagnostic produced data).
+    if align_agg:
+        # Preserve the input→hidden→output key order any non-bptt rule recorded.
+        any_rule = next(iter(align_agg))
+        align_keys = _grad_align_keys(align_agg[any_rule])
+        plot_alignment(cfg, record_steps, align_agg, align_keys, align_fig_path(cfg))
 
     # Final-metric summary (the plotted metric: accuracy or loss).
     metric_noun = "loss" if cfg.metric == "loss" else "accuracy"
