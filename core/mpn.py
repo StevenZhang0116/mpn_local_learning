@@ -149,13 +149,28 @@ from net_helpers import rand_weight_init, get_activation_function
 
 
 # ─── Feedback (learning-signal) modes ─────────────────────────────────────────
-# How the hidden layers' learning signal ("ell", the surrogate dL/dh) is formed.
-# The differences only matter for a DEEP MP stack; for a single hidden layer the
-# two random variants coincide (one boundary → one random matrix), which is
-# exactly ordinary feedback alignment.
+# How each hidden layer's learning signal ("ell", the surrogate dL/dh) is formed.
+# exact_spatial differs from random feedback (layerwise_fa/direct_fa) at ANY depth
+# — even one hidden layer: grad_output @ W_output (exact) vs @ B (random).
+# layerwise_fa and direct_fa differ from EACH OTHER only when there is more than
+# one trainable activity boundary (multiple MP layers, or one MP layer plus a
+# trainable input embedding); with a single boundary both are ordinary one-hidden-
+# layer feedback alignment (one random matrix).
 #
-#   'exact_readout'  actual readout + actual (modulated) lower weights — the true
-#                    same-time spatial gradient (weight transport everywhere).
+#   'exact_spatial'  actual readout + actual (modulated) lower weights — the exact
+#                    same-time SPATIAL gradient (weight transport everywhere).
+#                    "exact" qualifies the FEEDBACK PATHWAY, not the full deep
+#                    gradient: paired with local_exact_rowlocal the TOP plastic
+#                    layer's gradient is exact vs BPTT (its only paths to the loss
+#                    are the spatial one — delivered by the true W_output — and its
+#                    own temporal M-path — captured by the exact P trace), but the
+#                    LOWER plastic layers still get SURROGATE gradients (they omit
+#                    temporal paths through the plastic state of the layers above).
+#                    Paired with local_diag_rflo / local_direct even the top layer
+#                    is only approximate, because the eligibility itself is. Hence
+#                    the literal name 'exact_spatial'/'backprop_spatial'; the
+#                    behavior is mathematically correct either way. Legacy name:
+#                    'exact_readout' (kept as an alias; mpn_archive.py still uses it).
 #   'layerwise_fa'   conventional recursive feedback alignment: a fixed random matrix
 #                    at EVERY adjacent boundary (readout→top via B_feedback, each
 #                    inter-hidden boundary via B_inter[n]). No actual W or M is used
@@ -163,15 +178,20 @@ from net_helpers import rand_weight_init, get_activation_function
 #   'direct_fa'      direct feedback alignment: the readout error is projected DIRECTLY
 #                    to every hidden layer through its own random matrix B_direct[k]
 #                    (no sequential backward chain at all).
-_FEEDBACK_MODES = ('exact_readout', 'layerwise_fa', 'direct_fa')
+_FEEDBACK_MODES = ('exact_spatial', 'layerwise_fa', 'direct_fa')
+_FEEDBACK_ALIASES = {'exact_readout': 'exact_spatial'}   # legacy name → canonical
 
 
 def canonical_feedback_mode(mode):
-    """Validate a feedback_mode string against _FEEDBACK_MODES, returning it
-    unchanged. Raises ValueError for an unrecognized mode."""
+    """Map a (possibly legacy) feedback_mode string to its canonical name and
+    validate it against _FEEDBACK_MODES. 'exact_readout' is the previous name for
+    'exact_spatial' and aliases to it (byte-identical behavior); mpn_archive.py
+    and older configs still use it. Raises ValueError for an unrecognized mode."""
+    mode = _FEEDBACK_ALIASES.get(mode, mode)
     if mode not in _FEEDBACK_MODES:
         raise ValueError(
-            f"unknown feedback_mode '{mode}'; expected one of {_FEEDBACK_MODES}")
+            f"unknown feedback_mode '{mode}'; expected one of {_FEEDBACK_MODES} "
+            f"(or the legacy alias {tuple(_FEEDBACK_ALIASES)})")
     return mode
 
 
@@ -1213,22 +1233,24 @@ class MultiPlasticNet(MultiPlasticNetBase):
                          'local_direct'), f"unknown learning_rule '{_rule}'"
         self.learning_rule = _rule
 
-        # Learning signal for the hidden layer. This net has a SINGLE hidden
-        # boundary (readout → hidden), so both random-feedback variants
-        # ('layerwise_fa', 'direct_fa') coincide — each just replaces the readout
-        # transpose with one fixed random matrix B_feedback, which IS ordinary
-        # feedback alignment. Only 'exact_readout' (true gradient via W_output) is
-        # distinct here. Buffer registered in super().__init__ once W_output's
+        # Learning signal for the hidden layer. This net has exactly ONE trainable
+        # activity boundary (readout → hidden; no input embedding), so the two
+        # random-feedback variants ('layerwise_fa', 'direct_fa') coincide — each
+        # just replaces the readout transpose with one fixed random matrix
+        # B_feedback, i.e. ordinary one-hidden-layer feedback alignment. They would
+        # only differ with a second trainable boundary (see DeepMultiPlasticNet).
+        # 'exact_spatial' (true gradient via W_output) is distinct from them here
+        # and at any depth. Buffer registered in super().__init__ once W_output's
         # shape is known.
         self.feedback_mode = canonical_feedback_mode(
-            net_params.get('feedback_mode', 'exact_readout'))
+            net_params.get('feedback_mode', 'exact_spatial'))
 
         super().__init__(net_params, self.n_hidden, verbose=verbose)
 
         # Fixed random feedback matrix for feedback alignment (same shape as
         # W_output, never trained). Allocated for any non-exact mode (they all
         # reduce to one random boundary for a single hidden layer).
-        if self.feedback_mode != 'exact_readout':
+        if self.feedback_mode != 'exact_spatial':
             self.register_buffer('B_feedback', torch.tensor(
                 rand_weight_init(self.n_hidden, self.n_output,
                                  init_type=net_params.get('B_feedback_init', 'xavier')),
@@ -1411,9 +1433,9 @@ class MultiPlasticNet(MultiPlasticNetBase):
         elif mode == 'diag':
             mp.reset_diag_rflo_state(B=B)
 
-        # Single hidden boundary: exact readout uses W_output, the random modes
+        # Single hidden boundary: exact_spatial uses W_output, the random modes
         # use the one fixed B_feedback (they coincide here — ordinary FA).
-        feedback = self.W_output if self.feedback_mode == 'exact_readout' else self.B_feedback
+        feedback = self.W_output if self.feedback_mode == 'exact_spatial' else self.B_feedback
         step_fn = mp.step_fn_for(mode)      # resolve the per-step rule ONCE (no in-loop branch)
         # Tier-B: if compilation is on and this mode/config supports it, use the
         # fused compiled core (grads + M/A/Q update in one region); else eager.
@@ -1547,15 +1569,26 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
     state of the layers above them — even when the intra-layer eligibility is exact.
 
     feedback_mode selects HOW the inter-layer learning signal is formed (see the
-    module-level _FEEDBACK_MODES table). It only matters for a DEEP stack (L>1):
-      'exact_readout'  true same-time spatial gradient (weight transport
-                       everywhere); the TOP plastic layer's gradient is exact.
+    module-level _FEEDBACK_MODES table). exact_spatial differs from the random modes
+    at ANY depth; layerwise_fa and direct_fa differ from each other only when there
+    is more than one trainable activity boundary (multiple MP layers, or one MP
+    layer plus a trainable input embedding):
+      'exact_spatial'  exact same-time SPATIAL gradient (weight transport
+                       everywhere). With local_exact_rowlocal the TOP plastic
+                       layer's gradient is exact vs BPTT (spatial path via the true
+                       W_output + its own temporal M-path via the exact P trace);
+                       LOWER layers stay surrogates, and diag/direct make even the
+                       top only approximate. Legacy alias: 'exact_readout'.
       'layerwise_fa'   conventional recursive feedback alignment — a fixed random
                        matrix at EVERY boundary, so the whole feedback pathway is
                        weight-transport-free.
       'direct_fa'      direct feedback alignment — the readout error is projected
                        directly onto every hidden layer through its own random matrix.
-    For a single MP layer both random modes coincide with ordinary FA.
+    For a single MP layer with no trainable input embedding, layerwise_fa and
+    direct_fa reduce to ordinary one-hidden-layer feedback alignment. With a
+    trainable embedding the MP-layer signals coincide in form, but the embedding
+    receives recursive feedback under layerwise_fa and a direct output projection
+    under direct_fa.
     """
 
     def __init__(self, net_params, verbose=False):
@@ -1584,12 +1617,46 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
         assert _rule in ('bptt', 'local_exact_rowlocal', 'local_diag_rflo',
                          'local_direct'), f"unknown learning_rule '{_rule}'"
         self.learning_rule = _rule
+        # input_mode decouples the TRAINABLE INPUT EMBEDDING's learning rule from the
+        # MP-layer learning_rule, so any RULES_TO_RUN × input-rule combination can be
+        # compared. Only meaningful when input_layer_add_trainable is on.
+        #   'match'        — the embedding follows learning_rule (historical default:
+        #                    exact autograd under bptt, the 3-factor local rule under
+        #                    a local rule). Zero behavior change from before.
+        #   'exact'        — the embedding is ALWAYS trained by the true BPTT gradient
+        #                    (dL/dW_in via autograd), even during a local MP run.
+        #   'three_factor' — the embedding ALWAYS uses the DIRECT 3-factor local rule
+        #                    (ell_h[0] ⊙ phi'(embed_pre)) · uᵀ, even during a bptt run.
+        # The splice lives in sequence_gradients (recompute the OTHER method's grad
+        # and overwrite only W_in/b_in) so no new gradient math is introduced.
+        self.input_mode = cfg.get('input_mode', 'match')
+        assert self.input_mode in ('match', 'exact', 'three_factor'), \
+            f"unknown input_mode '{self.input_mode}'"
         # feedback_mode governs how each hidden layer's learning signal is formed
         # in the local rules (see the _FEEDBACK_MODES table and
         # _same_time_boundary_signals). B_feedback_init is stashed for the
         # per-layer FA buffers built after the MP layers exist.
-        self.feedback_mode = canonical_feedback_mode(cfg.get('feedback_mode', 'exact_readout'))
+        self.feedback_mode = canonical_feedback_mode(cfg.get('feedback_mode', 'exact_spatial'))
         self._B_feedback_init = cfg.get('B_feedback_init', 'xavier')
+
+        # ── Homeostatic gain control on the FA learning signals (opt-in) ──────
+        # Deep random-feedback pathways can attenuate/amplify each lower boundary's
+        # learning signal ell (products of random matrices × phi'). This keeps a
+        # per-boundary running RMS estimate v_k and rescales ell_k -> gain_k * ell_k
+        # / sqrt(v_k + eps) — a fully local, weight-transport-free gain control
+        # (per-layer RMSNorm on the teaching signal). OFF by default and applied
+        # ONLY to the random feedback modes: exact_spatial must stay bit-identical to
+        # BPTT, so it is never rescaled (asserted in __init__). See
+        # _normalize_learning_signal / _same_time_boundary_signals.
+        self.feedback_normalize = bool(cfg.get('feedback_normalize', False))
+        self.ell_rms_beta = float(cfg.get('feedback_normalize_beta', 0.9))
+        self.ell_rms_eps = float(cfg.get('feedback_normalize_eps', 1e-8))
+        self._ell_gain_val = float(cfg.get('feedback_normalize_gain', 1.0))
+        if self.feedback_normalize and self.feedback_mode == 'exact_spatial':
+            raise ValueError(
+                "feedback_normalize is only valid for the random feedback modes "
+                "('layerwise_fa'/'direct_fa'); it would break exact_spatial's "
+                "exact==BPTT guarantee. Got feedback_mode='exact_spatial'.")
 
         super().__init__(cfg, cfg['n_neurons'][-2], output_matrix=self.output_matrix, verbose=verbose)
 
@@ -1713,6 +1780,17 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
                     rand_weight_init(dim_hk, self.n_output, init_type=self._B_feedback_init),
                     dtype=self.W_output.dtype))
                 self._B_direct_names.append(name)
+
+        # Homeostatic-gain state, allocated only when feedback_normalize is on (so
+        # the default net's buffer set — hence its state_dict — is unchanged). One
+        # entry per boundary index 0..L (0 = embedding boundary, 1..L = MP layers).
+        # ell_gain is a fixed target-gain buffer (moves with .to()); the running RMS
+        # v_k is a per-sequence TEMPORAL state (a plain tensor attribute, reset each
+        # unroll like self.M — never a buffer, so it stays out of state_dict).
+        if self.feedback_normalize:
+            self.register_buffer(
+                'ell_gain', torch.full((L + 1,), self._ell_gain_val, dtype=self.W_output.dtype))
+            self.ell_rms = None   # allocated/zeroed by reset_feedback_norm_state(B)
 
 
     def forward(self, inputs, run_mode='minimal', verbose=False):
@@ -1848,13 +1926,56 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
         output = F.linear(h[-1], self.W_output, self.b_output)
         return output, h, z, phi_p, embed_pre
 
+    def reset_feedback_norm_state(self, B=1):
+        """Zero the per-sequence running RMS of every boundary learning signal.
+        No-op unless feedback_normalize is on. Called once per unroll (parallel to
+        reset_state), so the homeostatic gain control starts fresh each sequence and
+        never leaks state across calls. B is unused (the RMS is a scalar per
+        boundary, averaged over batch and units) but kept for signature symmetry."""
+        if not getattr(self, 'feedback_normalize', False):
+            return
+        L = len(self.mp_layers)
+        self.ell_rms = torch.zeros(L + 1, dtype=self.W_output.dtype, device=self.W_output.device)
+
+    def _normalize_learning_signal(self, k, ell):
+        """Homeostatic gain control on boundary k's learning signal (opt-in).
+
+        Advances the per-boundary running RMS estimate and rescales ell to a fixed
+        target gain — a fully local, weight-transport-free normalization (per-layer
+        RMSNorm on the teaching signal):
+            v_k   <- beta v_k + (1 - beta) mean_{B,i}[ ell_{i}^2 ]
+            ell~  =  gain_k * ell / sqrt(v_k + eps)
+        Uses only the activity of the neurons receiving the signal (no forward
+        weights/gradients). ell is (B, dim h[k]); returns the rescaled signal."""
+        power = ell.square().mean()
+        v = self.ell_rms[k] * self.ell_rms_beta + power * (1.0 - self.ell_rms_beta)
+        self.ell_rms[k] = v
+        return self.ell_gain[k] * ell / torch.sqrt(v + self.ell_rms_eps)
+
+    def _maybe_normalize_boundary_signals(self, ell_h, need_input_signal):
+        """Post-pass homeostatic gain control over a fully-built ell_h list; a no-op
+        unless feedback_normalize is on (so the default/exact path is untouched).
+        Every filled boundary (1..L, plus 0 when the embedding is trainable) is
+        rescaled independently. Because the layerwise recursion is LINEAR, rescaling
+        as a post-pass preserves each boundary's direction and only controls its
+        magnitude, so it is equivalent (up to the running-RMS history) to normalizing
+        inside the recursion — and matches the reference _normalize_learning_signal
+        loop. exact_spatial never reaches here with the flag on (asserted off)."""
+        if not self.feedback_normalize:
+            return ell_h
+        for k in range(1, len(self.mp_layers) + 1):
+            ell_h[k] = self._normalize_learning_signal(k, ell_h[k])
+        if need_input_signal and ell_h[0] is not None:
+            ell_h[0] = self._normalize_learning_signal(0, ell_h[0])
+        return ell_h
+
     def _same_time_boundary_signals(self, grad_output, phi_p, need_input_signal):
         """Same-time layer-boundary learning signals using the frozen M_{t-1}.
 
         ell_h[n] is the surrogate dL/dh[n] (the signal at the INPUT boundary of MP
         layer n). How it is formed depends on self.feedback_mode (see _FEEDBACK_MODES):
 
-          exact_readout — true same-time spatial gradient:
+          exact_spatial — exact same-time spatial gradient:
             ell_h[L] = grad_output @ W_output
             ell_h[n] = W_eff^{(n)T} ( ell_h[n+1] ⊙ phi'(z[n]) )      for n < L
           layerwise_fa — conventional recursive feedback alignment: a fixed random
@@ -1866,7 +1987,7 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
             (no backward chain, no phi'/M in the feedback pathway):
             ell_h[k] = grad_output @ B_direct[k]                      for all k
 
-        For exact_readout / layerwise_fa the recursion drops temporal paths through
+        For exact_spatial / layerwise_fa the recursion drops temporal paths through
         the plastic state of upper layers but keeps the same-time spatial structure.
         Layer n's eligibility routine is fed ell_h[n+1] (its OUTPUT-boundary signal)
         — NOT premultiplied by phi'.
@@ -1874,7 +1995,12 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
         Returns ell_h, a length-(L+1) list. ell_h[1..L] are always filled (every
         MP layer's step needs its output signal); ell_h[0] is filled only when
         need_input_signal (the trainable input embedding). For a single MP layer
-        with no embedding, exact_readout / layerwise_fa compute exactly one matmul.
+        with no embedding, exact_spatial / layerwise_fa compute exactly one matmul.
+
+        When feedback_normalize is on (random modes only), each fully-constructed
+        boundary signal is passed through the homeostatic gain control before return
+        (a post-pass, so the layerwise recursion itself is built from raw signals and
+        only its outputs are rescaled — matching _normalize_learning_signal).
         """
         L = len(self.mp_layers)
         ell_h = [None] * (L + 1)
@@ -1886,9 +2012,9 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
                 ell_h[k] = grad_output @ getattr(self, self._B_direct_names[k])
             if need_input_signal:
                 ell_h[0] = grad_output @ getattr(self, self._B_direct_names[0])
-            return ell_h
+            return self._maybe_normalize_boundary_signals(ell_h, need_input_signal)
 
-        # exact_readout vs layerwise_fa: the former uses the exact (modulated)
+        # exact_spatial vs layerwise_fa: the former uses the exact (modulated)
         # weight transpose at every boundary (weight transport), the latter a fixed
         # random matrix at every boundary (transport-free). Top boundary first, then
         # recurse down; ell_h[0] only when the trainable embedding needs it.
@@ -1907,7 +2033,7 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
             else:
                 ell_h[0] = self.mp_layers[0].backproject_through_modulated_weights_fast(delta_0)
 
-        return ell_h
+        return self._maybe_normalize_boundary_signals(ell_h, need_input_signal)
 
     def _trainable_params(self):
         """Trainable tensors this net computes gradients for, keyed by name.
@@ -2052,6 +2178,7 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
                 inputs, labels, masks, loss_and_grad, eta_lam, update_masks)
 
         self.reset_state(B=B)
+        self.reset_feedback_norm_state(B=B)   # per-sequence RMS state (no-op unless on)
         for mp in layers:
             if mode == 'exact':
                 mp.reset_local_learning_state(B=B)
@@ -2176,36 +2303,77 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
         return result
 
     def local_gradients(self, inputs, labels, masks, **kwargs):
-        """Exact intra-layer row-local eligibility per MP layer + direct same-time
-        inter-layer learning signals + direct 3-factor input embedding. The top
-        plastic layer's gradient is exact with exact readout feedback; hidden-layer
-        updates omit temporal paths through upper plastic layers (surrogates)."""
+        """Exact intra-layer row-local eligibility per MP layer + same-time
+        inter-layer learning signals + direct 3-factor input embedding. ONLY with
+        feedback_mode='exact_spatial' is the TOP plastic layer's gradient exact vs
+        BPTT (exact eligibility + true spatial feedback); the LOWER plastic layers
+        stay surrogates (they omit temporal paths through upper plastic layers), and
+        under the FA feedback modes even the top layer is no longer exact."""
         return self._local_sequence_gradients(inputs, labels, masks, 'exact', **kwargs)
 
     def local_diag_rflo_gradients(self, inputs, labels, masks, **kwargs):
-        """Diagonal RFLO eligibility per MP layer + direct same-time inter-layer
-        learning signals + direct 3-factor input embedding."""
+        """Diagonal RFLO eligibility per MP layer + same-time inter-layer learning
+        signals + direct 3-factor input embedding. APPROXIMATE for EVERY plastic
+        layer — including the top — regardless of feedback_mode, because the
+        diagonal eligibility itself drops off-synapse plastic sensitivities (exact
+        only when n_input == 1). The readout gradient stays exact."""
         return self._local_sequence_gradients(inputs, labels, masks, 'diag', **kwargs)
 
     def local_direct_gradients(self, inputs, labels, masks, **kwargs):
-        """Direct/instantaneous eligibility per MP layer + direct same-time
-        inter-layer learning signals + direct 3-factor input embedding. Treats
-        every M_{t-1} as a stop-gradient state (spatial backprop through the deep
-        feedforward net with frozen modulation)."""
+        """Direct/instantaneous eligibility per MP layer + same-time inter-layer
+        learning signals + direct 3-factor input embedding. Treats every M_{t-1} as
+        a stop-gradient state (spatial backprop through the deep feedforward net with
+        frozen modulation). APPROXIMATE for EVERY plastic layer — including the top —
+        regardless of feedback_mode (no plasticity-mediated temporal credit at all);
+        exact only at T=1 or eta=0. The readout gradient stays exact."""
         return self._local_sequence_gradients(inputs, labels, masks, 'direct', **kwargs)
 
+    def _grads_for_rule(self, rule, inputs, labels, masks, **kwargs):
+        """Full gradient dict for an ARBITRARY rule (not necessarily self.learning_
+        rule). Used both by sequence_gradients and by the input_mode splice, which
+        needs the OTHER rule's embedding gradient."""
+        if rule == 'bptt':
+            return self.bptt_gradients(inputs, labels, masks, **kwargs)
+        elif rule == 'local_exact_rowlocal':
+            return self.local_gradients(inputs, labels, masks, **kwargs)
+        elif rule == 'local_diag_rflo':
+            return self.local_diag_rflo_gradients(inputs, labels, masks, **kwargs)
+        elif rule == 'local_direct':
+            return self.local_direct_gradients(inputs, labels, masks, **kwargs)
+        raise ValueError(f"unknown learning_rule '{rule}'")
+
+    def _apply_input_mode(self, grads, inputs, labels, masks, **kwargs):
+        """Override W_in/b_in in `grads` when input_mode requests a rule the native
+        pass did not already produce for the embedding.
+
+        The embedding's NATIVE rule is 'exact' under bptt and 'three_factor' under
+        any local rule (all local rules give the SAME embedding gradient — the
+        3-factor rule does not depend on the MP eligibility mode). So a splice is
+        needed only when input_mode disagrees with that native rule:
+          input_mode='exact'        on a LOCAL run → take W_in/b_in from a BPTT pass.
+          input_mode='three_factor' on a BPTT run  → take W_in/b_in from a local pass
+                                                      (local_direct is the cheapest).
+        'match', a non-trainable embedding, or an already-matching native rule → no-op.
+        The extra pass recomputes the full gradient but only W_in/b_in are kept."""
+        if self.input_mode == 'match' or not self._has_trainable_embed():
+            return grads
+        native_is_exact = (self.learning_rule == 'bptt')
+        want_exact = (self.input_mode == 'exact')
+        if want_exact == native_is_exact:
+            return grads                      # native pass already produced it
+        other_rule = 'bptt' if want_exact else 'local_direct'
+        other = self._grads_for_rule(other_rule, inputs, labels, masks, **kwargs)
+        for k in ('W_in', 'b_in'):
+            if k in grads and k in other:
+                grads[k] = other[k]
+        return grads
+
     def sequence_gradients(self, inputs, labels, masks, **kwargs):
-        """Dispatch on self.learning_rule; write grads into each param's .grad."""
-        if self.learning_rule == 'bptt':
-            grads = self.bptt_gradients(inputs, labels, masks, **kwargs)
-        elif self.learning_rule == 'local_exact_rowlocal':
-            grads = self.local_gradients(inputs, labels, masks, **kwargs)
-        elif self.learning_rule == 'local_diag_rflo':
-            grads = self.local_diag_rflo_gradients(inputs, labels, masks, **kwargs)
-        elif self.learning_rule == 'local_direct':
-            grads = self.local_direct_gradients(inputs, labels, masks, **kwargs)
-        else:
-            raise ValueError(f"unknown learning_rule '{self.learning_rule}'")
+        """Dispatch on self.learning_rule; write grads into each param's .grad.
+        If input_mode != 'match', the trainable input embedding's W_in/b_in grad is
+        then overridden to the input_mode's rule (see _apply_input_mode)."""
+        grads = self._grads_for_rule(self.learning_rule, inputs, labels, masks, **kwargs)
+        grads = self._apply_input_mode(grads, inputs, labels, masks, **kwargs)
 
         for name, p in self._trainable_params().items():
             p.grad = grads[name].clone()

@@ -27,6 +27,7 @@ Run from this directory:
 """
 import argparse
 import torch
+import numpy as np 
 
 import _bootstrap  # prepends ../core + ../scripts to sys.path; exposes ROOT
 import rnn
@@ -34,13 +35,13 @@ import tasks
 import train_common as tc
 
 # ─── Configuration (mirrors train_mpn.py) ─────────────────────────────────────
-SEED = 42
+SEED = np.random.randint(0, 2**32 - 1)  # random seed for this run
 RULESET = "seqmnist_pixel"           # single task to train on
 RULES_TO_RUN = ["bptt", "local_diag_rflo"]   # rules to compare
-# 'exact_readout' = true gradient; the random modes ('layerwise_fa', 'direct_fa')
+# 'exact_spatial' = true gradient; the random modes ('layerwise_fa', 'direct_fa')
 # both coincide with ordinary feedback alignment for this single-hidden-layer RNN.
-# See mpn._FEEDBACK_MODES.
-FEEDBACK_MODE = "exact_readout"
+# See mpn._FEEDBACK_MODES. (Legacy 'exact_readout' still aliases to 'exact_spatial'.)
+FEEDBACK_MODE = "exact_spatial"
 N_RUNS = 3                    # independent seeds per rule
 N_HIDDEN = 180                # one_task.py: n_hidden = 200
 N_DATASETS = 5000             # one_task.py: n_datasets = 3000 (heavy on CPU)
@@ -167,10 +168,11 @@ def _parse_args():
     p.add_argument("--hidden", type=int, default=N_HIDDEN, help="hidden units")
     p.add_argument("--steps", type=int, default=N_DATASETS, help="training batches")
     p.add_argument("--feedback",
-                   choices=["exact_readout", "layerwise_fa", "direct_fa"],
+                   choices=["exact_spatial", "layerwise_fa", "direct_fa", "exact_readout"],
                    default=FEEDBACK_MODE,
                    help="hidden learning-signal feedback (both random modes "
-                        "coincide for this single-hidden RNN)")
+                        "coincide for this single-hidden RNN). 'exact_readout' is "
+                        "the legacy name for 'exact_spatial'.")
     return p.parse_args()
 
 

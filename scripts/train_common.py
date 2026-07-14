@@ -19,6 +19,7 @@ globals like N_HIDDEN before calling ckpt_path/build_params) and delegates:
 """
 import copy
 import gc
+import json
 import os
 import time
 from dataclasses import dataclass, field
@@ -73,6 +74,16 @@ class RunConfig:
     # train_batch / accuracy. Defaults to None, resolved to tasks.make_task(ruleset)
     # in run_seed so callers that don't set it keep the ring-task behaviour.
     task: object = None
+    # Opt-in homeostatic gain control on the FA learning signals (see
+    # mpn.DeepMultiPlasticNet feedback_normalize). Only affects presentation here
+    # (the console log + a "_fbnorm" filename fragment); the net itself reads it from
+    # net_params. False (default) keeps logs/filenames byte-for-byte as before.
+    feedback_normalize: bool = False
+    # Input-embedding learning rule (dmpn), decoupled from the per-rule MP-layer
+    # rule (see mpn.DeepMultiPlasticNet input_mode). Presentation only here (console
+    # log + an "_in-<mode>" filename fragment); the net reads it from net_params.
+    # 'match' (default) keeps logs/filenames byte-for-byte as before.
+    input_mode: str = "match"
     # optional extra string appended to the filename param tag (e.g. eta/lambda);
     # keep it filename-safe. Empty by default.
     tag_extra: str = ""
@@ -110,6 +121,14 @@ def param_tag(cfg):
     arch = cfg.arch_tag if getattr(cfg, "arch_tag", "") else f"h{cfg.n_hidden}"
     tag = (f"{cfg.ruleset}_{arch}_b{cfg.batch}_n{cfg.n_datasets}"
            f"_lr{cfg.lr:.0e}_{cfg.feedback_mode}")
+    # Append "_fbnorm" only when homeostatic normalization is on, so filenames for
+    # existing (normalization-off) runs are unchanged byte-for-byte.
+    if getattr(cfg, "feedback_normalize", False):
+        tag += "_fbnorm"
+    # Always record the input-embedding rule "_in-<mode>" (incl. the default
+    # 'match'), so every output filename (figure / checkpoint / .npz) is
+    # self-describing about how the input layer was trained.
+    tag += f"_in-{getattr(cfg, 'input_mode', 'match')}"
     if cfg.tag_extra:
         tag += f"_{cfg.tag_extra}"
     return tag
@@ -121,6 +140,12 @@ def fig_path(cfg):
 
 def data_path(cfg):
     return os.path.join(cfg.data_dir, f"{cfg.file_prefix}_{param_tag(cfg)}_runs{cfg.n_runs}.npz")
+
+
+def config_path(cfg):
+    """Where the run's config JSON is written — the figure dir, same stem as the
+    figure/.npz (so the three outputs of a run share a name)."""
+    return os.path.join(cfg.fig_dir, f"{cfg.file_prefix}_{param_tag(cfg)}_runs{cfg.n_runs}.json")
 
 
 def ckpt_path(cfg, rule, seed):
@@ -444,7 +469,11 @@ def run_seed(cfg, seed, record_steps):
             n_accum = 0
 
     # Save each trained network (per rule) so it can be reloaded later. Stores
-    # state_dict + net_params (as in one_task.py) plus rule/seed metadata.
+    # state_dict + net_params (as in one_task.py) plus rule/seed metadata. Also
+    # stores the (initialized) task_params/train_params so a downstream viewer can
+    # draw held-out trials from the checkpoint ALONE — no need to re-run
+    # build_params() with a matching config (see notebooks/visualize_performance).
+    # ruleset is duplicated at top level for convenient labeling.
     if cfg.save_nets and cfg.ckpt_prefix:
         os.makedirs(cfg.ckpt_dir, exist_ok=True)
         for rule in cfg.rules_to_run:
@@ -452,8 +481,13 @@ def run_seed(cfg, seed, record_steps):
             torch.save({
                 "state_dict": nets[rule].state_dict(),
                 "net_params": net_params,
+                "task_params": task_params,
+                "train_params": train_params,
+                "ruleset": cfg.ruleset,
                 "learning_rule": rule,
                 "feedback_mode": cfg.feedback_mode,
+                "feedback_normalize": cfg.feedback_normalize,
+                "input_mode": cfg.input_mode,
                 "seed": seed,
             }, path)
             print(f"  saved network: {path}")
@@ -514,7 +548,8 @@ def save_plot_data(cfg, record_steps, runs, agg, path=None):
         # scalar/string config for provenance + title reconstruction
         "ruleset": cfg.ruleset, "n_hidden": cfg.n_hidden, "batch": cfg.batch,
         "n_datasets": cfg.n_datasets, "lr": cfg.lr, "n_runs": cfg.n_runs,
-        "feedback_mode": cfg.feedback_mode, "title": cfg.title,
+        "feedback_mode": cfg.feedback_mode, "feedback_normalize": cfg.feedback_normalize,
+        "input_mode": cfg.input_mode, "title": cfg.title,
         # full architecture (multi-layer stacks) for provenance + replot suffix
         "arch_tag": getattr(cfg, "arch_tag", ""),
         "arch_desc": getattr(cfg, "arch_desc", ""),
@@ -528,6 +563,71 @@ def save_plot_data(cfg, record_steps, runs, agg, path=None):
             out[f"std__{r}__{split}"] = np.asarray(agg[r][split]["std"], dtype=float)
     np.savez(path, **out)
     print(f"Saved plot data: {path}")
+
+
+def _json_safe(x):
+    """Best-effort convert an arbitrary value to something json.dump can write:
+    tensors/arrays → lists, torch dtype/device → str, dict/list recurse, other
+    non-primitives → repr. Never raises (config recording must not break a run)."""
+    if x is None or isinstance(x, (bool, int, float, str)):
+        return x
+    if isinstance(x, dict):
+        return {str(k): _json_safe(v) for k, v in x.items()}
+    if isinstance(x, (list, tuple, set)):
+        return [_json_safe(v) for v in x]
+    if isinstance(x, (np.integer,)):
+        return int(x)
+    if isinstance(x, (np.floating,)):
+        return float(x)
+    if isinstance(x, np.ndarray):
+        return x.tolist()
+    if isinstance(x, torch.Tensor):
+        return x.detach().cpu().tolist()
+    return repr(x)   # torch.dtype, torch.device, callables, task adapters, …
+
+
+def save_config(cfg, path=None):
+    """Write a JSON of the run's training + network setup next to the figure (same
+    stem). Records the RunConfig scalars plus the RESOLVED net_params / task_params /
+    train_params (built once via the cfg hooks, exactly as run_seed builds them), so
+    the JSON fully describes how the nets were configured. Best-effort: any value
+    that is not natively JSON-serializable is coerced by _json_safe, and the whole
+    thing is wrapped so a recording failure can never abort training."""
+    path = path or config_path(cfg)
+    try:
+        task = cfg.task if cfg.task is not None else tasks.make_task(cfg.ruleset)
+        task_params, train_params, net_params = cfg.build_params()
+        task_params, train_params, net_params = task.init_params(
+            task_params, train_params, net_params)
+        record = {
+            # run / experiment
+            "file_prefix": cfg.file_prefix, "title": cfg.title,
+            "ruleset": cfg.ruleset, "rules_to_run": list(cfg.rules_to_run),
+            "seed": cfg.seed, "n_runs": cfg.n_runs,
+            "seeds": [cfg.seed + k for k in range(cfg.n_runs)],
+            # optimization
+            "batch": cfg.batch, "n_datasets": cfg.n_datasets, "lr": cfg.lr,
+            "grad_clip": cfg.grad_clip, "log_every": cfg.log_every,
+            "device": str(cfg.device), "dtype": str(cfg.dtype),
+            "metric": cfg.metric, "acc_label": cfg.acc_label,
+            # network / learning-rule setup
+            "n_hidden": cfg.n_hidden,
+            "arch_tag": getattr(cfg, "arch_tag", ""),
+            "arch_desc": getattr(cfg, "arch_desc", ""),
+            "feedback_mode": cfg.feedback_mode,
+            "feedback_normalize": cfg.feedback_normalize,
+            "input_mode": cfg.input_mode,
+            # the resolved param dicts the nets are actually built from
+            "net_params": _json_safe(net_params),
+            "task_params": _json_safe(task_params),
+            "train_params": _json_safe(train_params),
+        }
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as fh:
+            json.dump(record, fh, indent=2)
+        print(f"Saved config: {path}")
+    except Exception as e:                      # never let recording break a run
+        print(f"WARNING: could not save config JSON ({e})")
     return path
 
 
@@ -564,7 +664,9 @@ def run_experiment(cfg):
     print(f"Task: {cfg.ruleset}{cfg.header_note}  |  rules: {cfg.rules_to_run}  |  "
           f"runs: {cfg.n_runs}  |  {arch_suffix(cfg)} batch={cfg.batch} "
           f"steps={cfg.n_datasets} lr={cfg.lr} clip={cfg.grad_clip}")
-    print(f"Device: {cfg.device}  dtype: {cfg.dtype}  feedback: {cfg.feedback_mode}\n")
+    print(f"Device: {cfg.device}  dtype: {cfg.dtype}  feedback: {cfg.feedback_mode}"
+          f"{'  (homeostatic norm ON)' if getattr(cfg, 'feedback_normalize', False) else ''}"
+          f"  input_mode: {getattr(cfg, 'input_mode', 'match')}\n")
 
     record_steps = list(range(0, cfg.n_datasets, cfg.log_every))
     if record_steps[-1] != cfg.n_datasets - 1:
@@ -590,8 +692,15 @@ def run_experiment(cfg):
                              "std": np.nanstd(arr, axis=0)}
 
     save_plot_data(cfg, record_steps, runs, agg)
+    save_config(cfg)   # JSON of the training + network setup, next to the figure
+    # Append notes to the figure title only when the feature is on / non-default, so
+    # existing (norm-off, match) figure titles are unchanged.
+    fbnorm_note = ", homeostatic norm" if getattr(cfg, "feedback_normalize", False) else ""
+    inmode_note = ("" if getattr(cfg, "input_mode", "match") == "match"
+                   else f", input={cfg.input_mode}")
     plot(cfg, record_steps, agg, cfg.rules_to_run,
-         f"(mean ± std over {cfg.n_runs} runs, {arch_suffix(cfg)})", fig_path(cfg))
+         f"(mean ± std over {cfg.n_runs} runs, {arch_suffix(cfg)}{fbnorm_note}{inmode_note})",
+         fig_path(cfg))
 
     # Final-metric summary (the plotted metric: accuracy or loss).
     metric_noun = "loss" if cfg.metric == "loss" else "accuracy"

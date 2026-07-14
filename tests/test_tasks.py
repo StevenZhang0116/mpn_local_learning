@@ -187,7 +187,7 @@ def _net_params(net_type, n_in, n_hidden, n_out):
     npar = {
         "n_neurons": [n_in, n_hidden, n_out], "loss_type": "MSE", "activation": "tanh",
         "output_bias": False, "output_matrix": "", "dt": 40,
-        "learning_rule": "bptt", "feedback_mode": "exact_readout",
+        "learning_rule": "bptt", "feedback_mode": "exact_spatial",
         "ml_params": {"bias": True, "mp_type": "mult", "m_update_type": "hebb_assoc",
                       "m_activation": "linear", "modulation_bounds": False,
                       "eta_type": "scalar", "eta_train": False, "lam_type": "scalar",

@@ -69,9 +69,10 @@ class LeakyRNN(BaseNetwork):
             f"unknown learning_rule '{self.learning_rule}'"
         # A vanilla RNN has ONE hidden layer, so both random-feedback variants
         # ('layerwise_fa', 'direct_fa') are the same single-boundary feedback
-        # alignment; only 'exact_readout' is distinct. Validated via the shared helper.
+        # alignment; only 'exact_spatial' is distinct. Validated via the shared helper
+        # (legacy 'exact_readout' aliases to 'exact_spatial').
         self.feedback_mode = canonical_feedback_mode(
-            net_params.get('feedback_mode', 'exact_readout'))
+            net_params.get('feedback_mode', 'exact_spatial'))
 
         self.param_clamping = False
 
@@ -106,8 +107,11 @@ class LeakyRNN(BaseNetwork):
             dtype=torch.float))
 
         # Fixed random feedback matrix (same shape as W_output = (n_output, n_hidden)).
-        # Allocated for any non-exact mode (they all coincide for one hidden layer).
-        if self.feedback_mode != 'exact_readout':
+        # Allocated for any non-exact mode. The RNN has a SINGLE FA boundary
+        # (readout → hidden; W_input/W_rec/b_hidden are all credited by that one ell
+        # via their RFLO traces, not separate feedback matrices), so layerwise_fa and
+        # direct_fa coincide here — ordinary one-hidden-layer feedback alignment.
+        if self.feedback_mode != 'exact_spatial':
             self.register_buffer('B_feedback', torch.tensor(
                 rand_weight_init(self.n_hidden, self.n_output,
                                  init_type=net_params.get('B_feedback_init', 'xavier')),
@@ -211,7 +215,7 @@ class LeakyRNN(BaseNetwork):
         grad_b_output = torch.zeros_like(self.b_output)
         outputs = torch.zeros(B, T, self.n_output, dtype=dt, device=dev)
 
-        feedback = self.W_output if self.feedback_mode == 'exact_readout' else self.B_feedback
+        feedback = self.W_output if self.feedback_mode == 'exact_spatial' else self.B_feedback
         N = B * T * self.n_output
 
         for t in range(T):

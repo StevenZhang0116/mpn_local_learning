@@ -107,6 +107,9 @@ def net_params(net_type, n_in, n_hidden, n_out, m_update="hebb_assoc"):
         "net_type": net_type,
         "n_neurons": [n_in, n_hidden, n_out], "loss_type": "MSE", "activation": "tanh",
         "output_bias": True, "output_matrix": "", "dt": 40,
+        # This config is fed to BOTH the optimized net and the frozen mpn_archive.py
+        # reference; the archive only knows the legacy 'exact_readout' name (which
+        # aliases to 'exact_spatial' in the optimized net), so keep it here.
         "learning_rule": "bptt", "feedback_mode": "exact_readout",
         "ml_params": {"bias": True, "mp_type": "mult", "m_update_type": m_update,
                       "m_activation": "linear", "modulation_bounds": False,

@@ -50,6 +50,7 @@ single-layer runs on disk.
 import argparse
 import os
 import torch
+import numpy as np 
 
 import _bootstrap  # prepends ../core + ../scripts to sys.path; exposes ROOT
 import mpn         # core/mpn.py — the efficiency-optimized implementation
@@ -57,7 +58,7 @@ import tasks
 import train_common as tc
 
 # ─── Configuration (aligned with MultiTaskMPN/one_task/one_task.py) ───────────
-SEED = 42
+SEED = np.random.randint(0, 2**32 - 1)  # random seed for this run
 RULESET = "contextdelaydm1"           # single task to train on
 # Network: 'dmpn' = DeepMultiPlasticNet (trainable input embedding + MP layer,
 # RNN-comparable); 'mpn1' = MultiPlasticNet (single MP layer, no embedding).
@@ -69,11 +70,29 @@ NET_TYPE = "dmpn"
 # Overridable with --compile-local.
 COMPILE_LOCAL = False
 RULES_TO_RUN = ["bptt", "local_diag_rflo", "local_direct"]   # rules to compare
-# Hidden learning-signal feedback (deep stacks only; both random modes coincide
-# for a single hidden layer). 'exact_readout' = true gradient; 'layerwise_fa' =
-# recursive per-boundary feedback alignment; 'direct_fa' = direct feedback
-# alignment. See mpn._FEEDBACK_MODES.
-FEEDBACK_MODE = "layerwise_fa"
+# Hidden learning-signal feedback. 'exact_spatial' = exact same-time spatial
+# gradient (weight transport; top plastic layer exact vs BPTT under
+# local_exact_rowlocal); 'layerwise_fa' = recursive per-boundary feedback
+# alignment; 'direct_fa' = direct feedback alignment. See mpn._FEEDBACK_MODES.
+# exact_spatial differs from the random modes at any depth; layerwise_fa vs
+# direct_fa differ only with >1 trainable boundary — which the default dmpn net
+# always has (MP layer + trainable input embedding), so they differ here even for
+# a single MP layer. (Legacy 'exact_readout' still loads.)
+FEEDBACK_MODE = "direct_fa"
+# Opt-in homeostatic gain control on the FA learning signals (per-boundary running-
+# RMS normalization; see mpn._normalize_learning_signal). Off by default; only valid
+# for the random feedback modes (layerwise_fa/direct_fa), never exact_spatial. Helps
+# depth-dependent signal conditioning in deep FA stacks. --feedback-normalize on CLI.
+FEEDBACK_NORMALIZE = True
+# Learning rule for the TRAINABLE INPUT EMBEDDING (dmpn only), decoupled from the
+# per-rule MP-layer learning_rule so any RULES_TO_RUN × input-rule combo compares:
+#   'match'        — embedding follows each rule (exact under bptt, 3-factor local
+#                    under a local rule). The historical default; no behavior change.
+#   'exact'        — embedding ALWAYS trained by the true BPTT gradient (even in a
+#                    local run — costs an extra BPTT pass for that rule).
+#   'three_factor' — embedding ALWAYS uses the direct 3-factor local rule (even in
+#                    the bptt run — MP+readout stay exact-autograd). --input-mode on CLI.
+INPUT_MODE = "match"
 N_RUNS = 3                    # independent seeds per rule
 # Hidden width(s) of the MP-layer stack. A single int → one MP layer (the classic
 # in→hidden→out net). A list of ints → one MP layer per width, i.e. a DEEP MP
@@ -184,6 +203,8 @@ def build_params():
         "acc_measure": "angle",
         "learning_rule": "bptt",         # overwritten per rule below
         "feedback_mode": FEEDBACK_MODE,
+        "feedback_normalize": FEEDBACK_NORMALIZE,
+        "input_mode": INPUT_MODE,        # input-embedding rule (match/exact/three_factor)
         "ml_params": {
             "bias": True,
             "mp_type": "mult",
@@ -301,7 +322,8 @@ def _cfg():
         title=f"{RULESET} ({desc}): BPTT vs local", header_note=f" ({desc})",
         rule_label=RULE_LABEL, rule_color=RULE_COLOR,
         seed=SEED, ruleset=RULESET, rules_to_run=RULES_TO_RUN,
-        feedback_mode=FEEDBACK_MODE, n_runs=N_RUNS, n_hidden=_hidden_widths()[0],
+        feedback_mode=FEEDBACK_MODE, feedback_normalize=FEEDBACK_NORMALIZE,
+        input_mode=INPUT_MODE, n_runs=N_RUNS, n_hidden=_hidden_widths()[0],
         batch=BATCH, n_datasets=N_DATASETS, lr=LR, grad_clip=GRAD_CLIP,
         log_every=LOG_EVERY, device=DEVICE, dtype=DTYPE,
         fig_dir=FIG_DIR, ckpt_dir=CKPT_DIR, data_dir=DATA_DIR, save_nets=SAVE_NETS,
@@ -319,6 +341,7 @@ def _cfg():
 # ─── Public path/replot helpers (thin wrappers over train_common) ─────────────
 def fig_path():   return tc.fig_path(_cfg())
 def data_path():  return tc.data_path(_cfg())
+def config_path(): return tc.config_path(_cfg())
 def ckpt_path(rule, seed): return tc.ckpt_path(_cfg(), rule, seed)
 def replot_from_npz(npz_path, save_to=None):
     return tc.replot_from_npz(_cfg(), npz_path, save_to=save_to)
@@ -356,10 +379,25 @@ def _parse_args():
                         "global.")
     p.add_argument("--steps", type=int, default=N_DATASETS, help="training batches")
     p.add_argument("--feedback",
-                   choices=["exact_readout", "layerwise_fa", "direct_fa"],
+                   choices=["exact_spatial", "layerwise_fa", "direct_fa", "exact_readout"],
                    default=FEEDBACK_MODE,
-                   help="hidden learning-signal feedback (deep stacks only; both "
-                        "random modes coincide for one hidden layer)")
+                   help="hidden learning-signal feedback. exact_spatial differs from "
+                        "the random modes at any depth; layerwise_fa vs direct_fa "
+                        "differ only with >1 trainable boundary (dmpn's embedding "
+                        "counts). 'exact_readout' is the legacy name for 'exact_spatial'.")
+    p.add_argument("--feedback-normalize", action=argparse.BooleanOptionalAction,
+                   default=FEEDBACK_NORMALIZE,
+                   help="homeostatic gain control on the FA learning signals "
+                        "(per-boundary running-RMS normalization; layerwise_fa/direct_fa "
+                        "only, never exact_spatial). Use --no-feedback-normalize to turn "
+                        "off (needed for exact_spatial runs when the FEEDBACK_NORMALIZE "
+                        "default is True). Default: %(default)s.")
+    p.add_argument("--input-mode", choices=["match", "exact", "three_factor"],
+                   default=INPUT_MODE,
+                   help="input-embedding learning rule (dmpn), decoupled from the "
+                        "MP-layer rule: 'match' = per-rule native (default), 'exact' "
+                        "= always BPTT gradient, 'three_factor' = always the direct "
+                        "local rule. Default: %(default)s.")
     p.add_argument("--compile-local", action="store_true", default=COMPILE_LOCAL,
                    help="torch.compile the fused local per-step core (direct/diag, "
                         "hebb_assoc). Default: %(default)s.")
@@ -368,7 +406,7 @@ def _parse_args():
 
 def main():
     global NET_TYPE, RULESET, N_RUNS, N_HIDDEN, N_DATASETS, FEEDBACK_MODE
-    global COMPILE_LOCAL
+    global COMPILE_LOCAL, FEEDBACK_NORMALIZE, INPUT_MODE
     args = _parse_args()
     NET_TYPE = args.net
     RULESET = args.task
@@ -378,6 +416,8 @@ def main():
         N_HIDDEN = args.hidden[0] if len(args.hidden) == 1 else args.hidden
     N_DATASETS = args.steps
     FEEDBACK_MODE = args.feedback
+    FEEDBACK_NORMALIZE = args.feedback_normalize
+    INPUT_MODE = args.input_mode
     COMPILE_LOCAL = args.compile_local
     tc.run_experiment(_cfg())
 
