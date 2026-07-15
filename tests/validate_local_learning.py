@@ -324,10 +324,8 @@ def tier4_real_task():
     # This tier's invariant is exact-local == BPTT on the hidden W, which only holds
     # with exact_spatial feedback (the FA modes deliberately perturb it). Pin the
     # feedback config here so the check is independent of train_mpn's current
-    # globals: exact_spatial + no homeostatic norm (which is invalid with
-    # exact_spatial anyway), and input_mode='match' so no cross-rule splice runs.
+    # globals: exact_spatial, and input_mode='match' so no cross-rule splice runs.
     tm.FEEDBACK_MODE = "exact_spatial"
-    tm.FEEDBACK_NORMALIZE = False
     tm.INPUT_MODE = "match"
     task_params, train_params, net_params = tm.build_params()
     # Correctness is size-independent; shrink hidden/embedding so long-sequence
@@ -868,106 +866,6 @@ def tier11_feedback_modes():
     return allok
 
 
-def tier12_feedback_normalize():
-    """Homeostatic gain control on the FA learning signals (feedback_normalize),
-    an OPT-IN, random-modes-only stabilizer (see mpn._normalize_learning_signal).
-    Invariants:
-      (a) OFF (the default): grads are BYTE-IDENTICAL to a net built with no flag,
-          and no ell_gain/ell_rms buffers are allocated (state_dict unchanged).
-      (b) feedback_normalize=True with feedback_mode='exact_spatial' RAISES
-          ValueError (it would break the exact==BPTT guarantee).
-      (c) ON with layerwise_fa on a genuinely deep stack EQUALIZES the per-boundary
-          learning-signal RMS across depth (bottom/top ratio → ~1), whereas OFF it
-          decays with depth. The readout gradient stays EXACT vs BPTT (normalization
-          never touches it), and the hidden-W grads actually change (it's not a no-op).
-    """
-    print("── Tier 12: homeostatic feedback-signal normalization (opt-in) ─────")
-    allok = True
-
-    def build(nn, fb, seed=0, norm=False, embed=False):
-        # Seed BOTH RNGs: weight init routes through numpy (rand_weight_init), so a
-        # shared seed needs np.random.seed too for two nets to init byte-identically.
-        import numpy as _np
-        torch.manual_seed(seed); _np.random.seed(seed)
-        npar = {'n_neurons': nn, 'loss_type': 'MSE', 'activation': 'tanh',
-                'output_bias': True, 'output_matrix': '', 'dt': 40,
-                'input_layer_add': embed, 'input_layer_add_trainable': embed,
-                'linear_embed': 6, 'input_layer_bias': True, 'input_init_type': 'xavier',
-                'learning_rule': 'local_exact_rowlocal', 'feedback_mode': fb,
-                'feedback_normalize': norm,
-                'ml_params': {'bias': True, 'mp_type': 'mult', 'm_update_type': 'hebb_assoc',
-                              'm_activation': 'linear', 'modulation_bounds': False,
-                              'eta_type': 'scalar', 'eta_train': False, 'lam_type': 'scalar',
-                              'lam_train': False, 'm_time_scale': 400, 'W_freeze': False}}
-        net = mpn.DeepMultiPlasticNet(npar, verbose=False).double()
-        with torch.no_grad():
-            for m in net.mp_layers:
-                m.eta.fill_(0.1)
-                m.lam.fill_(0.6 * m.lam_clamp)
-        return net
-
-    DEEP = [8] + [12] * 6 + [4]                 # 6 MP layers → real depth
-    inp, lab, msk, _ = make_data(6, 10, DEEP[0], DEEP[-1])
-
-    # (a) OFF byte-identical + no extra buffers.
-    a = build(DEEP, 'layerwise_fa', seed=1, norm=False)
-    b = build(DEEP, 'layerwise_fa', seed=1, norm=False)
-    keys = [k for k in a.local_gradients(inp, lab, msk) if k not in ('loss', 'outputs')]
-    ga, gb = a.local_gradients(inp, lab, msk), b.local_gradients(inp, lab, msk)
-    ok_a = (compare(ga, gb, keys)[0]
-            and not hasattr(a, 'ell_gain') and getattr(a, 'ell_rms', None) is None)
-    allok &= ok_a
-    print(f"  [{'PASS' if ok_a else 'FAIL'}] OFF: byte-identical + no ell_gain/ell_rms buffers")
-
-    # (b) exact_spatial + normalize raises.
-    ok_b = False
-    try:
-        build(DEEP, 'exact_spatial', seed=1, norm=True)
-    except ValueError:
-        ok_b = True
-    allok &= ok_b
-    print(f"  [{'PASS' if ok_b else 'FAIL'}] exact_spatial + normalize raises ValueError")
-
-    # (c) ON equalizes per-boundary RMS; readout stays exact; hidden-W changes.
-    def boundary_rms(net):
-        L = len(net.mp_layers)
-        orig = net._same_time_boundary_signals
-        rec = {k: [] for k in range(1, L + 1)}
-        def patched(go, pp, need_input_signal, _o=orig, _r=rec):
-            e = _o(go, pp, need_input_signal)
-            for k in range(1, L + 1):
-                if e[k] is not None:
-                    _r[k].append(e[k].square().mean().sqrt().item())
-            return e
-        net._same_time_boundary_signals = patched
-        g = net.local_gradients(inp, lab, msk)
-        net._same_time_boundary_signals = orig
-        import numpy as _np
-        m = {k: _np.mean(v) for k, v in rec.items()}
-        return g, m, L
-
-    net_on = build(DEEP, 'layerwise_fa', seed=1, norm=True)
-    g_on, m_on, L = boundary_rms(net_on)
-    net_off = build(DEEP, 'layerwise_fa', seed=1, norm=False)
-    g_off, m_off, _ = boundary_rms(net_off)
-
-    ratio_on = m_on[1] / m_on[L]
-    ratio_off = m_off[1] / m_off[L]
-    ref = net_on.bptt_gradients(inp, lab, msk)
-    wout_rel = ((g_on['W_output'] - ref['W_output']).abs().max()
-                / ref['W_output'].abs().max().clamp_min(1e-12)).item()
-    w_change = ((g_on['W'] - g_off['W']).abs().max()
-                / g_off['W'].abs().max().clamp_min(1e-12)).item()
-    # ON should pull the bottom/top RMS ratio much closer to 1 than OFF does.
-    ok_c = (abs(ratio_on - 1.0) < abs(ratio_off - 1.0)
-            and wout_rel < 1e-8 and w_change > 1e-3)
-    allok &= ok_c
-    print(f"  [{'PASS' if ok_c else 'FAIL'}] ON equalizes depth: bottom/top RMS "
-          f"{ratio_off:.2f} (off) → {ratio_on:.2f} (on); readout exact "
-          f"(rel={wout_rel:.1e}); W changed (rel={w_change:.1e})")
-    return allok
-
-
 def tier13_input_mode():
     """input_mode decouples the trainable input embedding's learning rule from the
     MP-layer learning_rule (see mpn.DeepMultiPlasticNet._apply_input_mode).
@@ -1066,7 +964,6 @@ def main():
         tier9_custom_loss(),
         tier10_cross_entropy(),
         tier11_feedback_modes(),
-        tier12_feedback_normalize(),
         tier13_input_mode(),
         tier4_real_task(),
     ]

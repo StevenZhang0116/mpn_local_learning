@@ -73,12 +73,7 @@ RULES_TO_RUN = ["bptt", "local_diag_rflo", "local_direct"]   # rules to compare
 # direct_fa differ only with >1 trainable boundary — which the default dmpn net
 # always has (MP layer + trainable input embedding), so they differ here even for
 # a single MP layer. (Legacy 'exact_readout' still loads.)
-FEEDBACK_MODE = "direct_fa"
-# Opt-in homeostatic gain control on the FA learning signals (per-boundary running-
-# RMS normalization; see mpn._normalize_learning_signal). Off by default; only valid
-# for the random feedback modes (layerwise_fa/direct_fa), never exact_spatial. Helps
-# depth-dependent signal conditioning in deep FA stacks. --feedback-normalize on CLI.
-FEEDBACK_NORMALIZE = True
+FEEDBACK_MODE = "exact_spatial"
 # Learning rule for the TRAINABLE INPUT EMBEDDING (dmpn only), decoupled from the
 # per-rule MP-layer learning_rule so any RULES_TO_RUN × input-rule combo compares:
 #   'match'        — embedding follows each rule (exact under bptt, 3-factor local
@@ -87,7 +82,7 @@ FEEDBACK_NORMALIZE = True
 #                    local run — costs an extra BPTT pass for that rule).
 #   'three_factor' — embedding ALWAYS uses the direct 3-factor local rule (even in
 #                    the bptt run — MP+readout stay exact-autograd). --input-mode on CLI.
-INPUT_MODE = "match"
+INPUT_MODE = "exact"
 N_RUNS = 3                    # independent seeds per rule
 # Hidden width(s) of the MP-layer stack. A single int → one MP layer (the classic
 # in→hidden→out net). A list of ints → one MP layer per width, i.e. a DEEP MP
@@ -198,7 +193,6 @@ def build_params():
         "acc_measure": "angle",
         "learning_rule": "bptt",         # overwritten per rule below
         "feedback_mode": FEEDBACK_MODE,
-        "feedback_normalize": FEEDBACK_NORMALIZE,
         "input_mode": INPUT_MODE,        # input-embedding rule (match/exact/three_factor)
         "ml_params": {
             "bias": True,
@@ -315,7 +309,7 @@ def _cfg():
         title=f"{RULESET} ({desc}): BPTT vs local", header_note=f" ({desc})",
         rule_label=RULE_LABEL, rule_color=RULE_COLOR,
         seed=SEED, ruleset=RULESET, rules_to_run=RULES_TO_RUN,
-        feedback_mode=FEEDBACK_MODE, feedback_normalize=FEEDBACK_NORMALIZE,
+        feedback_mode=FEEDBACK_MODE,
         input_mode=INPUT_MODE, n_runs=N_RUNS, n_hidden=_hidden_widths()[0],
         batch=BATCH, n_datasets=N_DATASETS, lr=LR, grad_clip=GRAD_CLIP,
         log_every=LOG_EVERY, device=DEVICE, dtype=DTYPE,
@@ -378,13 +372,6 @@ def _parse_args():
                         "the random modes at any depth; layerwise_fa vs direct_fa "
                         "differ only with >1 trainable boundary (dmpn's embedding "
                         "counts). 'exact_readout' is the legacy name for 'exact_spatial'.")
-    p.add_argument("--feedback-normalize", action=argparse.BooleanOptionalAction,
-                   default=FEEDBACK_NORMALIZE,
-                   help="homeostatic gain control on the FA learning signals "
-                        "(per-boundary running-RMS normalization; layerwise_fa/direct_fa "
-                        "only, never exact_spatial). Use --no-feedback-normalize to turn "
-                        "off (needed for exact_spatial runs when the FEEDBACK_NORMALIZE "
-                        "default is True). Default: %(default)s.")
     p.add_argument("--input-mode", choices=["match", "exact", "three_factor"],
                    default=INPUT_MODE,
                    help="input-embedding learning rule (dmpn), decoupled from the "
@@ -396,7 +383,7 @@ def _parse_args():
 
 def main():
     global NET_TYPE, RULESET, N_RUNS, N_HIDDEN, N_DATASETS, FEEDBACK_MODE
-    global FEEDBACK_NORMALIZE, INPUT_MODE
+    global INPUT_MODE
     args = _parse_args()
     NET_TYPE = args.net
     RULESET = args.task
@@ -406,7 +393,6 @@ def main():
         N_HIDDEN = args.hidden[0] if len(args.hidden) == 1 else args.hidden
     N_DATASETS = args.steps
     FEEDBACK_MODE = args.feedback
-    FEEDBACK_NORMALIZE = args.feedback_normalize
     INPUT_MODE = args.input_mode
     tc.run_experiment(_cfg())
 

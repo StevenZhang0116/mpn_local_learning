@@ -1501,25 +1501,6 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
         self.feedback_mode = canonical_feedback_mode(cfg.get('feedback_mode', 'exact_spatial'))
         self._B_feedback_init = cfg.get('B_feedback_init', 'xavier')
 
-        # ── Homeostatic gain control on the FA learning signals (opt-in) ──────
-        # Deep random-feedback pathways can attenuate/amplify each lower boundary's
-        # learning signal ell (products of random matrices × phi'). This keeps a
-        # per-boundary running RMS estimate v_k and rescales ell_k -> gain_k * ell_k
-        # / sqrt(v_k + eps) — a fully local, weight-transport-free gain control
-        # (per-layer RMSNorm on the teaching signal). OFF by default and applied
-        # ONLY to the random feedback modes: exact_spatial must stay bit-identical to
-        # BPTT, so it is never rescaled (asserted in __init__). See
-        # _normalize_learning_signal / _same_time_boundary_signals.
-        self.feedback_normalize = bool(cfg.get('feedback_normalize', False))
-        self.ell_rms_beta = float(cfg.get('feedback_normalize_beta', 0.9))
-        self.ell_rms_eps = float(cfg.get('feedback_normalize_eps', 1e-8))
-        self._ell_gain_val = float(cfg.get('feedback_normalize_gain', 1.0))
-        if self.feedback_normalize and self.feedback_mode == 'exact_spatial':
-            raise ValueError(
-                "feedback_normalize is only valid for the random feedback modes "
-                "('layerwise_fa'/'direct_fa'); it would break exact_spatial's "
-                "exact==BPTT guarantee. Got feedback_mode='exact_spatial'.")
-
         super().__init__(cfg, cfg['n_neurons'][-2], output_matrix=self.output_matrix, verbose=verbose)
 
         # Fixed random feedback matrix for the TOP (readout → top-hidden) boundary,
@@ -1642,17 +1623,6 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
                     rand_weight_init(dim_hk, self.n_output, init_type=self._B_feedback_init),
                     dtype=self.W_output.dtype))
                 self._B_direct_names.append(name)
-
-        # Homeostatic-gain state, allocated only when feedback_normalize is on (so
-        # the default net's buffer set — hence its state_dict — is unchanged). One
-        # entry per boundary index 0..L (0 = embedding boundary, 1..L = MP layers).
-        # ell_gain is a fixed target-gain buffer (moves with .to()); the running RMS
-        # v_k is a per-sequence TEMPORAL state (a plain tensor attribute, reset each
-        # unroll like self.M — never a buffer, so it stays out of state_dict).
-        if self.feedback_normalize:
-            self.register_buffer(
-                'ell_gain', torch.full((L + 1,), self._ell_gain_val, dtype=self.W_output.dtype))
-            self.ell_rms = None   # allocated/zeroed by reset_feedback_norm_state(B)
 
 
     def forward(self, inputs, run_mode='minimal', verbose=False):
@@ -1788,49 +1758,6 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
         output = F.linear(h[-1], self.W_output, self.b_output)
         return output, h, z, phi_p, embed_pre
 
-    def reset_feedback_norm_state(self, B=1):
-        """Zero the per-sequence running RMS of every boundary learning signal.
-        No-op unless feedback_normalize is on. Called once per unroll (parallel to
-        reset_state), so the homeostatic gain control starts fresh each sequence and
-        never leaks state across calls. B is unused (the RMS is a scalar per
-        boundary, averaged over batch and units) but kept for signature symmetry."""
-        if not getattr(self, 'feedback_normalize', False):
-            return
-        L = len(self.mp_layers)
-        self.ell_rms = torch.zeros(L + 1, dtype=self.W_output.dtype, device=self.W_output.device)
-
-    def _normalize_learning_signal(self, k, ell):
-        """Homeostatic gain control on boundary k's learning signal (opt-in).
-
-        Advances the per-boundary running RMS estimate and rescales ell to a fixed
-        target gain — a fully local, weight-transport-free normalization (per-layer
-        RMSNorm on the teaching signal):
-            v_k   <- beta v_k + (1 - beta) mean_{B,i}[ ell_{i}^2 ]
-            ell~  =  gain_k * ell / sqrt(v_k + eps)
-        Uses only the activity of the neurons receiving the signal (no forward
-        weights/gradients). ell is (B, dim h[k]); returns the rescaled signal."""
-        power = ell.square().mean()
-        v = self.ell_rms[k] * self.ell_rms_beta + power * (1.0 - self.ell_rms_beta)
-        self.ell_rms[k] = v
-        return self.ell_gain[k] * ell / torch.sqrt(v + self.ell_rms_eps)
-
-    def _maybe_normalize_boundary_signals(self, ell_h, need_input_signal):
-        """Post-pass homeostatic gain control over a fully-built ell_h list; a no-op
-        unless feedback_normalize is on (so the default/exact path is untouched).
-        Every filled boundary (1..L, plus 0 when the embedding is trainable) is
-        rescaled independently. Because the layerwise recursion is LINEAR, rescaling
-        as a post-pass preserves each boundary's direction and only controls its
-        magnitude, so it is equivalent (up to the running-RMS history) to normalizing
-        inside the recursion — and matches the reference _normalize_learning_signal
-        loop. exact_spatial never reaches here with the flag on (asserted off)."""
-        if not self.feedback_normalize:
-            return ell_h
-        for k in range(1, len(self.mp_layers) + 1):
-            ell_h[k] = self._normalize_learning_signal(k, ell_h[k])
-        if need_input_signal and ell_h[0] is not None:
-            ell_h[0] = self._normalize_learning_signal(0, ell_h[0])
-        return ell_h
-
     def _same_time_boundary_signals(self, grad_output, phi_p, need_input_signal):
         """Same-time layer-boundary learning signals using the frozen M_{t-1}.
 
@@ -1858,11 +1785,6 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
         MP layer's step needs its output signal); ell_h[0] is filled only when
         need_input_signal (the trainable input embedding). For a single MP layer
         with no embedding, exact_spatial / layerwise_fa compute exactly one matmul.
-
-        When feedback_normalize is on (random modes only), each fully-constructed
-        boundary signal is passed through the homeostatic gain control before return
-        (a post-pass, so the layerwise recursion itself is built from raw signals and
-        only its outputs are rescaled — matching _normalize_learning_signal).
         """
         L = len(self.mp_layers)
         ell_h = [None] * (L + 1)
@@ -1874,7 +1796,7 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
                 ell_h[k] = grad_output @ getattr(self, self._B_direct_names[k])
             if need_input_signal:
                 ell_h[0] = grad_output @ getattr(self, self._B_direct_names[0])
-            return self._maybe_normalize_boundary_signals(ell_h, need_input_signal)
+            return ell_h
 
         # exact_spatial vs layerwise_fa: the former uses the exact (modulated)
         # weight transpose at every boundary (weight transport), the latter a fixed
@@ -1895,7 +1817,7 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
             else:
                 ell_h[0] = self.mp_layers[0].backproject_through_modulated_weights_fast(delta_0)
 
-        return self._maybe_normalize_boundary_signals(ell_h, need_input_signal)
+        return ell_h
 
     def _trainable_params(self):
         """Trainable tensors this net computes gradients for, keyed by name.
@@ -2040,7 +1962,6 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
                 inputs, labels, masks, loss_and_grad, eta_lam, update_masks)
 
         self.reset_state(B=B)
-        self.reset_feedback_norm_state(B=B)   # per-sequence RMS state (no-op unless on)
         for mp in layers:
             if mode == 'exact':
                 mp.reset_local_learning_state(B=B)
