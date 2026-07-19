@@ -1006,6 +1006,24 @@ class MultiPlasticNetBase(BaseNetwork):
             dtype=torch.float)
         )
 
+        # ── Fixed input standardization (opt-in) ─────────────────────────────
+        # The raw input u_t feeds straight into the modulated forward W(1+M)x AND
+        # into the Hebbian M update (η·h·xᵀ), so its scale strongly conditions the
+        # modulation dynamics. When enabled, u_t is affinely standardized by FIXED
+        # per-feature statistics — u_norm = (u - loc) / scale — applied IDENTICALLY
+        # in every forward/gradient/eval path (so it conditions all learning rules
+        # equally and just removes a scale artifact; it is NOT a learned/adaptive
+        # norm). The statistics are frozen buffers (they move with .to()/.double()
+        # and ride in state_dict so a reloaded net normalizes identically); estimate
+        # them once from a task sample via set_input_norm_stats(). The buffers are
+        # allocated ONLY when the flag is on (matching the rest of the codebase), so
+        # a default net's buffer set — hence its state_dict — is byte-for-byte
+        # unchanged and old checkpoints still load. When off, _standardize_input is a
+        # pure identity, so every existing gradient path is unchanged.
+        self.input_normalize = net_params.get('input_normalize', False)
+        if self.input_normalize:
+            self._alloc_input_norm_buffers()
+
         if verbose: # Full summary of readout parameters (MP layer prints out internally)
             print(init_string)
 
@@ -1014,6 +1032,51 @@ class MultiPlasticNetBase(BaseNetwork):
 
         for mp_layer in self.mp_layers:
             mp_layer.reset_state(B=B)
+
+    def _alloc_input_norm_buffers(self):
+        """Register the fixed input-standardization buffers (identity init: loc=0,
+        scale=1). Allocated only when input_normalize is on, so a default net's
+        state_dict is unchanged and old checkpoints still load. Idempotent. Matches
+        W_output's dtype/device so it is correct whether called at construction or
+        later (e.g. after .double()/.to(device))."""
+        if 'input_loc' not in self._buffers:
+            ref = self.W_output
+            self.register_buffer('input_loc', torch.zeros(self.n_input, dtype=ref.dtype, device=ref.device))
+            self.register_buffer('input_scale', torch.ones(self.n_input, dtype=ref.dtype, device=ref.device))
+
+    @torch.no_grad()
+    def set_input_norm_stats(self, sample_inputs, eps=1e-5):
+        """Freeze the fixed input-standardization statistics from a data SAMPLE.
+
+        Estimates per-feature mean/std over all non-feature axes of `sample_inputs`
+        (shape (..., n_input); e.g. a (B, T, n_input) batch or a stack of them) and
+        stores them in the input_loc / input_scale buffers so _standardize_input maps
+        u -> (u - mean) / max(std, eps) thereafter. `eps` floors the scale so a
+        constant channel (std 0, e.g. a fixation bit) is centered but not blown up.
+        The statistics are FIXED once set (this is not called inside any training
+        step) and applied identically to train + validation for every rule. Enables
+        normalization (input_normalize=True), allocating the buffers if needed, since
+        freezing real statistics is the whole point of computing them. The buffers
+        move with .to()/.double() and persist in state_dict, so a reloaded net
+        normalizes identically."""
+        self.input_normalize = True
+        self._alloc_input_norm_buffers()
+        x = sample_inputs.reshape(-1, self.n_input).to(self.input_loc)
+        self.input_loc.copy_(x.mean(dim=0))
+        self.input_scale.copy_(x.std(dim=0).clamp_min(eps))
+
+    def _standardize_input(self, inputs):
+        """Apply the FIXED input standardization u -> (u - loc) / scale.
+
+        Identity (returns `inputs` unchanged, no copy) unless input_normalize is on,
+        so every default path is byte-for-byte unchanged. Called once at the top of
+        each terminal gradient method and the eval forward on the whole (B, T,
+        n_input) sequence, so the standardized input then propagates identically into
+        the modulated forward W(1+M)x, the Hebbian M update, and (deep net) the input
+        embedding's own gradient. Broadcasts over any leading axes."""
+        if not getattr(self, 'input_normalize', False):
+            return inputs
+        return (inputs - self.input_loc) / self.input_scale
 
     def _scratch(self, name, shape, dtype, device):
         """Return a persistent scratch buffer (allocated once, reused across calls)
@@ -1199,6 +1262,7 @@ class MultiPlasticNet(MultiPlasticNetBase):
         if _cuda:
             torch.cuda.synchronize()
         _t0 = time.perf_counter()
+        inputs = self._standardize_input(inputs)   # fixed norm (identity unless on)
         self.reset_state(B=B)
         outs = []
         for t in range(T):
@@ -1284,6 +1348,11 @@ class MultiPlasticNet(MultiPlasticNetBase):
         B, T, _ = inputs.shape
         dev, dt = inputs.device, inputs.dtype
         eta, lam = mp._eta_lam_full()   # constant over the unroll; also used by the pre-pass
+
+        # Fixed input standardization (identity unless on), applied ONCE here so both
+        # the custom-loss pre-pass and the accumulation loop below see the same
+        # standardized u_t (the pre-pass itself must NOT re-normalize).
+        inputs = self._standardize_input(inputs)
 
         # Custom loss: a forward-only pre-pass supplies grad_output_seq (dL/d
         # outputs) and the loss from the SUPPLIED loss_and_grad, so the returned
@@ -1851,6 +1920,7 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
         if _cuda:
             torch.cuda.synchronize()
         _t0 = time.perf_counter()
+        inputs = self._standardize_input(inputs)   # fixed norm (identity unless on)
         self.reset_state(B=B)
         outs = []
         for t in range(T):
@@ -1951,6 +2021,12 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
         B, T, _ = inputs.shape
         dev, dt = inputs.device, inputs.dtype
         eta_lam = [mp._eta_lam_full() for mp in layers]   # per-layer (eta, lam), constant over the unroll
+
+        # Fixed input standardization (identity unless on), applied ONCE here so both
+        # the custom-loss pre-pass and the accumulation loop see the same standardized
+        # u_t (the pre-pass itself must NOT re-normalize). The standardized u_t then
+        # feeds the embedding forward AND the embedding's own input gradient (u_seq).
+        inputs = self._standardize_input(inputs)
 
         # Custom loss: forward-only pre-pass supplies grad_output_seq and the loss
         # (see MultiPlasticNet._local_sequence_gradients / _prepass_output_grad).

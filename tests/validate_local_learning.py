@@ -949,6 +949,92 @@ def tier13_input_mode():
     return allok
 
 
+def tier14_input_normalize():
+    """Fixed input standardization u -> (u - loc)/scale (see
+    mpn.MultiPlasticNetBase.set_input_norm_stats / _standardize_input), a data-
+    conditioning knob applied IDENTICALLY to every rule (it is not rule-specific).
+    Invariants:
+      (a) OFF (the default): grads are BYTE-IDENTICAL to a net built with no flag,
+          and no input_loc/input_scale buffers are allocated (state_dict unchanged).
+      (b) set_input_norm_stats freezes correct per-feature statistics: the
+          standardized sample is per-feature zero-mean / unit-std, and the buffers
+          survive a state_dict round-trip (so a reloaded net normalizes identically).
+      (c) The DEFINING equivalence: an ON net fed RAW inputs produces EXACTLY the
+          same gradients (every rule × feedback mode) as an OFF net fed the pre-
+          standardized inputs — proving the standardization is inserted once, in
+          every path (BPTT / exact / diag / direct, all feedback modes, the trainable
+          embedding's own input gradient), and conditions all rules equally.
+    """
+    print("── Tier 14: fixed input standardization (opt-in) ───────────────────")
+    allok = True
+
+    def build(nn, rule, fb='exact_spatial', norm=False, embed=True, seed=1):
+        import numpy as _np
+        torch.manual_seed(seed); _np.random.seed(seed)
+        npar = {'n_neurons': nn, 'loss_type': 'MSE', 'activation': 'tanh',
+                'output_bias': True, 'output_matrix': '', 'dt': 40,
+                'input_layer_add': embed, 'input_layer_add_trainable': embed,
+                'linear_embed': 6, 'input_layer_bias': True, 'input_init_type': 'xavier',
+                'learning_rule': rule, 'feedback_mode': fb, 'input_mode': 'match',
+                'input_normalize': norm,
+                'ml_params': {'bias': True, 'mp_type': 'mult', 'm_update_type': 'hebb_assoc',
+                              'm_activation': 'linear', 'modulation_bounds': False,
+                              'eta_type': 'scalar', 'eta_train': False, 'lam_type': 'scalar',
+                              'lam_train': False, 'm_time_scale': 400, 'W_freeze': False}}
+        net = mpn.DeepMultiPlasticNet(npar, verbose=False).double()
+        with torch.no_grad():
+            for m in net.mp_layers:
+                m.eta.fill_(0.1); m.lam.fill_(0.6 * m.lam_clamp)
+        return net
+
+    ARCH = [8, 12, 12, 4]                       # embedding + 2 MP layers → real depth
+    # Off-scale, shifted inputs so standardization actually does something.
+    inp, lab, msk, _ = make_data(6, 10, ARCH[0], ARCH[-1])
+    inp = 5.0 * inp - 2.0
+
+    # (a) OFF byte-identical + no extra buffers.
+    a = build(ARCH, 'local_exact_rowlocal', norm=False)
+    b = build(ARCH, 'local_exact_rowlocal', norm=False)
+    keys = [k for k in a.sequence_gradients(inp, lab, msk) if k not in ('loss', 'outputs')]
+    ga, gb = a.sequence_gradients(inp, lab, msk), b.sequence_gradients(inp, lab, msk)
+    ok_a = (compare(ga, gb, keys)[0]
+            and 'input_loc' not in a.state_dict() and 'input_scale' not in a.state_dict())
+    allok &= ok_a
+    print(f"  [{'PASS' if ok_a else 'FAIL'}] OFF: byte-identical + no input_loc/input_scale buffers")
+
+    # (b) statistics correct (zero-mean / unit-std) + state_dict round-trip.
+    on = build(ARCH, 'bptt', norm=True); on.set_input_norm_stats(inp)
+    xs = on._standardize_input(inp).reshape(-1, ARCH[0])
+    mean_err = xs.mean(0).abs().max().item()
+    std_err = (xs.std(0) - 1.0).abs().max().item()
+    rt = build(ARCH, 'bptt', norm=True); rt.set_input_norm_stats(torch.zeros_like(inp))
+    rt.load_state_dict(on.state_dict())
+    rt_err = (rt.input_loc - on.input_loc).abs().max().item() + (rt.input_scale - on.input_scale).abs().max().item()
+    ok_b = mean_err < 1e-10 and std_err < 1e-10 and rt_err < 1e-12
+    allok &= ok_b
+    print(f"  [{'PASS' if ok_b else 'FAIL'}] stats: standardized mean={mean_err:.1e} "
+          f"std-1={std_err:.1e}; state_dict round-trip err={rt_err:.1e}")
+
+    # (c) ON(raw) == OFF(pre-standardized), every rule × feedback mode.
+    xs_full = on._standardize_input(inp).clone()
+    ok_c = True
+    worst = 0.0
+    for fb in ('exact_spatial', 'layerwise_fa', 'direct_fa'):
+        for rule in ('bptt', 'local_exact_rowlocal', 'local_diag_rflo', 'local_direct'):
+            n_on = build(ARCH, rule, fb, norm=True); n_on.set_input_norm_stats(inp)
+            n_off = build(ARCH, rule, fb, norm=False)
+            g_on = n_on.sequence_gradients(inp, lab, msk)
+            g_off = n_off.sequence_gradients(xs_full, lab, msk)
+            gkeys = [k for k in g_on if k not in ('loss', 'outputs')]
+            same, d = compare(g_on, g_off, gkeys)
+            worst = max(worst, max(d[k][0] for k in gkeys))
+            ok_c &= same
+    allok &= ok_c
+    print(f"  [{'PASS' if ok_c else 'FAIL'}] ON(raw)==OFF(pre-standardized) for every "
+          f"rule × feedback (max abs diff={worst:.1e})")
+    return allok
+
+
 def main():
     torch.set_default_dtype(torch.float64)
     print("Validating local-learning rules vs autograd (BPTT), float64\n")
@@ -965,6 +1051,7 @@ def main():
         tier10_cross_entropy(),
         tier11_feedback_modes(),
         tier13_input_mode(),
+        tier14_input_normalize(),
         tier4_real_task(),
     ]
     print("\n" + ("ALL CHECKS PASSED" if all(results) else "SOME CHECKS FAILED"))

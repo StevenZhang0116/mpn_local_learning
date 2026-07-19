@@ -79,6 +79,13 @@ class RunConfig:
     # log + an "_in-<mode>" filename fragment); the net reads it from net_params.
     # 'match' (default) keeps logs/filenames byte-for-byte as before.
     input_mode: str = "match"
+    # Fixed input standardization (see mpn.MultiPlasticNetBase.set_input_norm_stats).
+    # When on, run_seed estimates per-feature input mean/std from a task sample of
+    # input_norm_sample trials and freezes them into the base net (shared by every
+    # rule via the deepcopy) BEFORE training. Adds a "_inorm" filename fragment + a
+    # console/figure note. False (default) keeps logs/filenames byte-for-byte.
+    input_normalize: bool = False
+    input_norm_sample: int = 2048
     # optional extra string appended to the filename param tag (e.g. eta/lambda);
     # keep it filename-safe. Empty by default.
     tag_extra: str = ""
@@ -116,6 +123,10 @@ def param_tag(cfg):
     arch = cfg.arch_tag if getattr(cfg, "arch_tag", "") else f"h{cfg.n_hidden}"
     tag = (f"{cfg.ruleset}_{arch}_b{cfg.batch}_n{cfg.n_datasets}"
            f"_lr{cfg.lr:.0e}_{cfg.feedback_mode}")
+    # Append "_inorm" only when fixed input standardization is on, so filenames for
+    # existing (normalization-off) runs are unchanged byte-for-byte.
+    if getattr(cfg, "input_normalize", False):
+        tag += "_inorm"
     # Always record the input-embedding rule "_in-<mode>" (incl. the default
     # 'match'), so every output filename (figure / checkpoint / .npz) is
     # self-describing about how the input layer was trained.
@@ -291,6 +302,16 @@ def run_seed(cfg, seed, record_steps):
 
     # One base net → deepcopy so every rule starts from the SAME weights.
     base = cfg.net_factory(net_params, seed == cfg.seed).to(cfg.device).to(cfg.dtype)
+
+    # Fixed input standardization: estimate per-feature input mean/std from a task
+    # sample ONCE and freeze them into the base net BEFORE the deepcopy, so every
+    # rule inherits the SAME frozen statistics (they must not differ across rules).
+    # Applied identically to train + validation inside each net's gradient/eval path.
+    if getattr(cfg, "input_normalize", False):
+        sample_in, _, _ = task.train_batch(
+            task_params, train_params, cfg.input_norm_sample, cfg.device, cfg.dtype)
+        base.set_input_norm_stats(sample_in)
+
     nets, optims = {}, {}
     for rule in cfg.rules_to_run:
         net = copy.deepcopy(base)
@@ -498,6 +519,7 @@ def run_seed(cfg, seed, record_steps):
                 "ruleset": cfg.ruleset,
                 "learning_rule": rule,
                 "feedback_mode": cfg.feedback_mode,
+                "input_normalize": cfg.input_normalize,
                 "input_mode": cfg.input_mode,
                 "seed": seed,
             }, path)
@@ -603,7 +625,7 @@ def save_plot_data(cfg, record_steps, runs, agg, path=None,
         # scalar/string config for provenance + title reconstruction
         "ruleset": cfg.ruleset, "n_hidden": cfg.n_hidden, "batch": cfg.batch,
         "n_datasets": cfg.n_datasets, "lr": cfg.lr, "n_runs": cfg.n_runs,
-        "feedback_mode": cfg.feedback_mode,
+        "feedback_mode": cfg.feedback_mode, "input_normalize": cfg.input_normalize,
         "input_mode": cfg.input_mode, "title": cfg.title,
         # full architecture (multi-layer stacks) for provenance + replot suffix
         "arch_tag": getattr(cfg, "arch_tag", ""),
@@ -683,6 +705,7 @@ def save_config(cfg, path=None):
             "arch_tag": getattr(cfg, "arch_tag", ""),
             "arch_desc": getattr(cfg, "arch_desc", ""),
             "feedback_mode": cfg.feedback_mode,
+            "input_normalize": cfg.input_normalize,
             "input_mode": cfg.input_mode,
             # the resolved param dicts the nets are actually built from
             "net_params": _json_safe(net_params),
@@ -732,6 +755,7 @@ def run_experiment(cfg):
           f"runs: {cfg.n_runs}  |  {arch_suffix(cfg)} batch={cfg.batch} "
           f"steps={cfg.n_datasets} lr={cfg.lr} clip={cfg.grad_clip}")
     print(f"Device: {cfg.device}  dtype: {cfg.dtype}  feedback: {cfg.feedback_mode}"
+          f"{'  (input norm ON)' if getattr(cfg, 'input_normalize', False) else ''}"
           f"  input_mode: {getattr(cfg, 'input_mode', 'match')}\n")
 
     record_steps = list(range(0, cfg.n_datasets, cfg.log_every))
@@ -776,12 +800,13 @@ def run_experiment(cfg):
     save_plot_data(cfg, record_steps, runs, agg, align_runs=align_runs,
                    align_agg=align_agg)
     save_config(cfg)   # JSON of the training + network setup, next to the figure
-    # Append a note to the figure title only when input_mode is non-default, so
-    # existing ('match') figure titles are unchanged.
+    # Append notes to the figure title only when the feature is on / non-default, so
+    # existing (norm-off, match) figure titles are unchanged.
+    inorm_note = ", input norm" if getattr(cfg, "input_normalize", False) else ""
     inmode_note = ("" if getattr(cfg, "input_mode", "match") == "match"
                    else f", input={cfg.input_mode}")
     plot(cfg, record_steps, agg, cfg.rules_to_run,
-         f"(mean ± std over {cfg.n_runs} runs, {arch_suffix(cfg)}{inmode_note})",
+         f"(mean ± std over {cfg.n_runs} runs, {arch_suffix(cfg)}{inorm_note}{inmode_note})",
          fig_path(cfg))
 
     # Gradient-alignment-vs-BPTT figure (only when the diagnostic produced data).

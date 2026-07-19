@@ -83,6 +83,15 @@ FEEDBACK_MODE = "exact_spatial"
 #   'three_factor' — embedding ALWAYS uses the direct 3-factor local rule (even in
 #                    the bptt run — MP+readout stay exact-autograd). --input-mode on CLI.
 INPUT_MODE = "exact"
+# Fixed input standardization of the raw input u_t. Because u_t feeds straight into
+# the modulated forward W(1+M)x AND the Hebbian M update (η·h·x), its scale strongly
+# conditions the modulation dynamics; standardizing by FIXED per-feature statistics
+# (estimated once from a task sample, then frozen and applied identically to every
+# rule + validation) removes that scale artifact without adding any adaptive/learned
+# norm. Off by default (identity → existing runs/filenames unchanged byte-for-byte).
+# --input-normalize on CLI. The sample size used to estimate the stats:
+INPUT_NORMALIZE = False
+INPUT_NORM_SAMPLE = 2048      # #trials sampled to estimate the fixed input stats
 N_RUNS = 3                    # independent seeds per rule
 # Hidden width(s) of the MP-layer stack. A single int → one MP layer (the classic
 # in→hidden→out net). A list of ints → one MP layer per width, i.e. a DEEP MP
@@ -193,6 +202,7 @@ def build_params():
         "acc_measure": "angle",
         "learning_rule": "bptt",         # overwritten per rule below
         "feedback_mode": FEEDBACK_MODE,
+        "input_normalize": INPUT_NORMALIZE,  # fixed per-feature input standardization
         "input_mode": INPUT_MODE,        # input-embedding rule (match/exact/three_factor)
         "ml_params": {
             "bias": True,
@@ -234,6 +244,9 @@ def forward_outputs(net, inputs):
     and returns 3 values; MultiPlasticNet's returns 2, so drive its mp_layer
     directly (the library's iterate_sequence_batch can't unpack the 2-tuple)."""
     B, T, _ = inputs.shape
+    # Apply the SAME fixed input standardization the gradient paths use (identity
+    # unless the net has input_normalize on), so held-out eval matches training.
+    inputs = net._standardize_input(inputs)
     net.reset_state(B=B)
     outs = []
     if isinstance(net, mpn.DeepMultiPlasticNet):
@@ -310,6 +323,7 @@ def _cfg():
         rule_label=RULE_LABEL, rule_color=RULE_COLOR,
         seed=SEED, ruleset=RULESET, rules_to_run=RULES_TO_RUN,
         feedback_mode=FEEDBACK_MODE,
+        input_normalize=INPUT_NORMALIZE, input_norm_sample=INPUT_NORM_SAMPLE,
         input_mode=INPUT_MODE, n_runs=N_RUNS, n_hidden=_hidden_widths()[0],
         batch=BATCH, n_datasets=N_DATASETS, lr=LR, grad_clip=GRAD_CLIP,
         log_every=LOG_EVERY, device=DEVICE, dtype=DTYPE,
@@ -378,12 +392,19 @@ def _parse_args():
                         "MP-layer rule: 'match' = per-rule native (default), 'exact' "
                         "= always BPTT gradient, 'three_factor' = always the direct "
                         "local rule. Default: %(default)s.")
+    p.add_argument("--input-normalize", action=argparse.BooleanOptionalAction,
+                   default=INPUT_NORMALIZE,
+                   help="fixed per-feature standardization of the raw input u_t "
+                        "(statistics estimated once from a task sample, then frozen "
+                        "and applied identically to every rule + validation). "
+                        "Conditions all rules equally by removing a scale artifact. "
+                        "Use --no-input-normalize to force off. Default: %(default)s.")
     return p.parse_args()
 
 
 def main():
     global NET_TYPE, RULESET, N_RUNS, N_HIDDEN, N_DATASETS, FEEDBACK_MODE
-    global INPUT_MODE
+    global INPUT_MODE, INPUT_NORMALIZE
     args = _parse_args()
     NET_TYPE = args.net
     RULESET = args.task
@@ -394,6 +415,7 @@ def main():
     N_DATASETS = args.steps
     FEEDBACK_MODE = args.feedback
     INPUT_MODE = args.input_mode
+    INPUT_NORMALIZE = args.input_normalize
     tc.run_experiment(_cfg())
 
 
