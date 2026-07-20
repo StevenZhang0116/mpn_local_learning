@@ -11,3 +11,6 @@ checkpoints/
 # Saved figures and their underlying plot data
 figure/
 figure_data/
+
+# Weights & Biases local run logs (offline runs, cache, artifacts)
+wandb/
