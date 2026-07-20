@@ -1035,6 +1035,194 @@ def tier14_input_normalize():
     return allok
 
 
+def tier15_embed_partial_freeze():
+    """Independently freezing the input embedding's weight vs bias (see
+    mpn.DeepMultiPlasticNet._embed_grad_flags / _has_trainable_embed). The two
+    tensors are gated PER TENSOR on requires_grad, so the local path must emit
+    EXACTLY _trainable_params's keys — no missing key (was KeyError: 'b_in' when the
+    weight was frozen but the bias trainable) and no silently-dropped computed grad
+    (mirror case: trainable weight, frozen bias). Invariants, for every rule:
+      (a) frozen weight + trainable bias: no crash; grads == _trainable_params keys
+          (b_in present, W_in absent); b_in == the fully-trainable net's b_in.
+      (b) trainable weight + frozen bias: grads == keys (W_in present, b_in absent);
+          W_in == the fully-trainable net's W_in (freezing the bias doesn't perturb it).
+    A frozen tensor's gradient must equal the full net's because reset weights are
+    identical and a per-tensor requires_grad flag changes only WHICH grads are
+    RETURNED, never the forward or the surviving grads' values.
+    """
+    print("── Tier 15: embedding partial freeze (weight/bias independent) ─────")
+    allok = True
+    RULES = ('bptt', 'local_exact_rowlocal', 'local_diag_rflo', 'local_direct')
+
+    def build(rule):
+        import numpy as _np
+        torch.manual_seed(1); _np.random.seed(1)
+        npar = {'n_neurons': [5, 7, 3], 'loss_type': 'MSE', 'activation': 'tanh',
+                'output_bias': True, 'output_matrix': '', 'dt': 40,
+                'input_layer_add': True, 'input_layer_add_trainable': True,
+                'linear_embed': 6, 'input_layer_bias': True, 'input_init_type': 'xavier',
+                'learning_rule': rule, 'feedback_mode': 'exact_spatial', 'input_mode': 'match',
+                'ml_params': {'bias': True, 'mp_type': 'mult', 'm_update_type': 'hebb_assoc',
+                              'm_activation': 'linear', 'modulation_bounds': False,
+                              'eta_type': 'scalar', 'eta_train': False, 'lam_type': 'scalar',
+                              'lam_train': False, 'm_time_scale': 400, 'W_freeze': False}}
+        net = mpn.DeepMultiPlasticNet(npar, verbose=False).double()
+        with torch.no_grad():
+            for m in net.mp_layers:
+                m.eta.fill_(0.1); m.lam.fill_(0.6 * m.lam_clamp)
+        return net
+
+    inp, lab, msk, _ = make_data(4, 8, 5, 3)
+
+    # (a) frozen weight + trainable bias (the reported KeyError: 'b_in').
+    ok_a = True
+    for rule in RULES:
+        full = build(rule); g_full = full.sequence_gradients(inp, lab, msk)
+        net = build(rule); net.W_initial_linear.weight.requires_grad = False
+        pk = sorted(net._trainable_params().keys())
+        try:
+            g = net.sequence_gradients(inp, lab, msk)
+        except Exception as e:                       # the pre-fix failure mode
+            ok_a = False
+            print(f"    {rule}: RAISED {type(e).__name__}: {e}")
+            continue
+        gk = sorted(k for k in g if k not in ('loss', 'outputs'))
+        bin_err = (g['b_in'] - g_full['b_in']).abs().max().item()
+        ok_a &= (gk == pk) and ('W_in' not in gk) and ('b_in' in gk) and bin_err < 1e-12
+    allok &= ok_a
+    print(f"  [{'PASS' if ok_a else 'FAIL'}] frozen weight + trainable bias: no crash, "
+          f"keys match, b_in == full net")
+
+    # (b) trainable weight + frozen bias (mirror: computed b_in must be dropped, W_in kept).
+    ok_b = True
+    for rule in RULES:
+        full = build(rule); g_full = full.sequence_gradients(inp, lab, msk)
+        net = build(rule); net.W_initial_linear.bias.requires_grad = False
+        pk = sorted(net._trainable_params().keys())
+        g = net.sequence_gradients(inp, lab, msk)
+        gk = sorted(k for k in g if k not in ('loss', 'outputs'))
+        win_err = (g['W_in'] - g_full['W_in']).abs().max().item()
+        ok_b &= (gk == pk) and ('b_in' not in gk) and ('W_in' in gk) and win_err < 1e-12
+    allok &= ok_b
+    print(f"  [{'PASS' if ok_b else 'FAIL'}] trainable weight + frozen bias: keys match, "
+          f"W_in == full net (b_in dropped)")
+    return allok
+
+
+def tier16_mp_residual():
+    """Identity skip connections around each equal-width MP block (see
+    mpn.DeepMultiPlasticNet mp_residual / _residual_at). The skip is a same-time,
+    parameter-free, memoryless op: h_{n+1}=act(z_n)+h_n where widths match. It stays
+    fully local — the Hebbian write uses the block activation a_n (recovered as
+    h_{n+1}-h_n), and the inter-layer signal gains the residual's identity Jacobian
+    term (+ell_h[n+1]) — and leaves BPTT exact (autograd through the residual forward).
+    Invariants (equal-width deep dmpn stack so skips are active everywhere):
+      (a) OFF (default): grads BYTE-IDENTICAL to a net built with no mp_residual key,
+          and no skip is registered (identity adds no params/buffers).
+      (b) skip inserted only where d_in==d_out: an unequal-width layer has it disabled.
+      (c) ON, eta=0 all layers: exact_rowlocal == BPTT (~1e-14) for EVERY param — the
+          same-time backward (incl. the identity Jacobian term) is exact with no plastic
+          temporal path.
+      (d) ON, top-layer exact_rowlocal == BPTT and readout exact (the skip passes the
+          top signal through unchanged; nothing plastic sits above the top block).
+      (e) ON, freeze UPPER-layer eta: lower layer returns to EXACT vs BPTT (~1e-14),
+          confirming the ONLY dropped term is the upper-plastic TEMPORAL path; with the
+          upper eta active the lower layer is a surrogate (differs).
+      (f) ON changes the network: grads differ from the non-residual net (not a no-op).
+    """
+    print("── Tier 16: identity skip connections (mp_residual) ────────────────")
+    allok = True
+    RULES = ('bptt', 'local_exact_rowlocal', 'local_diag_rflo', 'local_direct')
+
+    def build(rule, arch, resid, etas=None, resid_key=True):
+        import numpy as _np
+        torch.manual_seed(1); _np.random.seed(1)
+        npar = {'n_neurons': arch, 'loss_type': 'MSE', 'activation': 'tanh',
+                'output_bias': True, 'output_matrix': '', 'dt': 40,
+                'input_layer_add': True, 'input_layer_add_trainable': True,
+                'linear_embed': arch[1], 'input_layer_bias': True, 'input_init_type': 'xavier',
+                'learning_rule': rule, 'feedback_mode': 'exact_spatial', 'input_mode': 'match',
+                'ml_params': {'bias': True, 'mp_type': 'mult', 'm_update_type': 'hebb_assoc',
+                              'm_activation': 'linear', 'modulation_bounds': False,
+                              'eta_type': 'scalar', 'eta_train': False, 'lam_type': 'scalar',
+                              'lam_train': False, 'm_time_scale': 400, 'W_freeze': False}}
+        if resid_key:
+            npar['mp_residual'] = resid
+        net = mpn.DeepMultiPlasticNet(npar, verbose=False).double()
+        with torch.no_grad():
+            for i, m in enumerate(net.mp_layers):
+                m.eta.fill_(etas[i] if etas else 0.1); m.lam.fill_(0.6 * m.lam_clamp)
+        return net
+
+    ARCH = [6, 12, 12, 12, 4]         # embed(12) + 3 MP layers, all width 12 → skips everywhere
+    inp, lab, msk, _ = make_data(4, 8, ARCH[0], ARCH[-1])
+    keys = lambda g: [k for k in g if k not in ('loss', 'outputs')]
+
+    # (a) OFF byte-identical + no skip registered.
+    ok_a = True
+    for rule in RULES:
+        gA = build(rule, ARCH, False).sequence_gradients(inp, lab, msk)
+        gB = build(rule, ARCH, False, resid_key=False).sequence_gradients(inp, lab, msk)
+        ok_a &= compare(gA, gB, keys(gA))[0]
+    ok_a &= (not any(build('bptt', ARCH, False)._residual_at))
+    allok &= ok_a
+    print(f"  [{'PASS' if ok_a else 'FAIL'}] OFF: byte-identical + no skip active")
+
+    # (b) skip only where widths match.
+    net_eq = build('bptt', ARCH, True)
+    net_uneq = build('bptt', [6, 12, 10, 12, 4], True)   # middle layer 12->10 breaks equality
+    ok_b = (all(net_eq._residual_at)
+            and net_uneq._residual_at == [True, False, False])
+    allok &= ok_b
+    print(f"  [{'PASS' if ok_b else 'FAIL'}] skip active iff equal widths "
+          f"(equal={net_eq._residual_at}, unequal={net_uneq._residual_at})")
+
+    # (c) ON, eta=0 everywhere → exact == BPTT for all params.
+    g_loc = build('local_exact_rowlocal', ARCH, True, etas=[0., 0., 0.]).sequence_gradients(inp, lab, msk)
+    g_ref = build('bptt', ARCH, True, etas=[0., 0., 0.]).sequence_gradients(inp, lab, msk)
+    d_c = max((g_loc[k] - g_ref[k]).abs().max().item() for k in keys(g_loc))
+    ok_c = d_c < 1e-12
+    allok &= ok_c
+    print(f"  [{'PASS' if ok_c else 'FAIL'}] ON eta=0: exact_rowlocal == BPTT all params (d={d_c:.1e})")
+
+    # (d) ON, top-layer exact + readout exact.
+    g_loc = build('local_exact_rowlocal', ARCH, True).sequence_gradients(inp, lab, msk)
+    g_ref = build('bptt', ARCH, True).sequence_gradients(inp, lab, msk)
+    L = len(build('bptt', ARCH, True).mp_layers)
+    topW = 'W' + ('' if L - 1 == 0 else str(L - 1))
+    d_top = (g_loc[topW] - g_ref[topW]).abs().max().item()
+    d_wout = (g_loc['W_output'] - g_ref['W_output']).abs().max().item()
+    ok_d = d_top < 1e-12 and d_wout < 1e-12
+    allok &= ok_d
+    print(f"  [{'PASS' if ok_d else 'FAIL'}] ON: top MP layer {topW} == BPTT (d={d_top:.1e}), "
+          f"readout exact (d={d_wout:.1e})")
+
+    # (e) ON, freeze upper eta → lower exact; upper eta on → lower surrogate.
+    g_fz = build('local_exact_rowlocal', ARCH, True, etas=[0.1, 0., 0.]).sequence_gradients(inp, lab, msk)
+    gb_fz = build('bptt', ARCH, True, etas=[0.1, 0., 0.]).sequence_gradients(inp, lab, msk)
+    d_lo_fz = (g_fz['W'] - gb_fz['W']).abs().max().item()
+    g_on = build('local_exact_rowlocal', ARCH, True, etas=[0.1, 0.1, 0.1]).sequence_gradients(inp, lab, msk)
+    gb_on = build('bptt', ARCH, True, etas=[0.1, 0.1, 0.1]).sequence_gradients(inp, lab, msk)
+    rel_lo = ((g_on['W'] - gb_on['W']).abs().max()
+              / gb_on['W'].abs().max().clamp_min(1e-12)).item()
+    ok_e = d_lo_fz < 1e-12 and rel_lo > 1e-3
+    allok &= ok_e
+    print(f"  [{'PASS' if ok_e else 'FAIL'}] ON: freeze-upper-eta → lower exact (d={d_lo_fz:.1e}); "
+          f"upper-eta-on → lower surrogate (rel={rel_lo:.1e})")
+
+    # (f) ON is not a no-op vs the non-residual net.
+    ok_f = True
+    for rule in ('local_exact_rowlocal', 'local_diag_rflo', 'local_direct'):
+        g_res = build(rule, ARCH, True).sequence_gradients(inp, lab, msk)
+        g_no = build(rule, ARCH, False).sequence_gradients(inp, lab, msk)
+        rel = ((g_res['W'] - g_no['W']).abs().max()
+               / g_no['W'].abs().max().clamp_min(1e-12)).item()
+        ok_f &= rel > 1e-3
+    allok &= ok_f
+    print(f"  [{'PASS' if ok_f else 'FAIL'}] ON changes grads vs non-residual net (not a no-op)")
+    return allok
+
+
 def main():
     torch.set_default_dtype(torch.float64)
     print("Validating local-learning rules vs autograd (BPTT), float64\n")
@@ -1052,6 +1240,8 @@ def main():
         tier11_feedback_modes(),
         tier13_input_mode(),
         tier14_input_normalize(),
+        tier15_embed_partial_freeze(),
+        tier16_mp_residual(),
         tier4_real_task(),
     ]
     print("\n" + ("ALL CHECKS PASSED" if all(results) else "SOME CHECKS FAILED"))

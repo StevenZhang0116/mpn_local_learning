@@ -35,8 +35,17 @@ the input embedding — trains locally; under 'bptt' the whole network trains by
 exact autograd. The learning rule governs every layer; there is no separate
 per-layer control.
 
+Weights & Biases (https://wandb.ai): pass --wandb to log every run live. Each
+invocation becomes ONE W&B experiment named after this run's output save-stem (the
+same name the figure/.npz/JSON share), containing K = len(RULES_TO_RUN) × N_RUNS
+runs — one per (rule × seed). Group/color by 'rule' in the W&B UI to see exactly K
+colors, with each of the N_RUNS seeds drawn as its own separate curve; a summary
+run also logs the aggregate mean±std figures. Off by default (no wandb import, all
+outputs byte-for-byte unchanged). See scripts/wandb_logging.py.
+
 Run from this directory:
     python train_mpn.py                        # deep MPN (default)
+    python train_mpn.py --wandb                # + log to Weights & Biases
     python train_mpn.py --net mpn1             # single MP layer, no input embedding
     python train_mpn.py --net dmpn --hidden 100 --runs 3 --task delaygo
     python train_mpn.py --net dmpn --hidden 150 100   # deep MP stack (two MP layers)
@@ -58,13 +67,13 @@ import tasks
 import train_common as tc
 
 # ─── Configuration (aligned with MultiTaskMPN/one_task/one_task.py) ───────────
-SEED = np.random.randint(0, 2**32 - 1)  # random seed for this run
+SEED = np.random.randint(0, 1000)  # random seed for this run (small → short run names)
 RULESET = "contextdelaydm1"           # single task to train on
 # Network: 'dmpn' = DeepMultiPlasticNet (trainable input embedding + MP layer,
 # RNN-comparable); 'mpn1' = MultiPlasticNet (single MP layer, no embedding).
 # Overridable with --net on the command line (see main()).
 NET_TYPE = "dmpn"
-RULES_TO_RUN = ["bptt", "local_diag_rflo", "local_direct"]   # rules to compare
+RULES_TO_RUN = ["bptt", "local_exact_rowlocal", "local_diag_rflo", "local_direct"]   # rules to compare
 # Hidden learning-signal feedback. 'exact_spatial' = exact same-time spatial
 # gradient (weight transport; top plastic layer exact vs BPTT under
 # local_exact_rowlocal); 'layerwise_fa' = recursive per-boundary feedback
@@ -92,7 +101,15 @@ INPUT_MODE = "exact"
 # --input-normalize on CLI. The sample size used to estimate the stats:
 INPUT_NORMALIZE = False
 INPUT_NORM_SAMPLE = 2048      # #trials sampled to estimate the fixed input stats
-N_RUNS = 3                    # independent seeds per rule
+# Identity skip (residual) connections around each MP block: h_{n+1} = act(z_n) + h_n
+# (dmpn only). A same-time, parameter-free, memoryless op — it stays fully local (the
+# local rules gain the residual's identity Jacobian term in the inter-layer signal;
+# the Hebbian write still uses the block activation) and leaves BPTT exact. A skip is
+# inserted only where an MP layer's input/output widths MATCH (identity needs equal
+# widths); unequal-width layers are skipped with a warning. Use EQUAL stacked widths
+# (e.g. --hidden 128 128) to exercise it on a deep stack. Off by default. --residual.
+MP_RESIDUAL = True
+N_RUNS = 2                    # independent seeds per rule
 # Hidden width(s) of the MP-layer stack. A single int → one MP layer (the classic
 # in→hidden→out net). A list of ints → one MP layer per width, i.e. a DEEP MP
 # stack (in→h1→h2→...→out); the deep local rules train every layer. The deep
@@ -114,6 +131,19 @@ SAVE_NETS = True              # save each trained network (per rule, per seed)
 
 DEVICE = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 DTYPE = torch.float32         # float32 for speed (one_task.py also runs float32)
+
+# ─── Weights & Biases (https://wandb.ai) logging (opt-in) ─────────────────────
+# When USE_WANDB is on (--wandb), each invocation opens ONE W&B run per
+# (rule × seed), all grouped under this run's output save-stem — the SAME name the
+# figure/.npz/JSON share (train_common.run_stem) — which becomes the W&B
+# experiment/group. Group/color by 'rule' in the UI to see exactly K = len(
+# RULES_TO_RUN) colors, with each of the N_RUNS seeds drawn as its own separate
+# curve; a final summary run logs the aggregate mean±std figures. Off by default →
+# wandb is never imported and all outputs are byte-for-byte unchanged.
+USE_WANDB = False
+WANDB_PROJECT = "mpn_local_learning"   # W&B project the runs land in
+WANDB_ENTITY = None                    # None → your default W&B entity (user/team)
+WANDB_MODE = None                      # None → online; "offline"/"disabled" also valid
 
 RULE_LABEL = {"bptt": "BPTT", "local_diag_rflo": "diagonal RFLO",
               "local_exact_rowlocal": "exact row-local", "local_direct": "direct"}
@@ -185,6 +215,10 @@ def build_params():
         raise ValueError(
             "mpn1 (MultiPlasticNet) is a single MP layer; pass one --hidden width "
             "or use --net dmpn for a multi-MP-layer stack.")
+    if MP_RESIDUAL and NET_TYPE != "dmpn":
+        raise ValueError(
+            "--residual (identity skip connections) is implemented for dmpn only; "
+            "use --net dmpn.")
 
     net_params = {
         "net_type": NET_TYPE,            # 'dmpn' or 'mpn1'
@@ -203,6 +237,7 @@ def build_params():
         "learning_rule": "bptt",         # overwritten per rule below
         "feedback_mode": FEEDBACK_MODE,
         "input_normalize": INPUT_NORMALIZE,  # fixed per-feature input standardization
+        "mp_residual": MP_RESIDUAL,      # identity skip around each equal-width MP block
         "input_mode": INPUT_MODE,        # input-embedding rule (match/exact/three_factor)
         "ml_params": {
             "bias": True,
@@ -324,11 +359,14 @@ def _cfg():
         seed=SEED, ruleset=RULESET, rules_to_run=RULES_TO_RUN,
         feedback_mode=FEEDBACK_MODE,
         input_normalize=INPUT_NORMALIZE, input_norm_sample=INPUT_NORM_SAMPLE,
+        mp_residual=MP_RESIDUAL,
         input_mode=INPUT_MODE, n_runs=N_RUNS, n_hidden=_hidden_widths()[0],
         batch=BATCH, n_datasets=N_DATASETS, lr=LR, grad_clip=GRAD_CLIP,
         log_every=LOG_EVERY, device=DEVICE, dtype=DTYPE,
         fig_dir=FIG_DIR, ckpt_dir=CKPT_DIR, data_dir=DATA_DIR, save_nets=SAVE_NETS,
         arch_tag=_arch_tag(), arch_desc=_arch_desc(),
+        use_wandb=USE_WANDB, wandb_project=WANDB_PROJECT,
+        wandb_entity=WANDB_ENTITY, wandb_mode=WANDB_MODE,
         build_params=build_params,
         net_factory=lambda np_, verbose: net_cls(np_, verbose=verbose),
         eval_outputs=forward_outputs,
@@ -399,12 +437,35 @@ def _parse_args():
                         "and applied identically to every rule + validation). "
                         "Conditions all rules equally by removing a scale artifact. "
                         "Use --no-input-normalize to force off. Default: %(default)s.")
+    p.add_argument("--residual", action=argparse.BooleanOptionalAction,
+                   default=MP_RESIDUAL,
+                   help="identity skip connections around each equal-width MP block "
+                        "(dmpn only): h_{n+1}=act(z_n)+h_n. Parameter-free, stays fully "
+                        "local (adds the residual's identity Jacobian term to the "
+                        "inter-layer signal), BPTT stays exact. Needs equal stacked "
+                        "widths (e.g. --hidden 128 128); unequal layers skip it with a "
+                        "warning. Default: %(default)s.")
+    p.add_argument("--wandb", dest="use_wandb", action="store_true", default=USE_WANDB,
+                   help="log to Weights & Biases (https://wandb.ai): one run per "
+                        "(rule × seed), all grouped under this run's output save-stem "
+                        "as the experiment name. Group/color by 'rule' in the UI for "
+                        "K=len(RULES_TO_RUN) colors, each seed a separate curve. "
+                        "Off by default.")
+    p.add_argument("--wandb-project", default=WANDB_PROJECT,
+                   help="W&B project name (default: %(default)s).")
+    p.add_argument("--wandb-entity", default=WANDB_ENTITY,
+                   help="W&B entity (user/team); default: your W&B default.")
+    p.add_argument("--wandb-mode", choices=["online", "offline", "disabled"],
+                   default=WANDB_MODE,
+                   help="W&B mode; default: online. Use 'offline' to log locally and "
+                        "`wandb sync` later (no login needed).")
     return p.parse_args()
 
 
 def main():
     global NET_TYPE, RULESET, N_RUNS, N_HIDDEN, N_DATASETS, FEEDBACK_MODE
-    global INPUT_MODE, INPUT_NORMALIZE
+    global INPUT_MODE, INPUT_NORMALIZE, MP_RESIDUAL
+    global USE_WANDB, WANDB_PROJECT, WANDB_ENTITY, WANDB_MODE
     args = _parse_args()
     NET_TYPE = args.net
     RULESET = args.task
@@ -416,6 +477,11 @@ def main():
     FEEDBACK_MODE = args.feedback
     INPUT_MODE = args.input_mode
     INPUT_NORMALIZE = args.input_normalize
+    MP_RESIDUAL = args.residual
+    USE_WANDB = args.use_wandb
+    WANDB_PROJECT = args.wandb_project
+    WANDB_ENTITY = args.wandb_entity
+    WANDB_MODE = args.wandb_mode
     tc.run_experiment(_cfg())
 
 

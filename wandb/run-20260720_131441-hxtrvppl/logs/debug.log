@@ -1,0 +1,19 @@
+2026-07-20 13:14:41,532 INFO    MainThread:1657151 [wandb_setup.py:_flush():81] Current SDK version is 0.26.1
+2026-07-20 13:14:41,533 INFO    MainThread:1657151 [wandb_setup.py:_flush():81] Configure stats pid to 1657151
+2026-07-20 13:14:41,533 INFO    MainThread:1657151 [wandb_setup.py:_flush():81] Loading settings from environment variables
+2026-07-20 13:14:41,533 INFO    MainThread:1657151 [wandb_init.py:setup_run_log_directory():723] Logging user logs to /allen/programs/mindscope/workgroups/auto-model/zihan.zhang/mpn_local_learning/wandb/run-20260720_131441-hxtrvppl/logs/debug.log
+2026-07-20 13:14:41,533 INFO    MainThread:1657151 [wandb_init.py:setup_run_log_directory():724] Logging internal logs to /allen/programs/mindscope/workgroups/auto-model/zihan.zhang/mpn_local_learning/wandb/run-20260720_131441-hxtrvppl/logs/debug-internal.log
+2026-07-20 13:14:41,533 INFO    MainThread:1657151 [wandb_init.py:init():850] calling init triggers
+2026-07-20 13:14:41,533 INFO    MainThread:1657151 [wandb_init.py:init():855] wandb.init called with sweep_config: {}
+config: {'experiment': 'train_dmpn_contextdelaydm1_h200_b128_n5000_lr1e-03_exact_spatial_res_in-exact_eta1.00_lam0.99_runs2', 'ruleset': 'contextdelaydm1', 'rules_to_run': ['bptt', 'local_exact_rowlocal', 'local_diag_rflo', 'local_direct'], 'n_runs': 2, 'n_hidden': 200, 'arch_tag': '', 'arch_desc': 'arch=[1, 200, 200, 1]', 'feedback_mode': 'exact_spatial', 'input_mode': 'exact', 'input_normalize': False, 'mp_residual': True, 'batch': 128, 'n_datasets': 5000, 'lr': 0.001, 'grad_clip': 10, 'metric': 'accuracy', 'acc_label': 'angle accuracy (%)', 'device': 'cuda', 'dtype': 'torch.float32', 'file_prefix': 'train_dmpn', 'rule': 'bptt', 'seed': 175, 'run_idx': 0, '_wandb': {}}
+2026-07-20 13:14:41,533 INFO    MainThread:1657151 [wandb_init.py:init():898] starting backend
+2026-07-20 13:14:41,885 INFO    MainThread:1657151 [wandb_init.py:init():913] sending inform_init request
+2026-07-20 13:14:42,111 INFO    MainThread:1657151 [wandb_init.py:init():918] backend started and connected
+2026-07-20 13:14:42,176 INFO    MainThread:1657151 [wandb_init.py:init():988] updated telemetry
+2026-07-20 13:14:42,230 INFO    MainThread:1657151 [wandb_init.py:init():1011] communicating run to backend with 90.0 second timeout
+2026-07-20 13:14:42,768 INFO    MainThread:1657151 [wandb_init.py:init():1056] starting run threads in backend
+2026-07-20 13:14:43,317 INFO    MainThread:1657151 [wandb_run.py:_console_start():2554] atexit reg
+2026-07-20 13:14:43,317 INFO    MainThread:1657151 [wandb_run.py:_redirect():2403] redirect: wrap_raw
+2026-07-20 13:14:43,317 INFO    MainThread:1657151 [wandb_run.py:_redirect():2472] Wrapping output streams.
+2026-07-20 13:14:43,317 INFO    MainThread:1657151 [wandb_run.py:_redirect():2495] Redirects installed.
+2026-07-20 13:14:43,328 INFO    MainThread:1657151 [wandb_init.py:init():1094] run started, returning control to user process

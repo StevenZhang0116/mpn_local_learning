@@ -86,6 +86,11 @@ class RunConfig:
     # console/figure note. False (default) keeps logs/filenames byte-for-byte.
     input_normalize: bool = False
     input_norm_sample: int = 2048
+    # Identity skip (residual) connections around each equal-width MP block (dmpn;
+    # see mpn.DeepMultiPlasticNet mp_residual). Presentation only here (console log +
+    # a "_res" filename fragment + a figure-title note); the net reads it from
+    # net_params. False (default) keeps logs/filenames byte-for-byte as before.
+    mp_residual: bool = False
     # optional extra string appended to the filename param tag (e.g. eta/lambda);
     # keep it filename-safe. Empty by default.
     tag_extra: str = ""
@@ -113,6 +118,22 @@ class RunConfig:
     # diagnostic). Costs one extra BPTT pass per local rule per recorded step
     # (record steps only, not every step), timed OUTSIDE the fwd/bwd/opt readout.
     log_grad_align: bool = True
+    # ─ Weights & Biases logging (opt-in; see scripts/wandb_logging.py) ─
+    # When use_wandb is True, run_seed opens ONE W&B run per (rule × seed) grouped
+    # under the run's output save-stem (run_stem, == the figure/.npz/JSON name), so
+    # a single invocation shows K = len(rules_to_run) colors (group/color by 'rule')
+    # with each of the n_runs seeds as its own curve; a summary run logs the
+    # aggregate figures. False (the default) is a no-op — wandb is never imported and
+    # every existing output is byte-for-byte unchanged. wandb_project/entity/mode/dir
+    # /group/tags are forwarded to wandb.init (None → wandb's own defaults; mode None
+    # → online).
+    use_wandb: bool = False
+    wandb_project: str = "mpn_local_learning"
+    wandb_entity: str = None
+    wandb_mode: str = None          # None → wandb default (online); "offline"/"online"/"disabled"
+    wandb_dir: str = None           # None → wandb default (./wandb)
+    wandb_group: str = None         # None → run_stem (the output save-stem)
+    wandb_tags: list = None
 
 
 # ─── Path helpers (read the passed cfg, i.e. the caller's live globals) ───────
@@ -127,6 +148,9 @@ def param_tag(cfg):
     # existing (normalization-off) runs are unchanged byte-for-byte.
     if getattr(cfg, "input_normalize", False):
         tag += "_inorm"
+    # Append "_res" only when identity skip connections are on (unchanged otherwise).
+    if getattr(cfg, "mp_residual", False):
+        tag += "_res"
     # Always record the input-embedding rule "_in-<mode>" (incl. the default
     # 'match'), so every output filename (figure / checkpoint / .npz) is
     # self-describing about how the input layer was trained.
@@ -134,6 +158,16 @@ def param_tag(cfg):
     if cfg.tag_extra:
         tag += f"_{cfg.tag_extra}"
     return tag
+
+
+def run_stem(cfg):
+    """The shared output save-stem for this invocation — the common filename the
+    figure (.png), plot-data (.npz) and config (.json) are all built from
+    (`{file_prefix}_{param_tag}_runs{n_runs}`). Used as the W&B experiment/group
+    name so 'experiment name == the current file save name' (the user's request):
+    every rule × seed of one run lands in this group. Config-unique, so different
+    hyperparameters form different experiments."""
+    return f"{cfg.file_prefix}_{param_tag(cfg)}_runs{cfg.n_runs}"
 
 
 def fig_path(cfg):
@@ -280,7 +314,7 @@ def eval_outputs_chunked(cfg, net, v_inputs, chunk):
     return torch.cat(outs, dim=0)
 
 
-def run_seed(cfg, seed, record_steps):
+def run_seed(cfg, seed, record_steps, run_idx=0, wandb_logger=None):
     """Train all cfg.rules_to_run in lockstep for one seed: identical init
     (deepcopy of one base net), identical per-step data, identical held-out
     validation set. Returns (curves, align_curves):
@@ -289,7 +323,8 @@ def run_seed(cfg, seed, record_steps):
                                     between this (non-bptt) rule's gradient and the
                                     exact BPTT gradient for weight `key` ({} if the
                                     alignment diagnostic is off / no non-bptt rules).
-    Saves each trained net if cfg.save_nets."""
+    Saves each trained net if cfg.save_nets. If wandb_logger is given (cfg.use_wandb),
+    every recorded step is also logged to its K per-rule W&B runs for this seed."""
     np.random.seed(seed)
     torch.manual_seed(seed)
 
@@ -495,6 +530,21 @@ def run_seed(cfg, seed, record_steps):
                       f"{tr_acc:>7.3f} {va_acc:>7.3f}   "
                       f"{tr_loss:>9.3e} {va_loss:>9.3e}   {lr:>7.1e}   "
                       f"{fwd_ms:>7.1f} {bwd_ms:>7.1f} {opt_ms:>7.1f}{align_cols}")
+                # Mirror this step's metrics to W&B (opt-in). One row into this
+                # rule's run for this seed; grouping/coloring by 'rule' in the UI
+                # then yields K curves with each seed drawn separately.
+                if wandb_logger is not None:
+                    al = step_align.get(r, {}) if align_on else {}
+                    metrics = {
+                        "train/accuracy": tr_acc, "valid/accuracy": va_acc,
+                        "train/loss": tr_loss, "valid/loss": va_loss,
+                        "lr": lr,
+                        "time/fwd_ms": fwd_ms, "time/bwd_ms": bwd_ms,
+                        "time/opt_ms": opt_ms,
+                    }
+                    for k in align_keys:
+                        metrics[f"grad_align/{_short(k)}"] = al.get(k)
+                    wandb_logger.log_step(r, step, metrics)
             # Reset the window accumulators after logging.
             t_fwd = {r: 0.0 for r in cfg.rules_to_run}
             t_bwd = {r: 0.0 for r in cfg.rules_to_run}
@@ -520,6 +570,7 @@ def run_seed(cfg, seed, record_steps):
                 "learning_rule": rule,
                 "feedback_mode": cfg.feedback_mode,
                 "input_normalize": cfg.input_normalize,
+                "mp_residual": cfg.mp_residual,
                 "input_mode": cfg.input_mode,
                 "seed": seed,
             }, path)
@@ -626,6 +677,7 @@ def save_plot_data(cfg, record_steps, runs, agg, path=None,
         "ruleset": cfg.ruleset, "n_hidden": cfg.n_hidden, "batch": cfg.batch,
         "n_datasets": cfg.n_datasets, "lr": cfg.lr, "n_runs": cfg.n_runs,
         "feedback_mode": cfg.feedback_mode, "input_normalize": cfg.input_normalize,
+        "mp_residual": cfg.mp_residual,
         "input_mode": cfg.input_mode, "title": cfg.title,
         # full architecture (multi-layer stacks) for provenance + replot suffix
         "arch_tag": getattr(cfg, "arch_tag", ""),
@@ -706,6 +758,7 @@ def save_config(cfg, path=None):
             "arch_desc": getattr(cfg, "arch_desc", ""),
             "feedback_mode": cfg.feedback_mode,
             "input_normalize": cfg.input_normalize,
+            "mp_residual": cfg.mp_residual,
             "input_mode": cfg.input_mode,
             # the resolved param dicts the nets are actually built from
             "net_params": _json_safe(net_params),
@@ -756,7 +809,23 @@ def run_experiment(cfg):
           f"steps={cfg.n_datasets} lr={cfg.lr} clip={cfg.grad_clip}")
     print(f"Device: {cfg.device}  dtype: {cfg.dtype}  feedback: {cfg.feedback_mode}"
           f"{'  (input norm ON)' if getattr(cfg, 'input_normalize', False) else ''}"
+          f"{'  (residual ON)' if getattr(cfg, 'mp_residual', False) else ''}"
           f"  input_mode: {getattr(cfg, 'input_mode', 'match')}\n")
+
+    # Weights & Biases (opt-in). Import lazily so non-W&B runs never touch wandb.
+    # The experiment name == the output save-stem (figure/.npz/JSON share it), used
+    # as the W&B group so all K rules × n_runs seeds compare on one page.
+    wb = None
+    experiment = run_stem(cfg)
+    if getattr(cfg, "use_wandb", False):
+        import wandb_logging as wb
+        if not wb.wandb_available():
+            raise RuntimeError(
+                "use_wandb=True but the `wandb` package is not importable. "
+                "Install it (`pip install wandb`) or drop --wandb.")
+        print(f"W&B: logging to project '{getattr(cfg, 'wandb_project', None)}', "
+              f"group/experiment '{experiment}' "
+              f"({len(cfg.rules_to_run)} rules × {cfg.n_runs} seeds runs)\n")
 
     record_steps = list(range(0, cfg.n_datasets, cfg.log_every))
     if record_steps[-1] != cfg.n_datasets - 1:
@@ -770,7 +839,16 @@ def run_experiment(cfg):
     seeds = [cfg.seed + k for k in range(cfg.n_runs)]
     for run_idx, seed in enumerate(seeds):
         print(f"── Run {run_idx + 1}/{cfg.n_runs}  (seed {seed}) ──")
-        curves, align_curves = run_seed(cfg, seed, record_steps)
+        # One W&B logger (K live per-rule runs) per seed, so each seed is a separate
+        # curve within each rule's color. Closed before the next seed so at most K
+        # runs are open at once.
+        wandb_logger = wb.WandbLogger(cfg, seed, run_idx, experiment) if wb else None
+        try:
+            curves, align_curves = run_seed(
+                cfg, seed, record_steps, run_idx=run_idx, wandb_logger=wandb_logger)
+        finally:
+            if wandb_logger is not None:
+                wandb_logger.finish()
         for r in cfg.rules_to_run:
             runs[r]["train"].append(curves[r]["train"])
             runs[r]["valid"].append(curves[r]["valid"])
@@ -803,10 +881,11 @@ def run_experiment(cfg):
     # Append notes to the figure title only when the feature is on / non-default, so
     # existing (norm-off, match) figure titles are unchanged.
     inorm_note = ", input norm" if getattr(cfg, "input_normalize", False) else ""
+    resid_note = ", residual" if getattr(cfg, "mp_residual", False) else ""
     inmode_note = ("" if getattr(cfg, "input_mode", "match") == "match"
                    else f", input={cfg.input_mode}")
     plot(cfg, record_steps, agg, cfg.rules_to_run,
-         f"(mean ± std over {cfg.n_runs} runs, {arch_suffix(cfg)}{inorm_note}{inmode_note})",
+         f"(mean ± std over {cfg.n_runs} runs, {arch_suffix(cfg)}{inorm_note}{resid_note}{inmode_note})",
          fig_path(cfg))
 
     # Gradient-alignment-vs-BPTT figure (only when the diagnostic produced data).
@@ -820,9 +899,23 @@ def run_experiment(cfg):
     metric_noun = "loss" if cfg.metric == "loss" else "accuracy"
     fmt = "{:.3e}" if cfg.metric == "loss" else "{:.3f}"
     print(f"\nFinal {metric_noun} (mean ± std over runs):")
+    final_summary = {}
     for r in cfg.rules_to_run:
         tr = agg[r]["train"]; va = agg[r]["valid"]
         print(f"  {cfg.rule_label.get(r, r):<16} "
               f"train {fmt.format(tr['mean'][-1])} ± {fmt.format(tr['std'][-1])}"
               f"   test {fmt.format(va['mean'][-1])} ± {fmt.format(va['std'][-1])}")
+        final_summary[cfg.rule_label.get(r, r)] = (
+            float(tr["mean"][-1]), float(tr["std"][-1]),
+            float(va["mean"][-1]), float(va["std"][-1]))
+
+    # W&B summary run: the aggregate K-colored figures + the final-metric table, in
+    # the same group, so the comparison is viewable without any UI grouping.
+    if wb:
+        align_fig = align_fig_path(cfg) if align_agg else None
+        try:
+            wb.log_summary(cfg, experiment, fig_path(cfg), align_fig, final_summary)
+        except Exception as e:                  # never let logging break a finished run
+            print(f"WARNING: could not log W&B summary ({e})")
+
     return agg

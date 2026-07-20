@@ -1,0 +1,78 @@
+[34m[1mwandb[0m: Tracking run with wandb version 0.26.1qi (0.0s)
+[34m[1mwandb[0m: Run data is saved locally in [35m[1m/allen/programs/mindscope/workgroups/auto-model/zihan.zhang/mpn_local_learning/wandb/run-20260720_130914-0chp4nqi[0m
+[34m[1mwandb[0m: Run [1m`wandb offline`[0m to turn off syncing.
+[34m[1mwandb[0m: Syncing run [33mlocal_direct__seed1724781836[0m
+[34m[1mwandb[0m: ⭐️ View project at [34m[4mhttps://wandb.ai/allen-neuro-foundation-model/mpn_local_learning[0m
+[34m[1mwandb[0m: 🚀 View run at [34m[4mhttps://wandb.ai/allen-neuro-foundation-model/mpn_local_learning/runs/0chp4nqi[0m
+MultiPlastic Net:
+  output neurons: 3
+  Act: tanh
+
+  MP Layer1 parameters:
+    n_neurons - input: 200, output: 200
+    M matrix parameters:      type: mult // Update - type: hebb_assoc // Act fn: linear
+      Eta: scalar (fixed) // Lambda: scalar (fixed) // Lambda_max: 0.99 (tau: 4.0e+03)
+  seed 1724781836:
+      step  rule               acc tr  acc va     loss tr   loss va        lr    fwd ms  bwd ms  opt ms     cos Win     cos W  cos Wout
+         0  BPTT                0.115   0.091   1.804e+00 9.697e-01   1.0e-03     210.4   106.4    61.9           —         —         —
+            exact row-local     0.115   0.091   1.804e+00 9.697e-01   1.0e-03    3936.1    68.4     0.8      1.0000    1.0000    1.0000
+            diagonal RFLO       0.115   0.125   1.804e+00 1.002e+00   1.0e-03     176.6    64.3     0.8      1.0000    0.3565    1.0000
+            direct              0.115   0.126   1.804e+00 1.002e+00   1.0e-03     120.6    64.0     0.7      1.0000    0.3609    1.0000
+[34m[1mwandb[0m: [32m[41mERROR[0m Control-C detected -- Run data was not synced
+Traceback (most recent call last):0m uploading output.log 2.8KB/2.8KB (0.1s)
+  File "/allen/programs/mindscope/workgroups/auto-model/zihan.zhang/mpn_local_learning/scripts/train_common.py", line 847, in run_experiment
+    curves, align_curves = run_seed( uploading config.yaml 3.6KB/3.6KB (0.1s)
+  File "/allen/programs/mindscope/workgroups/auto-model/zihan.zhang/mpn_local_learning/scripts/train_common.py", line 433, in run_seed
+    grads = net.sequence_gradients(inputs, labels, mask, **loss_kw)
+  File "/allen/programs/mindscope/workgroups/auto-model/zihan.zhang/mpn_local_learning/core/mpn.py", line 2308, in sequence_gradients
+    grads = self._grads_for_rule(self.learning_rule, inputs, labels, masks, **kwargs)
+  File "/allen/programs/mindscope/workgroups/auto-model/zihan.zhang/mpn_local_learning/core/mpn.py", line 2273, in _grads_for_rule
+    return self.local_diag_rflo_gradients(inputs, labels, masks, **kwargs)
+  File "/allen/programs/mindscope/workgroups/auto-model/zihan.zhang/mpn_local_learning/core/mpn.py", line 2253, in local_diag_rflo_gradients
+    return self._local_sequence_gradients(inputs, labels, masks, 'diag', **kwargs)
+  File "/home/zihan.zhang/.conda/envs/mpn/lib/python3.9/site-packages/torch/utils/_contextlib.py", line 116, in decorate_context
+    return func(*args, **kwargs)
+  File "/allen/programs/mindscope/workgroups/auto-model/zihan.zhang/mpn_local_learning/core/mpn.py", line 2179, in _local_sequence_gradients
+    ell_h = self._same_time_boundary_signals(grad_output, phi_p,
+  File "/allen/programs/mindscope/workgroups/auto-model/zihan.zhang/mpn_local_learning/core/mpn.py", line 1955, in _same_time_boundary_signals
+    ell_h[0] = self.mp_layers[0].backproject_through_modulated_weights_fast(delta_0)
+  File "/allen/programs/mindscope/workgroups/auto-model/zihan.zhang/mpn_local_learning/core/mpn.py", line 671, in backproject_through_modulated_weights_fast
+    plastic = torch.bmm(ell_pre.unsqueeze(1), self.W.unsqueeze(0) * self.M).squeeze(1)
+KeyboardInterrupt
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/allen/programs/mindscope/workgroups/auto-model/zihan.zhang/mpn_local_learning/scripts/train_mpn.py", line 489, in <module>
+    main()
+  File "/allen/programs/mindscope/workgroups/auto-model/zihan.zhang/mpn_local_learning/scripts/train_mpn.py", line 485, in main
+    tc.run_experiment(_cfg())
+  File "/allen/programs/mindscope/workgroups/auto-model/zihan.zhang/mpn_local_learning/scripts/train_common.py", line 851, in run_experiment
+    wandb_logger.finish()
+  File "/allen/programs/mindscope/workgroups/auto-model/zihan.zhang/mpn_local_learning/scripts/wandb_logging.py", line 130, in finish
+    run.finish()
+  File "/home/zihan.zhang/.conda/envs/mpn/lib/python3.9/site-packages/wandb/sdk/wandb_run.py", line 411, in wrapper
+    return func(self, *args, **kwargs)
+  File "/home/zihan.zhang/.conda/envs/mpn/lib/python3.9/site-packages/wandb/sdk/wandb_run.py", line 456, in wrapper
+    return func(self, *args, **kwargs)
+  File "/home/zihan.zhang/.conda/envs/mpn/lib/python3.9/site-packages/wandb/sdk/wandb_run.py", line 2309, in finish
+    return self._finish(exit_code)
+  File "/home/zihan.zhang/.conda/envs/mpn/lib/python3.9/site-packages/wandb/sdk/wandb_run.py", line 411, in wrapper
+    return func(self, *args, **kwargs)
+  File "/home/zihan.zhang/.conda/envs/mpn/lib/python3.9/site-packages/wandb/sdk/wandb_run.py", line 2337, in _finish
+    self._atexit_cleanup(exit_code=exit_code)
+  File "/home/zihan.zhang/.conda/envs/mpn/lib/python3.9/site-packages/wandb/sdk/wandb_run.py", line 2531, in _atexit_cleanup
+    self._on_finish()
+  File "/home/zihan.zhang/.conda/envs/mpn/lib/python3.9/site-packages/wandb/sdk/wandb_run.py", line 2748, in _on_finish
+    wait_with_progress(
+  File "/home/zihan.zhang/.conda/envs/mpn/lib/python3.9/site-packages/wandb/sdk/mailbox/wait_with_progress.py", line 24, in wait_with_progress
+    return wait_all_with_progress(
+  File "/home/zihan.zhang/.conda/envs/mpn/lib/python3.9/site-packages/wandb/sdk/mailbox/wait_with_progress.py", line 78, in wait_all_with_progress
+    return asyncer.run(progress_loop_with_timeout)
+  File "/home/zihan.zhang/.conda/envs/mpn/lib/python3.9/site-packages/wandb/sdk/lib/asyncio_manager.py", line 137, in run
+    return future.result()
+  File "/home/zihan.zhang/.conda/envs/mpn/lib/python3.9/concurrent/futures/_base.py", line 441, in result
+    self._condition.wait(timeout)
+  File "/home/zihan.zhang/.conda/envs/mpn/lib/python3.9/threading.py", line 312, in wait
+    waiter.acquire()
+KeyboardInterrupt

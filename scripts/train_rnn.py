@@ -35,7 +35,7 @@ import tasks
 import train_common as tc
 
 # ─── Configuration (mirrors train_mpn.py) ─────────────────────────────────────
-SEED = np.random.randint(0, 2**32 - 1)  # random seed for this run
+SEED = np.random.randint(0, 1000)  # random seed for this run (small → short run names)
 RULESET = "seqmnist_pixel"           # single task to train on
 RULES_TO_RUN = ["bptt", "local_diag_rflo"]   # rules to compare
 # 'exact_spatial' = true gradient; the random modes ('layerwise_fa', 'direct_fa')

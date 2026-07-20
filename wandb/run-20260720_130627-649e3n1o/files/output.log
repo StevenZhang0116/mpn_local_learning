@@ -1,0 +1,24 @@
+[34m[1mwandb[0m: Tracking run with wandb version 0.26.1q2 (0.0s)
+[34m[1mwandb[0m: Run data is saved locally in [35m[1m/allen/programs/mindscope/workgroups/auto-model/zihan.zhang/mpn_local_learning/wandb/run-20260720_130629-c6dzblq2[0m
+[34m[1mwandb[0m: Run [1m`wandb offline`[0m to turn off syncing.
+[34m[1mwandb[0m: Syncing run [33mlocal_direct__seed1282395972[0m
+[34m[1mwandb[0m: ⭐️ View project at [34m[4mhttps://wandb.ai/allen-neuro-foundation-model/mpn_local_learning[0m
+[34m[1mwandb[0m: 🚀 View run at [34m[4mhttps://wandb.ai/allen-neuro-foundation-model/mpn_local_learning/runs/c6dzblq2[0m
+MultiPlastic Net:
+  output neurons: 3
+  Act: tanh
+
+  MP Layer1 parameters:
+    n_neurons - input: 200, output: 200
+    M matrix parameters:      type: mult // Update - type: hebb_assoc // Act fn: linear
+      Eta: scalar (fixed) // Lambda: scalar (fixed) // Lambda_max: 0.99 (tau: 4.0e+03)
+  seed 1282395972:
+      step  rule               acc tr  acc va     loss tr   loss va        lr    fwd ms  bwd ms  opt ms     cos Win     cos W  cos Wout
+[34m[1mwandb[0m: 🚀 View run [33mbptt__seed1282395972[0m at: [34m[4mhttps://wandb.ai/allen-neuro-foundation-model/mpn_local_learning/runs/gwedm4zl[0m
+[34m[1mwandb[0m: ⭐️ View project at: [34m[4mhttps://wandb.ai/allen-neuro-foundation-model/mpn_local_learning[0m
+[34m[1mwandb[0m: Synced 5 W&B file(s), 0 media file(s), 0 artifact file(s) and 0 other file(s)
+[34m[1mwandb[0m: Find logs at: [35m[1m./wandb/run-20260720_130623-gwedm4zl/logs[0m
+[34m[1mwandb[0m: 🚀 View run [33mlocal_exact_rowlocal__seed1282395972[0m at: [34m[4mhttps://wandb.ai/allen-neuro-foundation-model/mpn_local_learning/runs/wpyauhss[0m
+[34m[1mwandb[0m: ⭐️ View project at: [34m[4mhttps://wandb.ai/allen-neuro-foundation-model/mpn_local_learning[0m
+[34m[1mwandb[0m: Synced 5 W&B file(s), 0 media file(s), 0 artifact file(s) and 0 other file(s)
+[34m[1mwandb[0m: Find logs at: [35m[1m./wandb/run-20260720_130626-wpyauhss/logs[0m
