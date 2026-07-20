@@ -111,13 +111,20 @@ class WandbLogger:
         self.runs = {}
         for rule in cfg.rules_to_run:
             # rule + the output save-stem (== experiment/group) + the short seed.
-            self.runs[rule] = wandb.init(
+            run = wandb.init(
                 name=f"{rule}_{experiment}_seed{seed}",
                 job_type=rule,
                 tags=tags,
                 config={**base, "rule": rule, "seed": int(seed), "run_idx": run_idx},
                 **common,
             )
+            # Pin the TRAINING STEP as the x-axis for every metric so each metric
+            # renders as a LINE over the learning trajectory (not a per-run bar).
+            # Use the run-object method (NOT the global wandb.define_metric) because
+            # K runs are live at once here — the global one is ambiguous across them.
+            run.define_metric("step")
+            run.define_metric("*", step_metric="step")
+            self.runs[rule] = run
 
     def log_step(self, rule, step, metrics):
         run = self.runs.get(rule)
@@ -125,9 +132,12 @@ class WandbLogger:
             return
         payload = _clean(metrics)
         if payload:
-            # step=training step → the chart x-axis IS the training step, shared
-            # across every run in the group.
-            run.log(payload, step=int(step))
+            # The training step travels IN the payload as the "step" metric (the
+            # x-axis defined above), so every key plots as a line vs training step,
+            # shared across every run in the group. No step= kwarg — the custom
+            # step_metric drives the axis.
+            payload["step"] = int(step)
+            run.log(payload)
 
     def finish(self):
         for run in self.runs.values():
@@ -159,12 +169,15 @@ def log_summary(cfg, experiment, fig_path, align_fig_path, final_summary):
             imgs["figures/grad_alignment"] = wandb.Image(align_fig_path)
         if imgs:
             run.log(imgs)
+        # Final-metric table (rule × mean/std). NOTE: deliberately NOT logged as
+        # per-rule summary scalars (`final/<rule>/...`) — W&B renders single-value-
+        # per-run metrics as BAR panels, which is exactly the bar plot we want to
+        # avoid. The learning trajectory lives in the per-rule runs' line charts;
+        # this table is the only end-of-run scalar view.
         table = wandb.Table(
             columns=["rule", "train_mean", "train_std", "test_mean", "test_std"])
         for rule_label, vals in final_summary.items():
             table.add_data(rule_label, *vals)
-            run.summary[f"final/{rule_label}/train_mean"] = vals[0]
-            run.summary[f"final/{rule_label}/test_mean"] = vals[2]
         run.log({"final_metrics": table})
     finally:
         run.finish()
