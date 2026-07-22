@@ -107,8 +107,24 @@ INPUT_NORM_SAMPLE = 2048      # #trials sampled to estimate the fixed input stat
 # the Hebbian write still uses the block activation) and leaves BPTT exact. A skip is
 # inserted only where an MP layer's input/output widths MATCH (identity needs equal
 # widths); unequal-width layers are skipped with a warning. Use EQUAL stacked widths
-# (e.g. --hidden 128 128) to exercise it on a deep stack. Off by default. --residual.
+# (e.g. --hidden 128 128) to exercise it on a deep stack. --residual.
+# AUTO-DEACTIVATION: residual is a MULTI-MP-LAYER feature, so it is used ONLY when
+# there are >=2 MP layers (see _mp_residual). A single-MP-layer stack forces it OFF
+# regardless of this flag / --residual (the lone skip would just wrap embedding→MP,
+# not an inter-block residual). So this True is a no-op until N_HIDDEN is a list.
 MP_RESIDUAL = True
+_MP_RESIDUAL_NOTICE_SHOWN = False   # so the auto-disable notice prints at most once
+# Cross-layer TEMPORAL correction depth for the local rules (dmpn, multi-MP-layer).
+# The base local rules credit each hidden layer with a same-time inter-layer signal
+# only, DROPPING the temporal paths through the plastic state of the layers above it.
+# CROSS_LAYER_STEPS=1 adds back the exact leading (one-temporal-hop) term, which makes
+# every layer's gradient exact vs BPTT at T=2 and strictly improves the lower-layer
+# gradients at longer T (see mpn.DeepMultiPlasticNet._cross_layer_correction and
+# tests/validate_local_learning tier17). It costs one extra downward adjoint sweep +
+# a step of stored state per training step, and applies to every non-bptt rule
+# (bptt is already exact). 0 (default) = the pure same-time rule, byte-for-byte as
+# before. Only 0 and 1 are implemented. --cross-layer-steps on CLI.
+CROSS_LAYER_STEPS = 1
 N_RUNS = 2                    # independent seeds per rule
 # Hidden width(s) of the MP-layer stack. A single int → one MP layer (the classic
 # in→hidden→out net). A list of ints → one MP layer per width, i.e. a DEEP MP
@@ -157,6 +173,18 @@ def _hidden_widths():
     if isinstance(N_HIDDEN, (list, tuple)):
         return [int(w) for w in N_HIDDEN]
     return [int(N_HIDDEN)]
+
+
+def _mp_residual():
+    """Effective mp_residual after auto-deactivation. Identity skip connections are
+    a MULTI-MP-LAYER feature: with only ONE MP layer the sole skip would wrap that
+    layer around the embedding (embedding→MP), which is not the inter-block residual
+    this flag is meant to exercise. So residual is used ONLY when TWO OR MORE MP
+    layers are present (a genuine deep stack); a single-MP-layer stack forces it OFF
+    regardless of the MP_RESIDUAL global/--residual. This is the single source of
+    truth routed to BOTH the net (build_params) and the run metadata (_cfg → filename
+    / title / config JSON / W&B), so they never disagree."""
+    return bool(MP_RESIDUAL) and len(_hidden_widths()) >= 2
 
 
 def build_params():
@@ -219,6 +247,17 @@ def build_params():
         raise ValueError(
             "--residual (identity skip connections) is implemented for dmpn only; "
             "use --net dmpn.")
+    # Auto-deactivation: residual is a multi-MP-layer feature (see _mp_residual). A
+    # single-MP-layer dmpn forces it OFF even if MP_RESIDUAL/--residual is set, and
+    # says so ONCE (build_params runs per seed + in path helpers), so the user isn't
+    # surprised the flag had no effect but isn't spammed either.
+    global _MP_RESIDUAL_NOTICE_SHOWN
+    if (MP_RESIDUAL and NET_TYPE == "dmpn" and len(widths) < 2
+            and not _MP_RESIDUAL_NOTICE_SHOWN):
+        print("  [mp_residual] auto-DISABLED: only one MP layer — identity skip "
+              "connections apply to deep (>=2 MP-layer) stacks. Pass several --hidden "
+              "widths (e.g. --hidden 128 128) to use them.")
+        _MP_RESIDUAL_NOTICE_SHOWN = True
 
     net_params = {
         "net_type": NET_TYPE,            # 'dmpn' or 'mpn1'
@@ -237,7 +276,8 @@ def build_params():
         "learning_rule": "bptt",         # overwritten per rule below
         "feedback_mode": FEEDBACK_MODE,
         "input_normalize": INPUT_NORMALIZE,  # fixed per-feature input standardization
-        "mp_residual": MP_RESIDUAL,      # identity skip around each equal-width MP block
+        "mp_residual": _mp_residual(),   # identity skip around each equal-width MP block (>=2 MP layers)
+        "cross_layer_steps": CROSS_LAYER_STEPS,  # depth-1 cross-layer temporal correction
         "input_mode": INPUT_MODE,        # input-embedding rule (match/exact/three_factor)
         "ml_params": {
             "bias": True,
@@ -359,7 +399,7 @@ def _cfg():
         seed=SEED, ruleset=RULESET, rules_to_run=RULES_TO_RUN,
         feedback_mode=FEEDBACK_MODE,
         input_normalize=INPUT_NORMALIZE, input_norm_sample=INPUT_NORM_SAMPLE,
-        mp_residual=MP_RESIDUAL,
+        mp_residual=_mp_residual(), cross_layer_steps=CROSS_LAYER_STEPS,
         input_mode=INPUT_MODE, n_runs=N_RUNS, n_hidden=_hidden_widths()[0],
         batch=BATCH, n_datasets=N_DATASETS, lr=LR, grad_clip=GRAD_CLIP,
         log_every=LOG_EVERY, device=DEVICE, dtype=DTYPE,
@@ -445,6 +485,13 @@ def _parse_args():
                         "inter-layer signal), BPTT stays exact. Needs equal stacked "
                         "widths (e.g. --hidden 128 128); unequal layers skip it with a "
                         "warning. Default: %(default)s.")
+    p.add_argument("--cross-layer-steps", type=int, choices=[0, 1],
+                   default=CROSS_LAYER_STEPS,
+                   help="depth of the cross-layer TEMPORAL correction to the local "
+                        "rules (dmpn, multi-MP-layer): 0 = pure same-time surrogate "
+                        "(default); 1 = add the exact one-temporal-hop term (exact vs "
+                        "BPTT at T=2, improves lower layers at longer T). Applies to "
+                        "every non-bptt rule. Costs one extra adjoint sweep/step.")
     p.add_argument("--wandb", dest="use_wandb", action="store_true", default=USE_WANDB,
                    help="log to Weights & Biases (https://wandb.ai): one run per "
                         "(rule × seed), all grouped under this run's output save-stem "
@@ -464,7 +511,7 @@ def _parse_args():
 
 def main():
     global NET_TYPE, RULESET, N_RUNS, N_HIDDEN, N_DATASETS, FEEDBACK_MODE
-    global INPUT_MODE, INPUT_NORMALIZE, MP_RESIDUAL
+    global INPUT_MODE, INPUT_NORMALIZE, MP_RESIDUAL, CROSS_LAYER_STEPS
     global USE_WANDB, WANDB_PROJECT, WANDB_ENTITY, WANDB_MODE
     args = _parse_args()
     NET_TYPE = args.net
@@ -478,6 +525,7 @@ def main():
     INPUT_MODE = args.input_mode
     INPUT_NORMALIZE = args.input_normalize
     MP_RESIDUAL = args.residual
+    CROSS_LAYER_STEPS = args.cross_layer_steps
     USE_WANDB = args.use_wandb
     WANDB_PROJECT = args.wandb_project
     WANDB_ENTITY = args.wandb_entity

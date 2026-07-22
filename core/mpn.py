@@ -1565,6 +1565,21 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
         # per-layer FA buffers built after the MP layers exist.
         self.feedback_mode = canonical_feedback_mode(cfg.get('feedback_mode', 'exact_spatial'))
         self._B_feedback_init = cfg.get('B_feedback_init', 'xavier')
+        # cross_layer_steps: depth of the cross-layer TEMPORAL correction added to the
+        # surrogate lower-layer local gradients (see _cross_layer_correction). 0 (the
+        # default) = the pure same-time rule, byte-identical to before. 1 = the exact
+        # depth-1 (one-temporal-hop) correction: each layer n is credited through the
+        # Hebbian M-writes of EVERY upper layer m>n at the previous step, which makes
+        # every layer's gradient exact vs BPTT at T=2 (the dropped series has one term
+        # there). Only k=1 is implemented; k>1 (deeper truncated BPTT-through-plasticity)
+        # is a future extension and is rejected below. The correction is orthogonal to
+        # feedback_mode — it reuses whatever spatial operator that mode defines — and to
+        # the per-layer eligibility mode (it uses each layer's own E).
+        self.cross_layer_steps = int(cfg.get('cross_layer_steps', 0))
+        if self.cross_layer_steps not in (0, 1):
+            raise NotImplementedError(
+                f"cross_layer_steps={self.cross_layer_steps}: only 0 (same-time) and 1 "
+                f"(exact depth-1 temporal correction) are implemented.")
 
         super().__init__(cfg, cfg['n_neurons'][-2], output_matrix=self.output_matrix, verbose=verbose)
 
@@ -1959,6 +1974,75 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
 
         return ell_h
 
+    def _cross_layer_correction(self, grad_W, grad_b, ell_h, phi_p, h, eta_lam,
+                                prev_E, prev_R, prev_ablock, prev_hstream, prev_phi,
+                                prev_Weff):
+        """Add the exact depth-1 (one-temporal-hop) cross-layer correction to grad_W
+        and grad_b IN PLACE, for the current step t (>0), from the PREVIOUS step's
+        Hebbian M-writes. Only the same-time surrogate is dropped by the base local
+        rule; this restores the leading temporal term, making every hidden layer's
+        WEIGHT AND BIAS gradient exact vs BPTT at T=2 (where the dropped series has a
+        single term) under exact row-local eligibility.
+
+        Derivation (verified to machine precision by the T=2 oracle). Layer q-1's
+        weight/bias reaches L_t one temporal hop earlier through the M-write of EVERY
+        upper layer m≥q at step t-1: {W,b}[q-1] → h_stream[q]_{t-1} (= prev_E[q-1] for
+        the weight, prev_R[q-1] for the bias) → M[m]_{t-1} → z[m]_t → … → L_t. The
+        write M[m]_{ki}=η a[m]_k h[m]_i depends on {W,b}[q-1] through BOTH factors:
+          PRE  (∂/∂ the pre h[m]_i):  a[m]_{k,t-1} carried as prev_ablock[m];
+          POST (∂/∂ the post a[m]_k): a[m]_{k,t-1} itself depends on h_stream[m]_{t-1},
+               backprojected through W_eff[m]_{t-1} (= prev_Weff[m] = W(1+M_{t-2})).
+        The loss-sensitivity covector to that write is S_ki = δ[m]_k W[m]_{ki} h[m]_{i,t}
+        with δ[m]_t = ell_h[m+1]_t·φ'(z[m]_t). Both brackets share the SAME downward
+        route from h[m]_{t-1} to h_stream[q]_{t-1} through the intervening frozen
+        same-time Jacobians, so the whole thing regroups into ONE O(L·width²) adjoint
+        sweep: build a source covector v[m] at each upper layer, then descend, folding
+        each source in and backprojecting through the t-1 layer Jacobians (weight path +
+        residual identity). At each boundary the SAME accumulated adjoint `acc` is
+        contracted with prev_E[q-1] for the weight AND with prev_R[q-1] for the bias
+        (b[q-1] feeds h_stream[q]_{t-1} exactly as W[q-1] does, so it shares the whole
+        downstream path — only the intra-layer eligibility differs). NOTE the two weight
+        operators differ: the PRE bracket uses the RAW W[m] (current-step pre h[m]_t),
+        the POST bracket and the downward Jacobian use the EFFECTIVE W_eff[m]_{t-1};
+        conflating them breaks T=2 exactness."""
+        layers = self.mp_layers
+        L = len(layers)
+
+        # Source covector v[m] living at stream position h[m], for each upper plastic
+        # layer m = 1..L-1 (layer 0 has nothing below it to credit; the readout is
+        # non-plastic so no adjoint descends from h[L]).
+        v = [None] * L
+        for m in range(1, L):
+            delta = ell_h[m + 1] * phi_p[m]                       # (B, out_m)
+            We = layers[m].W * eta_lam[m][0]                      # W[m]·η[m]  (out_m, in_m)
+            # PRE bracket: post factor a[m]_{t-1} fixed (prev_ablock), pre index carried.
+            wk = delta * prev_ablock[m]                           # (B, out_m)
+            u_pre = torch.einsum('Bk,ki->Bi', wk, We) * h[m]      # (B, in_m)
+            # POST bracket: pre factor h[m]_{t-1} fixed, post a[m]_{t-1} backprojected
+            # one layer-m hop through W_eff[m]_{t-1}.
+            coef_post = delta * prev_phi[m] * torch.einsum(
+                'ki,Bi,Bi->Bk', We, h[m], prev_hstream[m])        # (B, out_m)
+            u_post = torch.einsum('Bk,Bki->Bi', coef_post, prev_Weff[m])   # (B, in_m)
+            v[m] = u_pre + u_post
+
+        # Downward adjoint sweep (t-1 Jacobians). acc holds dL_t/dh_stream[q]_{t-1}
+        # along the one-hop path; at each boundary credit W[q-1] via prev_E[q-1] and
+        # b[q-1] via prev_R[q-1] (the SAME acc — weight & bias share the downstream path).
+        acc = None
+        for q in range(L - 1, 0, -1):
+            if acc is None:
+                acc = v[q]
+            else:
+                # backproject the adjoint at h[q+1] down through layer q (t-1 forward):
+                # weight path r·φ'(z[q])_{t-1}·W_eff[q]_{t-1}, plus identity if a skip.
+                r = acc * prev_phi[q]
+                down = torch.einsum('Ba,Bai->Bi', r, prev_Weff[q])
+                if self._residual_at[q]:
+                    down = down + acc
+                acc = v[q] + down
+            grad_W[q - 1] = grad_W[q - 1] + torch.einsum('Bc,Bcd->cd', acc, prev_E[q - 1])
+            grad_b[q - 1] = grad_b[q - 1] + torch.einsum('Bc,Bc->c', acc, prev_R[q - 1])
+
     def _trainable_params(self):
         """Trainable tensors this net computes gradients for, keyed by name.
         The first MP layer keeps the bare keys 'W'/'b' (back-compat with the
@@ -2128,6 +2212,34 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
         grad_W = [torch.zeros_like(mp.W) for mp in layers]
         grad_b = [torch.zeros_like(mp.b) for mp in layers]
 
+        # Cross-layer depth-1 temporal correction (see _cross_layer_correction). Only
+        # active with cross_layer_steps>0 AND more than one MP layer (a single layer has
+        # no upper neighbor to route temporal credit through). It needs each layer's
+        # per-step eligibility E[n] and one step of history, so it keeps the PREVIOUS
+        # step's (E, block activation, stream, phi', W_eff) per layer. When off, none of
+        # this is allocated and the loop is byte-identical to before.
+        do_cross = (self.cross_layer_steps >= 1) and (L > 1)
+        if do_cross:
+            prev_E = [None] * L        # E[n]_{t-1} = dh_stream[n+1]/dW[n]  (B,out_n,in_n)
+            prev_R = [None] * L        # R[n]_{t-1} = dh_stream[n+1]/db[n]  (B,out_n)
+            prev_ablock = [None] * L   # block activation a[n]_{t-1}        (B,out_n)
+            prev_hstream = [None] * (L + 1)   # residual stream h[.]_{t-1}
+            prev_phi = [None] * L      # phi'(z[n])_{t-1}                   (B,out_n)
+            prev_Weff = [None] * L     # W_eff[n] the t-1 forward CONSUMED = W(1+M_{t-2})
+            # Per-layer eligibility + trace-advance callables for the explicit path the
+            # correction needs (resolved once, like step_fns). Direct mode has no trace.
+            compute_elig, update_trace = [], []
+            for mp in layers:
+                if mode == 'exact':
+                    compute_elig.append(mp.compute_exact_rowlocal_eligibility)
+                    update_trace.append(mp.update_exact_rowlocal_traces)
+                elif mode == 'diag':
+                    compute_elig.append(mp.compute_diag_rflo_eligibility)
+                    update_trace.append(mp.update_diag_rflo_traces)
+                else:  # direct: no plastic trace to advance
+                    compute_elig.append(mp.compute_direct_local_eligibility)
+                    update_trace.append(None)
+
         # Time-major, contiguous views (see MultiPlasticNet._local_sequence_gradients).
         inputs_T = inputs.transpose(0, 1).contiguous()
         labels_T = labels.transpose(0, 1).contiguous()
@@ -2188,12 +2300,42 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
                     u_seq[t] = u_t
 
             # 5. Per-layer local gradient + trace advance.
-            for n, mp in enumerate(layers):
-                eta_n, lam_n = eta_lam[n]
-                grad_W_t, grad_b_t = step_fns[n](
-                    h[n], phi_p[n], ell_h[n + 1], eta_n, lam_n, um)
-                grad_W[n] += grad_W_t
-                grad_b[n] += grad_b_t
+            if not do_cross:
+                # Fast path (default): the fused per-mode step (no E materialized for
+                # diag/direct). Byte-identical to before.
+                for n, mp in enumerate(layers):
+                    eta_n, lam_n = eta_lam[n]
+                    grad_W_t, grad_b_t = step_fns[n](
+                        h[n], phi_p[n], ell_h[n + 1], eta_n, lam_n, um)
+                    grad_W[n] += grad_W_t
+                    grad_b[n] += grad_b_t
+            else:
+                # Cross-layer correction needs each layer's per-step eligibility E, so
+                # use the explicit compute+update path (algebraically identical to the
+                # fused step — same grads — but exposes E). W_eff at THIS step uses the
+                # frozen M_{t-1}, captured BEFORE the step-6 M advance for next step's
+                # correction (it must read M_{t-2}).
+                cur_E = [None] * L
+                cur_R = [None] * L
+                cur_Weff = [mp.W * (1.0 + mp.M) for mp in layers]   # W(1+M_{t-1})
+                for n, mp in enumerate(layers):
+                    E_n, R_n = compute_elig[n](h[n], phi_p[n])
+                    grad_W[n] += torch.einsum('Bi,BiI->iI', ell_h[n + 1], E_n)
+                    grad_b[n] += torch.einsum('Bi,Bi->i', ell_h[n + 1], R_n)
+                    cur_E[n] = E_n
+                    cur_R[n] = R_n
+                # Depth-1 temporal correction from the PREVIOUS step's writes (t>0).
+                # Corrects BOTH grad_W (via prev_E) and grad_b (via prev_R).
+                if t > 0:
+                    self._cross_layer_correction(
+                        grad_W, grad_b, ell_h, phi_p, h, eta_lam,
+                        prev_E, prev_R, prev_ablock, prev_hstream, prev_phi, prev_Weff)
+                # Advance the intra-layer traces (exact/diag keep a trace; direct has
+                # none). Uses the just-computed cur_E/cur_R, exactly like the fused step.
+                for n, mp in enumerate(layers):
+                    if update_trace[n] is not None:
+                        update_trace[n](h[n], cur_E[n], cur_R[n],
+                                        update_mask=um, eta_lam=eta_lam[n])
             # 6. Only now advance every layer's M from M_{t-1} to M_t. h is the
             #    residual stream; the Hebbian write uses the block activation
             #    a_n = h[n+1]-h[n] wherever a skip is active (identity residual).
@@ -2202,6 +2344,19 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
                 post = h[n + 1] - h[n] if self._residual_at[n] else h[n + 1]
                 mp.update_M_matrix_local_fast(
                     h[n], post, eta=eta_n, lam=lam_n, update_mask=um)
+
+            # Stash this step's state for next step's depth-1 correction (post-M-advance
+            # is fine: the correction reads none of the just-advanced M; W_eff was
+            # captured pre-advance as cur_Weff = W(1+M_{t-1})).
+            if do_cross:
+                for n in range(L):
+                    prev_E[n] = cur_E[n]
+                    prev_R[n] = cur_R[n]
+                    prev_ablock[n] = (h[n + 1] - h[n]) if self._residual_at[n] else h[n + 1]
+                    prev_phi[n] = phi_p[n]
+                    prev_Weff[n] = cur_Weff[n]
+                for n in range(L + 1):
+                    prev_hstream[n] = h[n]
 
             go_seq[t] = grad_output
             hid_seq[t] = h[-1]

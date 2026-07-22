@@ -270,17 +270,21 @@ def tier5_direct_local():
     print(f"  [{'PASS' if ok_b else 'FAIL'}] eta=0 direct == BPTT        {fmt(d_b, keys)}")
 
     # (c) direct grad_W == diagonal RFLO grad_W with A forced to 0 each step.
+    # The diag path is FUSED (_local_step_diag updates A inline); it no longer calls
+    # update_diag_rflo_traces, so patch the fused step to zero A after each call
+    # (patching update_diag_rflo_traces would be a dead no-op — the stale-test bug).
     net = build_net(5, 7, 3, 'tanh', True, True, 'scalar', 'scalar', 'local_direct', seed=2)
     inp, lab, msk, _ = make_data(4, 12, 5, 3)
     gd = net.local_direct_gradients(inp, lab, msk)
     mp_layer = net.mp_layer
-    orig = mp_layer.update_diag_rflo_traces
-    def _a_zero(xx, E, R, update_mask=None):
-        orig(xx, E, R, update_mask=update_mask)
+    orig = mp_layer._local_step_diag
+    def _a_zero(x, phi_prime, ell, eta, lam, update_mask=None):
+        gW, gb = orig(x, phi_prime, ell, eta, lam, update_mask=update_mask)
         mp_layer.A.zero_()
-    mp_layer.update_diag_rflo_traces = _a_zero
+        return gW, gb
+    mp_layer._local_step_diag = _a_zero
     gdiag0 = net.local_diag_rflo_gradients(inp, lab, msk)
-    mp_layer.update_diag_rflo_traces = orig
+    mp_layer._local_step_diag = orig
     w_rel = (gd['W'] - gdiag0['W']).abs().max().item() / max(gdiag0['W'].abs().max().item(), 1e-12)
     ok_c = w_rel < 1e-10
     allok &= ok_c
@@ -1223,6 +1227,134 @@ def tier16_mp_residual():
     return allok
 
 
+def tier17_cross_layer_steps():
+    """Depth-1 cross-layer TEMPORAL correction (mpn.DeepMultiPlasticNet
+    cross_layer_steps / _cross_layer_correction). The base local rules drop the
+    temporal paths through the plastic state of UPPER layers; cross_layer_steps=1
+    restores the leading (one-temporal-hop) term. Ground truth: at T=2 the dropped
+    series has exactly ONE term, so the corrected local grad must equal BPTT there.
+    Invariants (deep dmpn stacks, exact_spatial):
+      (a) cross_layer_steps=0 is a NO-OP: grads byte-identical to a net built with the
+          key absent, for every rule (deepcopy so weights are identical).
+      (b) at T=1 the correction is inert: cross=1's explicit eligibility path gives
+          grads byte-identical to cross=0's fused path (isolates the base rewrite).
+      (c) THE headline: at T=2, cross=1 == BPTT (~1e-12) for every MP-layer WEIGHT AND
+          BIAS (the correction credits grad_b too, via prev_R), across 2/3/4-layer
+          stacks, scalar & matrix eta/lam, and residual-on.
+      (d) at T>=3 the correction is not exact (depth-2+ tail remains) but STRICTLY
+          IMPROVES the lower-layer weights AND biases vs cross=0.
+      (e) freeze ALL upper-layer eta → the correction term vanishes (its coefficient
+          carries the upper eta), so cross=1 == cross=0 exactly (the dropped paths
+          are exactly the ones an upper eta=0 removes).
+    SCOPE of the T=2 exactness claim (all satisfied here): exact_spatial feedback
+    (the correction reads the true W, not the FA random matrices) and exact row-local
+    intra-layer eligibility (diag/direct's own-M path is itself a surrogate at t=1, so
+    cross=1 IMPROVES but is not T=2-exact for them). The trainable input embedding
+    W_in keeps its same-time 3-factor rule (its cross-layer temporal term is not
+    corrected), so full-gradient T=2 exactness incl. W_in needs input_mode='exact' or
+    a frozen embedding; here the tier nets have no embedding, so it does not arise.
+    """
+    print("── Tier 17: cross-layer depth-1 temporal correction (cross_layer_steps) ──")
+    import copy as _copy
+    allok = True
+
+    def build(arch, cross, matrix_eta=False, residual=False, seed=3, etas=None):
+        torch.manual_seed(seed)
+        npar = {'n_neurons': arch, 'loss_type': 'MSE', 'activation': 'tanh',
+                'output_bias': True, 'output_matrix': '', 'dt': 40,
+                'feedback_mode': 'exact_spatial', 'mp_residual': residual,
+                'cross_layer_steps': cross, 'learning_rule': 'local_exact_rowlocal',
+                'ml_params': {'bias': True, 'mp_type': 'mult', 'm_update_type': 'hebb_assoc',
+                              'm_activation': 'linear', 'modulation_bounds': False,
+                              'eta_type': 'matrix' if matrix_eta else 'scalar', 'eta_train': False,
+                              'lam_type': 'matrix' if matrix_eta else 'scalar',
+                              'lam_train': False, 'm_time_scale': 400, 'W_freeze': False}}
+        net = mpn.DeepMultiPlasticNet(npar, verbose=False).double()
+        with torch.no_grad():
+            for j, m in enumerate(net.mp_layers):
+                if matrix_eta:
+                    m.eta.copy_(0.08 + 0.05 * torch.rand_like(m.eta))
+                    m.lam.copy_(0.5 * m.lam_clamp + 0.3 * m.lam_clamp * torch.rand_like(m.lam))
+                else:
+                    m.eta.fill_(etas[j] if etas else 0.10 + 0.02 * j)
+                    m.lam.fill_(0.6 * m.lam_clamp)
+        return net
+
+    def wk(net):
+        # ALL MP-layer trainable tensors — weights AND biases — so the T=2 exactness
+        # check covers grad_b too (the correction must credit the bias, not just W).
+        L = len(net.mp_layers)
+        ks = []
+        for n in range(L):
+            sfx = '' if n == 0 else str(n)
+            ks += [f'W{sfx}', f'b{sfx}']
+        return ks
+
+    # (a) no-op at cross=0 (identical weights via deepcopy).
+    net0 = build([5, 6, 7, 3], 0, matrix_eta=True, seed=7)
+    netK = _copy.deepcopy(net0); netK.cross_layer_steps = 0
+    inp, lab, msk, _ = make_data(3, 6, 5, 3)
+    g0, gK = net0.local_gradients(inp, lab, msk), netK.local_gradients(inp, lab, msk)
+    d_a = max((g0[k] - gK[k]).abs().max().item() for k in g0 if k not in ('loss', 'outputs'))
+    ok_a = d_a < 1e-14
+    allok &= ok_a
+    print(f"  [{'PASS' if ok_a else 'FAIL'}] cross=0 no-op (d={d_a:.1e})")
+
+    # (b) T=1 correction inert: explicit(cross=1) == fused(cross=0).
+    netf = build([5, 6, 7, 3], 0, matrix_eta=True, seed=2)
+    netc = _copy.deepcopy(netf); netc.cross_layer_steps = 1
+    inp1, lab1, msk1, _ = make_data(3, 1, 5, 3)
+    d_b = max((netf.local_gradients(inp1, lab1, msk1)[k]
+               - netc.local_gradients(inp1, lab1, msk1)[k]).abs().max().item()
+              for k in ('W', 'W1', 'W_output'))
+    ok_b = d_b < 1e-14
+    allok &= ok_b
+    print(f"  [{'PASS' if ok_b else 'FAIL'}] T=1 explicit==fused base path (d={d_b:.1e})")
+
+    # (c) T=2 == BPTT across configs.
+    ok_c = True
+    for name, arch, meta, resid in [("2L", [4, 5, 6, 3], False, False),
+                                    ("3L", [4, 5, 6, 7, 3], False, False),
+                                    ("3L-mat", [4, 5, 6, 7, 3], True, False),
+                                    ("4L-mat", [4, 5, 6, 7, 8, 3], True, False),
+                                    ("3L-res", [6, 6, 6, 6, 3], False, True)]:
+        net = build(arch, 1, matrix_eta=meta, residual=resid, seed=3)
+        inp, lab, msk, _ = make_data(3, 2, arch[0], arch[-1])
+        ref, loc = net.bptt_gradients(inp, lab, msk), net.local_gradients(inp, lab, msk)
+        worst = max((loc[k] - ref[k]).abs().max().item() / max(ref[k].abs().max().item(), 1e-30)
+                    for k in wk(net))
+        okm = worst < 1e-10
+        ok_c &= okm
+        print(f"  [{'PASS' if okm else 'FAIL'}] {name:7} T=2 cross=1 == BPTT (worst rel={worst:.1e})")
+    allok &= ok_c
+
+    # (d) T=3 improves over cross=0 on the lower weights AND biases.
+    net_c = build([4, 5, 6, 7, 3], 1, matrix_eta=True, seed=3)
+    net_0 = build([4, 5, 6, 7, 3], 0, matrix_eta=True, seed=3)
+    inp, lab, msk, _ = make_data(3, 3, 4, 3)
+    ref = net_c.bptt_gradients(inp, lab, msk)
+    lower = ('W', 'W1', 'b', 'b1')     # lower-layer weights + biases
+    rc = max((net_c.local_gradients(inp, lab, msk)[k] - ref[k]).abs().max().item()
+             / max(ref[k].abs().max().item(), 1e-30) for k in lower)
+    r0 = max((net_0.local_gradients(inp, lab, msk)[k] - ref[k]).abs().max().item()
+             / max(ref[k].abs().max().item(), 1e-30) for k in lower)
+    ok_d = rc < r0
+    allok &= ok_d
+    print(f"  [{'PASS' if ok_d else 'FAIL'}] T=3 cross improves lower W+b ({rc:.1e} < {r0:.1e})")
+
+    # (e) freeze all upper eta → correction vanishes (cross=1 == cross=0), W and b.
+    net_c = build([4, 5, 6, 7, 3], 1, seed=3, etas=[0.12, 0.0, 0.0])
+    net_0 = _copy.deepcopy(net_c); net_0.cross_layer_steps = 0
+    inp, lab, msk, _ = make_data(3, 4, 4, 3)
+    d_e = max((net_c.local_gradients(inp, lab, msk)[k]
+               - net_0.local_gradients(inp, lab, msk)[k]).abs().max().item()
+              for k in ('W', 'W1', 'b', 'b1'))
+    ok_e = d_e < 1e-12
+    allok &= ok_e
+    print(f"  [{'PASS' if ok_e else 'FAIL'}] freeze upper eta → correction vanishes (d={d_e:.1e})")
+    return allok
+
+
 def main():
     torch.set_default_dtype(torch.float64)
     print("Validating local-learning rules vs autograd (BPTT), float64\n")
@@ -1242,6 +1374,7 @@ def main():
         tier14_input_normalize(),
         tier15_embed_partial_freeze(),
         tier16_mp_residual(),
+        tier17_cross_layer_steps(),
         tier4_real_task(),
     ]
     print("\n" + ("ALL CHECKS PASSED" if all(results) else "SOME CHECKS FAILED"))

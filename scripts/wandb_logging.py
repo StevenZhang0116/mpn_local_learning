@@ -69,6 +69,7 @@ def _base_config(cfg, experiment):
         "input_mode": getattr(cfg, "input_mode", "match"),
         "input_normalize": getattr(cfg, "input_normalize", False),
         "mp_residual": getattr(cfg, "mp_residual", False),
+        "cross_layer_steps": getattr(cfg, "cross_layer_steps", 0),
         "batch": cfg.batch,
         "n_datasets": cfg.n_datasets,
         "lr": cfg.lr,

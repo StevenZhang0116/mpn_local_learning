@@ -91,6 +91,11 @@ class RunConfig:
     # a "_res" filename fragment + a figure-title note); the net reads it from
     # net_params. False (default) keeps logs/filenames byte-for-byte as before.
     mp_residual: bool = False
+    # Cross-layer temporal correction depth for the local rules (dmpn; see
+    # mpn.DeepMultiPlasticNet cross_layer_steps). Presentation only here (a "_xl{k}"
+    # filename fragment + a figure-title note); the net reads it from net_params.
+    # 0 (default) keeps logs/filenames byte-for-byte as before.
+    cross_layer_steps: int = 0
     # optional extra string appended to the filename param tag (e.g. eta/lambda);
     # keep it filename-safe. Empty by default.
     tag_extra: str = ""
@@ -151,6 +156,10 @@ def param_tag(cfg):
     # Append "_res" only when identity skip connections are on (unchanged otherwise).
     if getattr(cfg, "mp_residual", False):
         tag += "_res"
+    # Append "_xl{k}" only when the cross-layer temporal correction is on (unchanged
+    # otherwise), so corrected runs are distinguishable on disk from same-time runs.
+    if getattr(cfg, "cross_layer_steps", 0):
+        tag += f"_xl{cfg.cross_layer_steps}"
     # Always record the input-embedding rule "_in-<mode>" (incl. the default
     # 'match'), so every output filename (figure / checkpoint / .npz) is
     # self-describing about how the input layer was trained.
@@ -678,6 +687,7 @@ def save_plot_data(cfg, record_steps, runs, agg, path=None,
         "n_datasets": cfg.n_datasets, "lr": cfg.lr, "n_runs": cfg.n_runs,
         "feedback_mode": cfg.feedback_mode, "input_normalize": cfg.input_normalize,
         "mp_residual": cfg.mp_residual,
+        "cross_layer_steps": getattr(cfg, "cross_layer_steps", 0),
         "input_mode": cfg.input_mode, "title": cfg.title,
         # full architecture (multi-layer stacks) for provenance + replot suffix
         "arch_tag": getattr(cfg, "arch_tag", ""),
@@ -759,6 +769,7 @@ def save_config(cfg, path=None):
             "feedback_mode": cfg.feedback_mode,
             "input_normalize": cfg.input_normalize,
             "mp_residual": cfg.mp_residual,
+            "cross_layer_steps": getattr(cfg, "cross_layer_steps", 0),
             "input_mode": cfg.input_mode,
             # the resolved param dicts the nets are actually built from
             "net_params": _json_safe(net_params),
@@ -810,6 +821,7 @@ def run_experiment(cfg):
     print(f"Device: {cfg.device}  dtype: {cfg.dtype}  feedback: {cfg.feedback_mode}"
           f"{'  (input norm ON)' if getattr(cfg, 'input_normalize', False) else ''}"
           f"{'  (residual ON)' if getattr(cfg, 'mp_residual', False) else ''}"
+          f"{f'  (cross-layer x{cfg.cross_layer_steps})' if getattr(cfg, 'cross_layer_steps', 0) else ''}"
           f"  input_mode: {getattr(cfg, 'input_mode', 'match')}\n")
 
     # Weights & Biases (opt-in). Import lazily so non-W&B runs never touch wandb.
@@ -882,10 +894,12 @@ def run_experiment(cfg):
     # existing (norm-off, match) figure titles are unchanged.
     inorm_note = ", input norm" if getattr(cfg, "input_normalize", False) else ""
     resid_note = ", residual" if getattr(cfg, "mp_residual", False) else ""
+    xl_note = (f", cross-layer x{cfg.cross_layer_steps}"
+               if getattr(cfg, "cross_layer_steps", 0) else "")
     inmode_note = ("" if getattr(cfg, "input_mode", "match") == "match"
                    else f", input={cfg.input_mode}")
     plot(cfg, record_steps, agg, cfg.rules_to_run,
-         f"(mean ± std over {cfg.n_runs} runs, {arch_suffix(cfg)}{inorm_note}{resid_note}{inmode_note})",
+         f"(mean ± std over {cfg.n_runs} runs, {arch_suffix(cfg)}{inorm_note}{resid_note}{xl_note}{inmode_note})",
          fig_path(cfg))
 
     # Gradient-alignment-vs-BPTT figure (only when the diagnostic produced data).
