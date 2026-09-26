@@ -162,6 +162,12 @@ class MultiPlasticLayer(BaseNetworkFunctions):
         # Name appended to various parameters to disti
         self.mp_layer_name = ml_params.get('mpl_name', '')
 
+        # Independent of the weight-eligibility rule. Default preserves legacy
+        # exact bias traces; 'direct' uses R=phi' and allocates no Q trace.
+        self.local_bias_mode = ml_params.get('local_bias_mode', 'exact')
+        if self.local_bias_mode not in ('exact', 'direct'):
+            raise ValueError("local_bias_mode must be 'exact' or 'direct'")
+
         self.n_input = ml_params['n_input']
         self.n_output = ml_params['n_output']
 
@@ -372,10 +378,12 @@ class MultiPlasticLayer(BaseNetworkFunctions):
 
         P[b, i, I, J] = dM[b, i, J] / dW[i, I]   shape (B, n_output, n_input, n_input)
         Q[b, i, J]    = dM[b, i, J] / db[i]      shape (B, n_output, n_input)
+        Q is None when local_bias_mode='direct'.
         """
         dev, dt = self.W.device, self.W.dtype
         self.P = torch.zeros(B, self.n_output, self.n_input, self.n_input, device=dev, dtype=dt)
-        self.Q = torch.zeros(B, self.n_output, self.n_input, device=dev, dtype=dt)
+        self.Q = (torch.zeros(B, self.n_output, self.n_input, device=dev, dtype=dt)
+                  if self.local_bias_mode == 'exact' else None)
         self.E = None  # last computed dh/dW  (B, n_output, n_input)
         self.R = None  # last computed dh/db  (B, n_output)
 
@@ -398,11 +406,24 @@ class MultiPlasticLayer(BaseNetworkFunctions):
         E = phi_prime.unsqueeze(-1) * (direct + row_recurrent)         # (B, i, I)
 
         # R_i = phi'_i * [ 1 + sum_J W_{iJ} x_J Q_{iJ} ]
-        row_recurrent_b = torch.einsum('iJ,BJ,BiJ->Bi', self.W, x, self.Q)
-        R = phi_prime * (1.0 + row_recurrent_b)                        # (B, i)
+        R = self._local_bias_eligibility(x, phi_prime)
 
         self.E, self.R = E, R
         return E, R
+
+    def _local_bias_eligibility(self, x, phi_prime):
+        """Exact row-local bias sensitivity or direct neuron-level factor."""
+        if self.local_bias_mode == 'direct':
+            return phi_prime
+        recurrent = torch.einsum('iJ,BJ,BiJ->Bi', self.W, x, self.Q)
+        return phi_prime * (1.0 + recurrent)
+
+    def _advance_local_bias_trace(self, x, R, eta, lam, update_mask):
+        if self.local_bias_mode == 'direct':
+            return
+        Q_new = (lam[None] * self.Q
+                 + self._assoc * eta[None] * R.unsqueeze(-1) * x.unsqueeze(1))
+        self.Q = self._apply_update_mask_3d(Q_new, self.Q, update_mask)
 
     def _eta_lam_full(self):
         """Expand eta and lam to full (n_output, n_input) = (i, J) matrices so
@@ -437,22 +458,18 @@ class MultiPlasticLayer(BaseNetworkFunctions):
         outerP = torch.einsum('BiI,BJ->BiIJ', E, x)            # x_J E^I_i
         P_new = lam[None, :, None, :] * self.P + a * eta[None, :, None, :] * outerP
 
-        outerQ = torch.einsum('Bi,BJ->BiJ', R, x)              # x_J R_i
-        Q_new = lam[None, :, :] * self.Q + a * eta[None, :, :] * outerQ
-
         if update_mask is not None:
             mP = update_mask.view(-1, 1, 1, 1).to(P_new.dtype)
-            mQ = update_mask.view(-1, 1, 1).to(Q_new.dtype)
             P_new = mP * P_new + (1.0 - mP) * self.P
-            Q_new = mQ * Q_new + (1.0 - mQ) * self.Q
 
-        self.P, self.Q = P_new, Q_new
+        self.P = P_new
+        self._advance_local_bias_trace(x, R, eta, lam, update_mask)
 
     # ─── Diagonal / same-synapse RFLO approximation ──────────────────────────
     # Replaces the exact fourth-order trace P^I_{iJ} (B,post,pre,pre) with a
     # single same-synapse trace A_{iI} ~= P^I_{iI} (B,post,pre), dropping all
     # off-synapse (J != I) plastic sensitivities. The bias trace Q (B,post,pre)
-    # stays EXACT — it is only O(d), so there is no reason to approximate it.
+    # is exact by default. local_bias_mode='direct' instead uses R=phi' with no Q.
     # Intentionally an approximation to BPTT (grows with seq length and eta),
     # except when n_input == 1, where there are no off-diagonal terms to drop.
 
@@ -460,11 +477,13 @@ class MultiPlasticLayer(BaseNetworkFunctions):
         """Allocate the diagonal-RFLO traces (zeroed).
 
         A[b, i, I] ~= dM[b, i, I] / dW[i, I]   shape (B, n_output, n_input)
-        Q[b, i, J]  = dM[b, i, J] / db[i]       shape (B, n_output, n_input)  (exact)
+        Q[b, i, J]  = dM[b, i, J] / db[i]       shape (B, n_output, n_input)
+        Q is None when local_bias_mode='direct'.
         """
         dev, dt = self.W.device, self.W.dtype
         self.A = torch.zeros(B, self.n_output, self.n_input, device=dev, dtype=dt)
-        self.Q = torch.zeros(B, self.n_output, self.n_input, device=dev, dtype=dt)
+        self.Q = (torch.zeros(B, self.n_output, self.n_input, device=dev, dtype=dt)
+                  if self.local_bias_mode == 'exact' else None)
         self.E = None  # last computed (approx) dh/dW  (B, n_output, n_input)
         self.R = None  # last computed dh/db  (B, n_output)
 
@@ -474,7 +493,8 @@ class MultiPlasticLayer(BaseNetworkFunctions):
 
             E_hat^I_{i,t} = phi'_i * x_I * (1 + M_{iI,t-1} + W_{iI} A_{iI,t-1}).
 
-        The bias eligibility R stays exact (uses the exact bias trace Q). Call
+        The bias eligibility is exact by default; local_bias_mode='direct'
+        uses R=phi_prime and no Q trace. Call
         AFTER the forward pass and BEFORE update_diag_rflo_traces / update_M,
         so self.M, self.A, self.Q still hold time-(t-1) values.
         returns E_hat (B, n_output, n_input), R (B, n_output).
@@ -486,8 +506,7 @@ class MultiPlasticLayer(BaseNetworkFunctions):
              * (1.0 + M_prev + self.W.unsqueeze(0) * A_prev))          # (B, i, I)
 
         # Exact row-local bias trace (same as the exact rule).
-        row_recurrent_b = torch.einsum('iJ,BJ,BiJ->Bi', self.W, x, self.Q)
-        R = phi_prime * (1.0 + row_recurrent_b)                        # (B, i)
+        R = self._local_bias_eligibility(x, phi_prime)
 
         self.E, self.R = E, R
         return E, R
@@ -507,16 +526,12 @@ class MultiPlasticLayer(BaseNetworkFunctions):
 
         A_new = lam[None] * self.A + a * eta[None] * x.unsqueeze(1) * E  # x_I E_hat^I_i
 
-        outerQ = torch.einsum('Bi,BJ->BiJ', R, x)                      # x_J R_i
-        Q_new = lam[None] * self.Q + a * eta[None] * outerQ
-
         if update_mask is not None:
             mA = update_mask.view(-1, 1, 1).to(A_new.dtype)
-            mQ = update_mask.view(-1, 1, 1).to(Q_new.dtype)
             A_new = mA * A_new + (1.0 - mA) * self.A
-            Q_new = mQ * Q_new + (1.0 - mQ) * self.Q
 
-        self.A, self.Q = A_new, Q_new
+        self.A = A_new
+        self._advance_local_bias_trace(x, R, eta, lam, update_mask)
 
     # ─── Direct / instantaneous local approximation ──────────────────────────
     # The strongest approximation: treat M_{t-1} as a stop-gradient modulatory
@@ -606,26 +621,23 @@ class MultiPlasticLayer(BaseNetworkFunctions):
 
     def _local_step_diag(self, x, phi_prime, ell, eta, lam, update_mask=None):
         """Diagonal RFLO: factor = 1 + M + W*A fused into grad_W and the A update
-        (E_hat = phi'*x*factor never built); exact bias trace Q kept."""
+        (E_hat = phi'*x*factor never built); configurable exact/direct bias."""
         W, M_prev = self.W, self.M
         a = self._assoc
-        A_prev, Q_prev = self.A, self.Q
+        A_prev = self.A
         factor = 1.0 + M_prev + W.unsqueeze(0) * A_prev
         ell_phi = ell * phi_prime
 
         grad_W_t = (ell_phi.unsqueeze(-1) * x.unsqueeze(1) * factor).sum(0)
 
-        row_recurrent_b = torch.bmm(Q_prev * W.unsqueeze(0), x.unsqueeze(-1)).squeeze(-1)
-        R = phi_prime * (1.0 + row_recurrent_b)
+        R = self._local_bias_eligibility(x, phi_prime)
         grad_b_t = torch.einsum('Bi,Bi->i', ell, R)
 
         A_new = (lam.unsqueeze(0) * A_prev
                  + a * eta.unsqueeze(0) * phi_prime.unsqueeze(-1)
                  * x.square().unsqueeze(1) * factor)
-        Q_new = (lam.unsqueeze(0) * Q_prev
-                 + a * eta.unsqueeze(0) * R.unsqueeze(-1) * x.unsqueeze(1))
         self.A = self._apply_update_mask_3d(A_new, A_prev, update_mask)
-        self.Q = self._apply_update_mask_3d(Q_new, Q_prev, update_mask)
+        self._advance_local_bias_trace(x, R, eta, lam, update_mask)
         self.E, self.R = None, R
         return grad_W_t, grad_b_t
 
@@ -637,12 +649,11 @@ class MultiPlasticLayer(BaseNetworkFunctions):
         grad_W_t = torch.einsum('Bi,BiI->iI', ell, E)
         grad_b_t = torch.einsum('Bi,Bi->i', ell, R)
 
-        P_prev, Q_prev = self.P, self.Q
+        P_prev = self.P
         outerP = torch.einsum('BiI,BJ->BiIJ', E, x)
         P_new = lam[None, :, None, :] * P_prev + a * eta[None, :, None, :] * outerP
-        Q_new = lam[None, :, :] * Q_prev + a * eta[None, :, :] * R.unsqueeze(-1) * x.unsqueeze(1)
         self.P = self._apply_update_mask_4d(P_new, P_prev, update_mask)
-        self.Q = self._apply_update_mask_3d(Q_new, Q_prev, update_mask)
+        self._advance_local_bias_trace(x, R, eta, lam, update_mask)
         return grad_W_t, grad_b_t
 
     def step_fn_for(self, mode):
@@ -1573,9 +1584,14 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
         # every layer's gradient exact vs BPTT at T=2 (the dropped series has one term
         # there). Only k=1 is implemented; k>1 (deeper truncated BPTT-through-plasticity)
         # is a future extension and is rejected below. The correction is orthogonal to
-        # feedback_mode — it reuses whatever spatial operator that mode defines — and to
-        # the per-layer eligibility mode (it uses each layer's own E).
+        # the weight-eligibility mode. It is separate from the pure DFA algorithms:
+        # direct_fa requires zero correction, because this routine uses forward weights.
+        # Exact T=2 statements require exact_spatial feedback and exact bias/weight traces.
         self.cross_layer_steps = int(cfg.get('cross_layer_steps', 0))
+        if self.feedback_mode == 'direct_fa' and self.cross_layer_steps != 0:
+            raise ValueError(
+                "direct_fa requires cross_layer_steps=0: the one-step correction "
+                "uses upper forward weights and is a separate reference algorithm.")
         if self.cross_layer_steps not in (0, 1):
             raise NotImplementedError(
                 f"cross_layer_steps={self.cross_layer_steps}: only 0 (same-time) and 1 "
@@ -2394,7 +2410,7 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
         """Exact intra-layer row-local eligibility per MP layer + same-time
         inter-layer learning signals + direct 3-factor input embedding. ONLY with
         feedback_mode='exact_spatial' is the TOP plastic layer's gradient exact vs
-        BPTT (exact eligibility + true spatial feedback); the LOWER plastic layers
+        BPTT for weights (and biases when local_bias_mode='exact'); LOWER plastic layers
         stay surrogates (they omit temporal paths through upper plastic layers), and
         under the FA feedback modes even the top layer is no longer exact."""
         return self._local_sequence_gradients(inputs, labels, masks, 'exact', **kwargs)

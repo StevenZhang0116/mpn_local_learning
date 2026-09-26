@@ -30,10 +30,14 @@ Hyperparameters align with one_task.py (hidden=200, lr=1e-3, batch=128, clip=10,
 Adam, ReduceLROnPlateau, tanh); regularization OFF (pure masked-MSE, what the
 local rules are derived for). Shared machinery lives in train_common.py.
 
-Under a local rule (local_diag_rflo / local_direct) the WHOLE network — including
-the input embedding — trains locally; under 'bptt' the whole network trains by
-exact autograd. The learning rule governs every layer; there is no separate
-per-layer control.
+Use --dfa for the manuscript's DFA comparison. It selects direct_fa,
+input_mode=match, cross_layer_steps=0, and direct MP bias updates. Local runs
+then contain no BPTT splice; the BPTT baseline still trains every parameter
+with autograd. Without this preset, input_mode='exact' is a hybrid baseline
+that also computes BPTT input gradients during local runs. Example:
+    python scripts/train_mpn.py --dfa --hidden 64 64 --task delaygo --steps 500
+--local-bias-mode exact retains exact bias traces (appropriate for row-local
+DFA, but no longer the strictly synapse-local diagonal variant).
 
 Weights & Biases (https://wandb.ai): pass --wandb to log every run live. Each
 invocation becomes ONE W&B experiment named after this run's output save-stem (the
@@ -92,6 +96,10 @@ FEEDBACK_MODE = "exact_spatial"
 #   'three_factor' — embedding ALWAYS uses the direct 3-factor local rule (even in
 #                    the bptt run — MP+readout stay exact-autograd). --input-mode on CLI.
 INPUT_MODE = "exact"
+# --dfa selects 'direct' for both local variants to isolate weight traces.
+# Use --local-bias-mode exact for the manuscript's row-local bias variant.
+LOCAL_BIAS_MODE = "exact"
+LOG_GRAD_ALIGN = True  # --dfa disables the optional BPTT diagnostic by default
 # Fixed input standardization of the raw input u_t. Because u_t feeds straight into
 # the modulated forward W(1+M)x AND the Hebbian M update (η·h·x), its scale strongly
 # conditions the modulation dynamics; standardizing by FIXED per-feature statistics
@@ -118,14 +126,14 @@ _MP_RESIDUAL_NOTICE_SHOWN = False   # so the auto-disable notice prints at most 
 # The base local rules credit each hidden layer with a same-time inter-layer signal
 # only, DROPPING the temporal paths through the plastic state of the layers above it.
 # CROSS_LAYER_STEPS=1 adds back the exact leading (one-temporal-hop) term, which makes
-# every layer's gradient exact vs BPTT at T=2 and strictly improves the lower-layer
-# gradients at longer T (see mpn.DeepMultiPlasticNet._cross_layer_correction and
+# MP-layer gradients exact vs BPTT at T=2 under exact spatial feedback and exact
+# weight/bias eligibility. It need not improve gradient error at longer T (see mpn.DeepMultiPlasticNet._cross_layer_correction and
 # tests/validate_local_learning tier17). It costs one extra downward adjoint sweep +
 # a step of stored state per training step, and applies to every non-bptt rule
 # (bptt is already exact). 0 (default) = the pure same-time rule, byte-for-byte as
 # before. Only 0 and 1 are implemented. --cross-layer-steps on CLI.
 CROSS_LAYER_STEPS = 1
-N_RUNS = 2                    # independent seeds per rule
+N_RUNS = 1                    # independent seeds per rule
 # Hidden width(s) of the MP-layer stack. A single int → one MP layer (the classic
 # in→hidden→out net). A list of ints → one MP layer per width, i.e. a DEEP MP
 # stack (in→h1→h2→...→out); the deep local rules train every layer. The deep
@@ -281,6 +289,7 @@ def build_params():
         "input_mode": INPUT_MODE,        # input-embedding rule (match/exact/three_factor)
         "ml_params": {
             "bias": True,
+            "local_bias_mode": LOCAL_BIAS_MODE,
             "mp_type": "mult",
             "m_update_type": "hebb_assoc",
             "m_activation": "linear",      # required for the local rules
@@ -395,14 +404,18 @@ def _cfg():
     return tc.RunConfig(
         file_prefix=f"train_{NET_TYPE}", ckpt_prefix=NET_TYPE,
         title=f"{RULESET} ({desc}): BPTT vs local", header_note=f" ({desc})",
-        rule_label=RULE_LABEL, rule_color=RULE_COLOR,
+        rule_label=({**RULE_LABEL,
+                     "local_exact_rowlocal": "exact row-local + DFA",
+                     "local_diag_rflo": "diagonal + DFA"}
+                    if FEEDBACK_MODE == "direct_fa" else RULE_LABEL),
+        rule_color=RULE_COLOR,
         seed=SEED, ruleset=RULESET, rules_to_run=RULES_TO_RUN,
         feedback_mode=FEEDBACK_MODE,
         input_normalize=INPUT_NORMALIZE, input_norm_sample=INPUT_NORM_SAMPLE,
         mp_residual=_mp_residual(), cross_layer_steps=CROSS_LAYER_STEPS,
         input_mode=INPUT_MODE, n_runs=N_RUNS, n_hidden=_hidden_widths()[0],
         batch=BATCH, n_datasets=N_DATASETS, lr=LR, grad_clip=GRAD_CLIP,
-        log_every=LOG_EVERY, device=DEVICE, dtype=DTYPE,
+        log_every=LOG_EVERY, log_grad_align=LOG_GRAD_ALIGN, device=DEVICE, dtype=DTYPE,
         fig_dir=FIG_DIR, ckpt_dir=CKPT_DIR, data_dir=DATA_DIR, save_nets=SAVE_NETS,
         arch_tag=_arch_tag(), arch_desc=_arch_desc(),
         use_wandb=USE_WANDB, wandb_project=WANDB_PROJECT,
@@ -413,7 +426,8 @@ def _cfg():
         task=tasks.make_task(RULESET),
         acc_label=tasks.acc_label_for(RULESET),
         metric=tasks.metric_for(RULESET),
-        tag_extra=_eta_lam_tag(),
+        tag_extra=(_eta_lam_tag() +
+                   ("_bias-direct" if LOCAL_BIAS_MODE == "direct" else "")),
     )
 
 
@@ -449,6 +463,18 @@ def _parse_args():
                    help="dmpn: DeepMultiPlasticNet (trainable input embedding + MP "
                         "layer, RNN-comparable). mpn1: MultiPlasticNet (single MP "
                         "layer, no embedding). Default: %(default)s.")
+    p.add_argument("--dfa", action="store_true",
+                   help="compare BPTT, row-local+DFA and diagonal+DFA with fixed "
+                        "direct feedback, local input updates, no temporal correction, "
+                        "and direct bias updates by default")
+    p.add_argument("--rules", nargs="+", choices=list(RULE_LABEL), default=None,
+                   help="learning rules to run; --dfa defaults to BPTT plus both DFA variants")
+    p.add_argument("--grad-align", action=argparse.BooleanOptionalAction, default=None,
+                   help="optional BPTT gradient-alignment diagnostic; disabled by "
+                        "default with --dfa because it adds autograd passes")
+    p.add_argument("--local-bias-mode", choices=["exact", "direct"], default=None,
+                   help="MP bias eligibility: exact row trace or direct phi'; "
+                        "--dfa defaults to direct for a controlled comparison")
     p.add_argument("--task", default=RULESET, help="ruleset / task (default: %(default)s)")
     p.add_argument("--runs", type=int, default=N_RUNS, help="independent seeds")
     p.add_argument("--hidden", type=int, nargs="+", default=None,
@@ -459,13 +485,13 @@ def _parse_args():
     p.add_argument("--steps", type=int, default=N_DATASETS, help="training batches")
     p.add_argument("--feedback",
                    choices=["exact_spatial", "layerwise_fa", "direct_fa", "exact_readout"],
-                   default=FEEDBACK_MODE,
+                   default=None,
                    help="hidden learning-signal feedback. exact_spatial differs from "
                         "the random modes at any depth; layerwise_fa vs direct_fa "
                         "differ only with >1 trainable boundary (dmpn's embedding "
                         "counts). 'exact_readout' is the legacy name for 'exact_spatial'.")
     p.add_argument("--input-mode", choices=["match", "exact", "three_factor"],
-                   default=INPUT_MODE,
+                   default=None,
                    help="input-embedding learning rule (dmpn), decoupled from the "
                         "MP-layer rule: 'match' = per-rule native (default), 'exact' "
                         "= always BPTT gradient, 'three_factor' = always the direct "
@@ -486,11 +512,12 @@ def _parse_args():
                         "widths (e.g. --hidden 128 128); unequal layers skip it with a "
                         "warning. Default: %(default)s.")
     p.add_argument("--cross-layer-steps", type=int, choices=[0, 1],
-                   default=CROSS_LAYER_STEPS,
+                   default=None,
                    help="depth of the cross-layer TEMPORAL correction to the local "
                         "rules (dmpn, multi-MP-layer): 0 = pure same-time surrogate "
                         "(default); 1 = add the exact one-temporal-hop term (exact vs "
-                        "BPTT at T=2, improves lower layers at longer T). Applies to "
+                        "BPTT for MP layers at T=2 only with exact feedback and "
+                        "eligibility; no general improvement guarantee). Applies to "
                         "every non-bptt rule. Costs one extra adjoint sweep/step.")
     p.add_argument("--wandb", dest="use_wandb", action="store_true", default=USE_WANDB,
                    help="log to Weights & Biases (https://wandb.ai): one run per "
@@ -506,12 +533,28 @@ def _parse_args():
                    default=WANDB_MODE,
                    help="W&B mode; default: online. Use 'offline' to log locally and "
                         "`wandb sync` later (no login needed).")
-    return p.parse_args()
+    args = p.parse_args()
+    if args.grad_align is None:
+        args.grad_align = False if args.dfa else LOG_GRAD_ALIGN
+    args.feedback = args.feedback or ("direct_fa" if args.dfa else FEEDBACK_MODE)
+    args.input_mode = args.input_mode or ("match" if args.dfa else INPUT_MODE)
+    if args.cross_layer_steps is None:
+        args.cross_layer_steps = 0 if args.dfa else CROSS_LAYER_STEPS
+    args.local_bias_mode = args.local_bias_mode or ("direct" if args.dfa else LOCAL_BIAS_MODE)
+    args.rules = args.rules or (["bptt", "local_exact_rowlocal", "local_diag_rflo"]
+                               if args.dfa else RULES_TO_RUN)
+    if args.dfa and (args.feedback != "direct_fa" or args.input_mode != "match"
+                     or args.cross_layer_steps != 0):
+        p.error("--dfa requires --feedback direct_fa, --input-mode match, "
+                "and --cross-layer-steps 0; match keeps BPTT exact and local runs local")
+    if args.feedback == "direct_fa" and args.cross_layer_steps != 0:
+        p.error("direct_fa requires --cross-layer-steps 0 (or use --dfa)")
+    return args
 
 
 def main():
     global NET_TYPE, RULESET, N_RUNS, N_HIDDEN, N_DATASETS, FEEDBACK_MODE
-    global INPUT_MODE, INPUT_NORMALIZE, MP_RESIDUAL, CROSS_LAYER_STEPS
+    global INPUT_MODE, INPUT_NORMALIZE, MP_RESIDUAL, CROSS_LAYER_STEPS, LOCAL_BIAS_MODE, RULES_TO_RUN, LOG_GRAD_ALIGN
     global USE_WANDB, WANDB_PROJECT, WANDB_ENTITY, WANDB_MODE
     args = _parse_args()
     NET_TYPE = args.net
@@ -523,6 +566,9 @@ def main():
     N_DATASETS = args.steps
     FEEDBACK_MODE = args.feedback
     INPUT_MODE = args.input_mode
+    LOCAL_BIAS_MODE = args.local_bias_mode
+    RULES_TO_RUN = args.rules
+    LOG_GRAD_ALIGN = args.grad_align
     INPUT_NORMALIZE = args.input_normalize
     MP_RESIDUAL = args.residual
     CROSS_LAYER_STEPS = args.cross_layer_steps
