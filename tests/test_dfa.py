@@ -4,6 +4,7 @@ Run: python -m unittest discover -s tests -v
 import copy
 import contextlib
 import io
+from itertools import product
 import sys
 import unittest
 from pathlib import Path
@@ -18,7 +19,8 @@ sys.path.insert(0, str(ROOT / 'scripts'))
 import mpn
 
 
-def make_net(rule='local_exact_rowlocal', bias='exact', residual=False, kinds=None):
+def make_net(rule='local_exact_rowlocal', bias='exact', residual=False, kinds=None,
+             bounded=False, smooth_scale=None):
     np.random.seed(37)
     torch.manual_seed(37)
     cfg = dict(n_neurons=[2, 3, 3, 4, 2], dt=1, activation='tanh',
@@ -27,7 +29,10 @@ def make_net(rule='local_exact_rowlocal', bias='exact', residual=False, kinds=No
                learning_rule=rule, feedback_mode='direct_fa', input_mode='match',
                cross_layer_steps=0, mp_residual=residual,
                ml_params=dict(bias=True, mp_type='mult', m_update_type='hebb_assoc',
-                              m_activation='linear', modulation_bounds=False,
+                              m_activation='linear' if smooth_scale is None else 'scaled_tanh',
+                              m_scale=1.0 if smooth_scale is None else smooth_scale,
+                              modulation_bounds=bounded,
+                              m_bounds=(-1.0, 1.0),
                               eta_type='scalar', eta_train=False, lam_type='scalar',
                               lam_train=False, m_time_scale=10, local_bias_mode=bias))
     with contextlib.redirect_stdout(io.StringIO()):
@@ -56,7 +61,10 @@ def write(layer, M, x, a, active):
     eta, lam = layer._eta_lam_full()
     post = a if layer.m_update_type == 'hebb_assoc' else torch.ones_like(a) / a.shape[-1] ** .5
     new = lam * M + eta * post.unsqueeze(-1) * x.unsqueeze(1)
-    return active[:, None, None] * new + (1 - active[:, None, None]) * M
+    if layer.m_act == 'scaled_tanh':
+        new = layer.m_scale * torch.tanh(new / layer.m_scale)
+    updated = active[:, None, None] * new + (1 - active[:, None, None]) * M
+    return updated.clamp(-1.0, 1.0) if layer.modulation_bounds else updated
 
 
 @torch.no_grad()
@@ -121,7 +129,11 @@ def oracle(net, x, y, mask, um, diag):
                         objective = objective + (ell[:, t, i] * a).sum()
                         post = a if layer.m_update_type == 'hebb_assoc' else torch.ones_like(a) / layer.n_output ** .5
                         new = lam[i, j] * m + eta[i, j] * post * inp[:, j]
+                        if layer.m_act == 'scaled_tanh':
+                            new = layer.m_scale * torch.tanh(new / layer.m_scale)
                         m = um[:, t] * new + (1 - um[:, t]) * m
+                        if layer.modulation_bounds:
+                            m = m.clamp(-1.0, 1.0)
                     gw[i, j] = torch.autograd.grad(objective, w)[0]
             # Compute exact bias via an independent own-layer graph when requested.
             b = layer.b.detach().clone().requires_grad_()
@@ -148,22 +160,234 @@ def oracle(net, x, y, mask, um, diag):
 
 
 class TestDFA(unittest.TestCase):
+    def test_modulation_cli_modes_and_scales(self):
+        import train_mpn
+
+        for mode, tag in (('none', ''), ('hard', '_mb-0.4-0.4'), ('scaled_tanh', '_mtanh-0.4')):
+            with self.subTest(mode=mode):
+                with patch.object(sys, 'argv', ['train_mpn.py', '--dfa', '--modulation-mode', mode,
+                                               '--modulation-bound', '0.4']):
+                    args = train_mpn._parse_args()
+                self.assertEqual(args.modulation_mode, mode)
+                self.assertEqual(args.modulation_bound, .4)
+                with patch.multiple(train_mpn, MODULATION_MODE=mode, MODULATION_BOUND=.4,
+                                    MODULATION_BOUNDS=mode == 'hard'):
+                    _, _, params = train_mpn.build_params()
+                    layer_params = params['ml_params']
+                    self.assertEqual(layer_params['m_scale'], .4)
+                    self.assertEqual(layer_params['modulation_bounds'], mode == 'hard')
+                    self.assertEqual(layer_params['m_activation'],
+                                     'scaled_tanh' if mode == 'scaled_tanh' else 'linear')
+                    actual_tag = train_mpn._cfg().tag_extra
+                    if tag:
+                        self.assertIn(tag, actual_tag)
+                    else:
+                        self.assertNotIn('_mb-', actual_tag)
+                        self.assertNotIn('_mtanh-', actual_tag)
+        for invalid in (0., -1., float('nan'), float('inf')):
+            with self.subTest(invalid=invalid):
+                with patch.object(sys, 'argv', ['train_mpn.py', f'--modulation-bound={invalid}']):
+                    with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                        train_mpn._parse_args()
+                with self.assertRaises(ValueError):
+                    make_net(smooth_scale=invalid)
+        with self.assertRaises(ValueError):
+            make_net(bounded=True, smooth_scale=1.)
+
+    def test_runner_defaults_bound_modulation_without_regularization(self):
+        import train_common
+        import train_mpn
+
+        self.assertTrue(train_mpn.MODULATION_BOUNDS)
+        self.assertEqual(train_mpn.REG_LAMBDA, 0.0)
+        _, train_params, net_params = train_mpn.build_params()
+        self.assertTrue(net_params['ml_params']['modulation_bounds'])
+        self.assertEqual(net_params['ml_params']['m_bounds'], (-1.0, 1.0))
+        self.assertEqual(train_params['reg_lambda'], 0.0)
+        self.assertIsNone(train_params['activity_reg'])
+        _, optimizer, _ = train_common.make_optim(
+            make_net(), .001, weight_decay=train_params['reg_lambda'])
+        self.assertTrue(all(group['weight_decay'] == 0 for group in optimizer.param_groups))
+        config = train_mpn._cfg()
+        tag = config.tag_extra
+        self.assertIn('_mb-1-1', tag)
+        self.assertNotIn('_l2-', tag)
+        with patch.object(train_mpn, 'MODULATION_BOUNDS', False):
+            unbounded_config = train_mpn._cfg()
+        for path_builder in (train_common.fig_path, train_common.data_path,
+                             train_common.config_path, train_common.align_fig_path):
+            bounded_path = path_builder(config)
+            self.assertIn('_mb-1-1', bounded_path)
+            self.assertEqual(bounded_path.replace('_mb-1-1', ''), path_builder(unbounded_config))
+        for rule in ('bptt', 'local_diag_rflo', 'local_direct'):
+            self.assertIn('_mb-1-1', train_common.ckpt_path(config, rule, 291))
+
+    def test_runner_modulation_modes_and_regularization_for_all_rules(self):
+        import train_common
+        import train_mpn
+
+        for net_type, mode in product(('dmpn', 'mpn1'), ('none', 'hard', 'scaled_tanh')):
+            with self.subTest(net_type=net_type, mode=mode), patch.multiple(
+                    train_mpn, NET_TYPE=net_type, N_HIDDEN=[3, 3] if net_type == 'dmpn' else 3,
+                    RULESET='delaygo', N_DATASETS=2, N_RUNS=1, BATCH=2,
+                    DEVICE=torch.device('cpu'), DTYPE=torch.double, MP_RESIDUAL=False,
+                    MODULATION_MODE=mode, MODULATION_BOUND=.4,
+                    MODULATION_BOUNDS=mode == 'hard', REG_LAMBDA=1e-4,
+                    INPUT_MODE='match', LOG_GRAD_ALIGN=False, SAVE_NETS=False):
+                config = train_mpn._cfg()
+                original_builder = config.build_params
+
+                def small_params():
+                    task_params, train_params, net_params = original_builder()
+                    train_params['valid_n_batch'] = 2
+                    self.assertEqual(train_params['reg_lambda'], 1e-4)
+                    self.assertIsNone(train_params['activity_reg'])
+                    self.assertEqual(net_params['ml_params']['modulation_bounds'], mode == 'hard')
+                    self.assertEqual(net_params['ml_params']['m_bounds'], (-.4, .4))
+                    return task_params, train_params, net_params
+
+                config.build_params = small_params
+                with patch.object(train_common, 'make_optim', wraps=train_common.make_optim) as factory:
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        curves, _ = train_common.run_seed(config, 37, [0, 1])
+                self.assertEqual(factory.call_count, len(config.rules_to_run))
+                for call in factory.call_args_list:
+                    self.assertEqual(call.kwargs['weight_decay'], 1e-4)
+                    network = call.args[0]
+                    layers = network.mp_layers if net_type == 'dmpn' else [network.mp_layer]
+                    for layer in layers:
+                        if mode == 'hard':
+                            self.assertTrue((layer.M >= layer.M_bounds[1]).all())
+                            self.assertTrue((layer.M <= layer.M_bounds[0]).all())
+                        elif mode == 'scaled_tanh':
+                            self.assertTrue((layer.M.abs() <= layer.m_scale).all())
+                for split_curves in curves.values():
+                    for values in split_curves.values():
+                        self.assertTrue(np.isfinite(values).all())
+
+    def test_bounded_general_and_fast_write_paths(self):
+        layer = make_net(bounded=True).mp_layers[0]
+        layer.reset_state(B=2)
+        layer.reset_local_learning_state(B=2)
+        with torch.no_grad():
+            layer.eta.fill_(10)
+        reference = copy.deepcopy(layer)
+        inputs = torch.tensor([[1., -1., .1], [-1., 1., -.1]], dtype=torch.double)
+        post = torch.ones(2, layer.n_output, dtype=torch.double)
+        eligibility = torch.ones_like(layer.M)
+        bias_eligibility = torch.ones_like(post)
+        update_mask = torch.tensor([1., 0.], dtype=torch.double)
+        with torch.no_grad():
+            for current in (layer, reference):
+                current.update_exact_rowlocal_traces(
+                    inputs, eligibility, bias_eligibility, update_mask=update_mask)
+            layer.update_M_matrix_local_fast(inputs, post, update_mask=update_mask)
+            reference.update_M_matrix(inputs, post, update_mask=update_mask)
+        torch.testing.assert_close(layer.M, reference.M)
+        torch.testing.assert_close(layer.P, reference.P)
+        torch.testing.assert_close(layer.Q, reference.Q)
+        self.assertTrue((layer.M.abs() <= 1).all())
+
+    def test_clamp_derivative_matches_autograd_at_endpoints(self):
+        layer = make_net(bounded=True).mp_layers[0]
+        raw = torch.tensor([[[-2., -1., -.5], [0., .5, 1.], [2., 2., -2.]]],
+                           dtype=torch.double, requires_grad=True)
+        expected = torch.autograd.grad(raw.clamp(-1., 1.).sum(), raw)[0]
+        clipped = layer._apply_modulation_bounds(raw)
+        torch.testing.assert_close(clipped, raw.detach().clamp(-1., 1.))
+        torch.testing.assert_close(torch.autograd.grad(clipped.sum(), raw)[0], expected)
+        layer.M_pre = raw.detach()
+        torch.testing.assert_close(layer._modulation_clamp_derivative().to(raw.dtype), expected)
+
+    @torch.no_grad()
+    def test_frozen_state_traces_for_general_and_fast_updates(self):
+        for mode in ('exact', 'diag'):
+            for bounded in (False, True):
+                for bias in ('exact', 'direct'):
+                    for fast in (False, True):
+                        with self.subTest(mode=mode, bounded=bounded, bias=bias, fast=fast):
+                            layer = make_net(bias=bias, bounded=bounded).mp_layers[0]
+                            layer.set_plasticity_freeze(torch.tensor([0]), torch.tensor([1]))
+                            layer.reset_state(B=2)
+                            if mode == 'exact':
+                                layer.reset_local_learning_state(B=2)
+                            else:
+                                layer.reset_diag_rflo_state(B=2)
+                            frozen_value = layer.M[:, 0, 1].clone()
+                            inputs = torch.full((2, layer.n_input), .2, dtype=torch.double)
+                            phi_prime = torch.full((2, layer.n_output), .5, dtype=torch.double)
+                            eta, lam = layer._eta_lam_full()
+                            layer.step_fn_for(mode)(inputs, phi_prime, torch.ones_like(phi_prime), eta, lam)
+                            trace_name = 'P' if mode == 'exact' else 'A'
+                            expected_trace = getattr(layer, trace_name).clone()
+                            if mode == 'exact':
+                                expected_trace[:, 0, :, 1] = 0
+                            else:
+                                expected_trace[:, 0, 1] = 0
+                            expected_bias_trace = None if layer.Q is None else layer.Q.clone()
+                            if expected_bias_trace is not None:
+                                expected_bias_trace[:, 0, 1] = 0
+                            update = layer.update_M_matrix_local_fast if fast else layer.update_M_matrix
+                            update(inputs, torch.full_like(phi_prime, .3))
+                            torch.testing.assert_close(layer.M[:, 0, 1], frozen_value)
+                            torch.testing.assert_close(getattr(layer, trace_name), expected_trace)
+                            if expected_bias_trace is None:
+                                self.assertIsNone(layer.Q)
+                            else:
+                                torch.testing.assert_close(layer.Q, expected_bias_trace)
+
+    def test_weight_regularization_matches_explicit_l2_gradient(self):
+        import train_common
+
+        coefficient = 1e-4
+        net = make_net()
+        reference = copy.deepcopy(net)
+        _, optimizer, _ = train_common.make_optim(net, .001, weight_decay=coefficient)
+        baseline = torch.optim.Adam(reference.parameters(), lr=.001)
+        for name, parameter in net._trainable_params().items():
+            parameter.grad = torch.full_like(parameter, .2)
+            reference_parameter = reference._trainable_params()[name]
+            reference_parameter.grad = parameter.grad.clone()
+            if name.startswith('W'):
+                reference_parameter.grad.add_(reference_parameter.detach(), alpha=coefficient)
+        optimizer.step()
+        baseline.step()
+        for name, parameter in net._trainable_params().items():
+            torch.testing.assert_close(parameter, reference._trainable_params()[name],
+                                       rtol=1e-12, atol=1e-12)
+        for group in optimizer.param_groups:
+            for parameter in group['params']:
+                name = next(name for name, candidate in net._trainable_params().items()
+                            if candidate is parameter)
+                self.assertEqual(group['weight_decay'], coefficient if name.startswith('W') else 0)
+
     def test_both_rules_against_independent_autograd(self):
         x, y, masks, um = data()
-        for diag in (False, True):
+        for diag, (bounded, smooth_scale) in product((False, True), ((False, None), (True, None), (False, .4))):
+            write_masks = um if smooth_scale is None else torch.tensor(
+                [[1., .25, 0., 1.], [.75, 0., 1., 1.]], dtype=x.dtype)
             for bias in ('exact', 'direct'):
                 for residual in (False, True):
                     for kinds in (None, ['hebb_pre', 'hebb_assoc', 'hebb_pre'], ['hebb_pre']*3):
-                        with self.subTest(diag=diag, bias=bias, residual=residual, kinds=kinds):
+                        with self.subTest(diag=diag, bounded=bounded, smooth_scale=smooth_scale,
+                                          bias=bias, residual=residual, kinds=kinds):
                             rule = 'local_diag_rflo' if diag else 'local_exact_rowlocal'
-                            net = make_net(rule, bias, residual, kinds)
-                            expected_out, expected = oracle(net, x, y, masks, um, diag)
+                            net = make_net(rule, bias, residual, kinds, bounded=bounded, smooth_scale=smooth_scale)
+                            if bounded or smooth_scale is not None:
+                                with torch.no_grad():
+                                    for layer in net.mp_layers:
+                                        layer.eta.fill_(1000 if bounded else 20)
+                            expected_out, expected = oracle(net, x, y, masks, write_masks, diag)
                             # No hidden BPTT/autograd is allowed in either local DFA run.
                             with patch.object(net, 'bptt_gradients', side_effect=AssertionError('BPTT called')):
-                                actual = net.sequence_gradients(x, y, masks, update_masks=um)
+                                actual = net.sequence_gradients(x, y, masks, update_masks=write_masks)
                             torch.testing.assert_close(actual['outputs'], expected_out, rtol=1e-10, atol=1e-11)
                             for key, val in expected.items():
                                 torch.testing.assert_close(actual[key], val, rtol=1e-9, atol=1e-10)
+                            if bounded:
+                                self.assertTrue(any((layer.M.abs() == 1).any() for layer in net.mp_layers))
+                            if smooth_scale is not None:
+                                self.assertTrue(all((layer.M.abs() <= smooth_scale).all() for layer in net.mp_layers))
                             if bias == 'direct' and kinds != ['hebb_pre']*3:
                                 self.assertTrue(all(l.Q is None for l in net.mp_layers))
 

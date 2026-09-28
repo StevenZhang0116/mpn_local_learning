@@ -1,0 +1,59 @@
+"""Small helpers for teeing script output to timestamped log files."""
+
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
+from datetime import datetime
+from pathlib import Path
+import os
+import sys
+import threading
+
+
+class _TeeStream:
+    """Write to both the original terminal stream and a shared log file."""
+
+    def __init__(self, terminal, log_file, lock):
+        self.terminal = terminal
+        self.log_file = log_file
+        self.lock = lock
+
+    def write(self, text):
+        with self.lock:
+            self.terminal.write(text)
+            self.log_file.write(text)
+        return len(text)
+
+    def flush(self):
+        with self.lock:
+            self.terminal.flush()
+            self.log_file.flush()
+
+    def isatty(self):
+        return self.terminal.isatty()
+
+    @property
+    def encoding(self):
+        return self.terminal.encoding
+
+    def __getattr__(self, name):
+        return getattr(self.terminal, name)
+
+
+@contextmanager
+def tee_output(script_name, log_dir=None):
+    """Mirror stdout/stderr to ``log/<script>_<timestamp>_<pid>.log``."""
+    if log_dir is None:
+        log_dir = Path(__file__).resolve().parent.parent / "log"
+    else:
+        log_dir = Path(log_dir)
+
+    log_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_path = log_dir / f"{script_name}_{timestamp}_{os.getpid()}.log"
+    lock = threading.RLock()
+
+    with log_path.open("a", encoding="utf-8", buffering=1) as log_file:
+        stdout_tee = _TeeStream(sys.stdout, log_file, lock)
+        stderr_tee = _TeeStream(sys.stderr, log_file, lock)
+        with redirect_stdout(stdout_tee), redirect_stderr(stderr_tee):
+            print(f"Logging stdout/stderr to: {log_path}", flush=True)
+            yield log_path

@@ -296,9 +296,21 @@ def try_accuracy(task, net, output, labels, mask, inputs, isvalid=False):
         return float("nan")
 
 
-def make_optim(net, lr):
+def make_optim(net, lr, weight_decay=0.0):
+    """Adam with coupled L2: (weight_decay / 2) * sum(W**2), excluding biases."""
     trainable = [p for p in net.parameters() if p.requires_grad]
-    opt = torch.optim.Adam(trainable, lr=lr)
+    if weight_decay:
+        weight_ids = {id(parameter) for name, parameter in net._trainable_params().items()
+                      if name.startswith('W')}
+        groups = [
+            {'params': [parameter for parameter in trainable if id(parameter) in weight_ids],
+             'weight_decay': weight_decay},
+            {'params': [parameter for parameter in trainable if id(parameter) not in weight_ids],
+             'weight_decay': 0.0},
+        ]
+    else:
+        groups = trainable
+    opt = torch.optim.Adam(groups, lr=lr)
     sch = torch.optim.lr_scheduler.ReduceLROnPlateau(
         opt, mode="min", factor=0.95, patience=30, min_lr=1e-8)
     return trainable, opt, sch
@@ -356,12 +368,16 @@ def run_seed(cfg, seed, record_steps, run_idx=0, wandb_logger=None):
             task_params, train_params, cfg.input_norm_sample, cfg.device, cfg.dtype)
         base.set_input_norm_stats(sample_in)
 
+    weight_decay = (float(train_params.get('reg_lambda', 0.0))
+                    if train_params.get('weight_reg') == 'L2' else 0.0)
+    if weight_decay:
+        print(f"  L2 weight regularization: {weight_decay:g} (Adam coupled decay; biases excluded)")
     nets, optims = {}, {}
     for rule in cfg.rules_to_run:
         net = copy.deepcopy(base)
         net.learning_rule = rule
         nets[rule] = net
-        optims[rule] = make_optim(net, cfg.lr)
+        optims[rule] = make_optim(net, cfg.lr, weight_decay=weight_decay)
 
     # The task's objective. None → the net's default masked MSE; keeping it None
     # (not passing an explicit fn) preserves the local rules' single-pass fast

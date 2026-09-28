@@ -12,5 +12,13 @@ checkpoints/
 figure/
 figure_data/
 
+# Saved analysis figures and metrics
+/notebooks/visualize_performance/
+/notebooks/visualize_trained_networks/
+/notebooks/compare_mpn_rnn_performance/
+
 # Weights & Biases local run logs (offline runs, cache, artifacts)
 wandb/
+
+# Timestamped console output
+log/
