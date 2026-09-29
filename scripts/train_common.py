@@ -580,7 +580,7 @@ def run_seed(cfg, seed, record_steps, run_idx=0, wandb_logger=None):
     # state_dict + net_params (as in one_task.py) plus rule/seed metadata. Also
     # stores the (initialized) task_params/train_params so a downstream viewer can
     # draw held-out trials from the checkpoint ALONE — no need to re-run
-    # build_params() with a matching config (see notebooks/visualize_performance).
+    # build_params() with a matching config (see notebooks/visualize_trained_networks.py).
     # ruleset is duplicated at top level for convenient labeling.
     if cfg.save_nets and cfg.ckpt_prefix:
         os.makedirs(cfg.ckpt_dir, exist_ok=True)

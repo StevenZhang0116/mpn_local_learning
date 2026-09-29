@@ -1,9 +1,8 @@
-"""Run converted analysis scripts on small fixtures and inspect every saved figure."""
+"""Check checkpoint selection and analysis entry points using small figure fixtures."""
 
 import argparse
 import contextlib
 import io
-import json
 import os
 from pathlib import Path
 import runpy
@@ -22,13 +21,16 @@ import mpn
 import tasks
 import train_mpn
 
+sys.path.insert(0, str(_bootstrap.ROOT / 'notebooks'))
+from visualize_trained_networks import select_checkpoints
+
 
 class TestAnalysisScripts(unittest.TestCase):
     def test_default_output_directories_are_under_notebooks(self):
         class ParsedDefaults(Exception):
             pass
 
-        for name in ('visualize_performance', 'visualize_trained_networks',
+        for name in ('visualize_trained_networks',
                      'compare_mpn_rnn_performance'):
             with self.subTest(script=name):
                 script = _bootstrap.ROOT / 'notebooks' / f'{name}.py'
@@ -93,23 +95,79 @@ class TestAnalysisScripts(unittest.TestCase):
 
     def test_performance_saves_all_figures_and_accuracy(self):
         self.make_checkpoints()
-        self.run_script('visualize_performance.py', '--ckpt-dir', self.root,
-                        '--ckpt-stem', self.stem, '--seed', 37, '--trials', 8)
-        self.assert_figures(['accuracy_angle_stimulus', 'example_trials', 'modulation_per_synapse'])
-        records = list(self.output.glob('*accuracy_angle_stimulus.json'))
-        self.assertEqual(len(records), 1)
-        with records[0].open() as stream:
-            record = json.load(stream)
-        self.assertEqual(record['n_trials'], 8)
-        self.assertEqual(record['rules'], self.rules)
+        result = self.run_script('visualize_trained_networks.py', '--analysis', 'performance',
+                                 '--ckpt-dir', self.root,
+                                 '--ckpt-stem', self.stem, '--seed', 37, '--trials', 8)
+        self.assertEqual(result.stdout.count('Held-out masked MSE loss on 8 trials'), 2)
+        for timing_mode in ('random', 'random_batch'):
+            self.assertIn(f'mode_input={timing_mode}, task=delaygo, seed=37', result.stdout)
+        for threshold in (0.3, 0.6, 0.9):
+            self.assertIn(f'Active synapses (|M| > {threshold}); representative trials only:', result.stdout)
+        self.assert_figures(['accuracy_angle_stimulus', 'example_trials', 'modulation_per_synapse',
+                             'modulation_active_fraction_threshold0.3',
+                             'modulation_active_fraction_threshold0.6',
+                             'modulation_active_fraction_threshold0.9'])
+        self.assertEqual(list(self.output.glob('*.json')), [])
 
     def test_networks_save_heatmaps_alignments_and_distributions(self):
         self.make_checkpoints()
         self.run_script('visualize_trained_networks.py', '--ckpt-dir', self.root,
-                        '--ckpt-stem', self.stem, '--seed', 37)
+                        '--ckpt-stem', self.stem, '--seed', 37, '--analysis', 'weights')
         self.assert_figures(['weight_heatmaps', 'weight_alignment_to_bptt',
-                             'bias_alignment_to_bptt', 'weight_distributions'])
-        self.assertEqual(len(list(self.output.glob('*bias_alignment_to_bptt.json'))), 1)
+                             'bias_alignment_to_bptt', 'parameter_cosine_diag_rflo_vs_direct',
+                             'weight_distributions'])
+        self.assertEqual(list(self.output.glob('*.json')), [])
+
+    def test_combined_analysis_automatically_selects_run_and_seed(self):
+        self.make_checkpoints()
+        # A newer, incomplete seed must not displace the shared seed.
+        (self.root / f'{self.stem}bptt_seed38.pt').touch()
+        result = self.run_script('visualize_trained_networks.py', '--ckpt-dir', self.root,
+                                 '--trials', 8)
+        self.assertIn(f'Selected checkpoint group: {self.stem}seed37', result.stdout)
+        for rule in self.rules:
+            self.assertEqual(result.stdout.count(f'<- {self.stem}{rule}_seed37.pt'), 1)
+        self.assert_figures(['weight_heatmaps', 'weight_alignment_to_bptt',
+                             'bias_alignment_to_bptt', 'parameter_cosine_diag_rflo_vs_direct',
+                             'weight_distributions', 'accuracy_angle_stimulus',
+                             'example_trials', 'modulation_per_synapse',
+                             'modulation_active_fraction_threshold0.3',
+                             'modulation_active_fraction_threshold0.6',
+                             'modulation_active_fraction_threshold0.9'])
+        self.assertEqual(list(self.output.glob('*.json')), [])
+
+    def test_selection_uses_complete_groups_and_respects_overrides(self):
+        for seed in (37, 38):
+            for rule in self.rules:
+                path = self.root / f'{self.stem}{rule}_seed{seed}.pt'
+                path.touch()
+                os.utime(path, (seed, seed))
+        stem, seed, paths = select_checkpoints(self.root, self.rules, self.stem)
+        self.assertEqual((stem, seed), (self.stem, 38))
+        self.assertEqual(list(paths), self.rules)
+        self.assertEqual(select_checkpoints(self.root, self.rules, seed=37)[1], 37)
+        # Never mix seeds or stems to fill in a missing rule.
+        (self.root / 'other_bptt_seed99.pt').touch()
+        with self.assertRaisesRegex(ValueError, 'missing local_diag_rflo, local_direct'):
+            select_checkpoints(self.root, self.rules, stem='other_')
+        with self.assertRaisesRegex(ValueError, 'No complete checkpoint group'):
+            select_checkpoints(self.root, self.rules, self.stem, seed=99)
+        self.assertEqual(select_checkpoints(self.root, ['bptt'], stem='other_')[1], 99)
+
+    def test_performance_requires_saved_task_setup(self):
+        self.make_checkpoints()
+        path = self.root / f'{self.stem}bptt_seed37.pt'
+        checkpoint = torch.load(path, weights_only=False)
+        del checkpoint['task_params']
+        torch.save(checkpoint, path)
+        result = subprocess.run(
+            [sys.executable, str(_bootstrap.ROOT / 'notebooks/visualize_trained_networks.py'),
+             '--ckpt-dir', str(self.root), '--output-dir', str(self.output)],
+            capture_output=True, text=True, timeout=120,
+            env=dict(os.environ, OMP_NUM_THREADS='1', MKL_NUM_THREADS='1', CUDA_VISIBLE_DEVICES=''))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('requires saved ring-task task_params', result.stderr)
+        self.assertFalse(self.output.exists())
 
     def test_comparison_uses_metadata_and_distinct_source_names(self):
         values = dict(rules=np.asarray(['bptt']), record_steps=np.asarray([0, 10, 20]),

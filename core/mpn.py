@@ -1632,7 +1632,7 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
         self.learning_rule = _rule
         # input_mode decouples the TRAINABLE INPUT EMBEDDING's learning rule from the
         # MP-layer learning_rule, so any RULES_TO_RUN × input-rule combination can be
-        # compared. Only meaningful when input_layer_add_trainable is on.
+        # compared. Only meaningful when an embedding weight or bias is trainable.
         #   'match'        — the embedding follows learning_rule (historical default:
         #                    exact autograd under bptt, the 3-factor local rule under
         #                    a local rule). Zero behavior change from before.
@@ -1640,16 +1640,22 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
         #                    (dL/dW_in via autograd), even during a local MP run.
         #   'three_factor' — the embedding ALWAYS uses the DIRECT 3-factor local rule
         #                    (ell_h[0] ⊙ phi'(embed_pre)) · uᵀ, even during a bptt run.
-        # The splice lives in sequence_gradients (recompute the OTHER method's grad
-        # and overwrite only W_in/b_in) so no new gradient math is introduced.
+        #   'diag_mtrace'  — local runs track the first MP layer's modulation-column
+        #                    sensitivity to the corresponding embedding row. BPTT
+        #                    stays exact. Requires exact_spatial feedback.
+        # exact/three_factor use a gradient splice; diag_mtrace runs forward-mode
+        # sensitivities inside the local pass, without an additional BPTT pass.
         self.input_mode = cfg.get('input_mode', 'match')
-        assert self.input_mode in ('match', 'exact', 'three_factor'), \
+        assert self.input_mode in ('match', 'exact', 'three_factor', 'diag_mtrace'), \
             f"unknown input_mode '{self.input_mode}'"
         # feedback_mode governs how each hidden layer's learning signal is formed
         # in the local rules (see the _FEEDBACK_MODES table and
         # _same_time_boundary_signals). B_feedback_init is stashed for the
         # per-layer FA buffers built after the MP layers exist.
         self.feedback_mode = canonical_feedback_mode(cfg.get('feedback_mode', 'exact_spatial'))
+        if self.input_mode == 'diag_mtrace':
+            if not self.input_layer_active or self.feedback_mode != 'exact_spatial':
+                raise ValueError("diag_mtrace requires an input embedding and exact_spatial feedback")
         self._B_feedback_init = cfg.get('B_feedback_init', 'xavier')
         # cross_layer_steps: depth of the cross-layer TEMPORAL correction added to the
         # surrogate lower-layer local gradients (see _cross_layer_correction). 0 (the
@@ -1919,10 +1925,10 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
     # rules train EVERY MP layer with its own eligibility traces, credited by a
     # same-time inter-layer learning signal backprojected through the modulated
     # weights of the layers above (M-mediated temporal paths through upper layers
-    # dropped), and train the input embedding with the same DIRECT 3-factor rule
+    # dropped), and by default train the input embedding with a DIRECT 3-factor rule
     # (backproject the boundary signal through layer 0's modulated weights, then
-    # multiply by the embedding activation derivative and the raw input — the RNN's
-    # RFLO treatment of its input weights). Works for any number of MP layers.
+    # multiply by the embedding activation derivative and the raw input). The
+    # diag_mtrace input mode adds first-MP-layer temporal sensitivities below.
 
     def _embed_grad_flags(self):
         """(need_W_in, need_b_in): whether the input embedding's weight / bias each
@@ -1939,10 +1945,63 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
 
     def _has_trainable_embed(self):
         """True if the input embedding contributes ANY trainable tensor (weight OR
-        bias), i.e. the local pass must run its 3-factor embedding branch. The two
+        bias), i.e. the local pass must run its selected embedding rule. The two
         tensors are gated independently in _embed_grad_flags / _trainable_params; a
         frozen weight with a trainable bias (or vice-versa) still counts."""
         return any(self._embed_grad_flags())
+
+    def _input_mtrace_step(self, trace, features, embed_prime, x, post,
+                           phi_prime, signal, eta, lam):
+        """Advance a diagonal-column input sensitivity, before the M write.
+
+        trace[b,i,j,k] approximates dM0[b,i,j]/dU[j,k]; derivatives of
+        M0[b,i,J!=j] w.r.t. U[j,k] and all deeper M states are omitted.
+        features contains raw (standardized) inputs for trainable weights and
+        optionally a constant 1 for the input bias. No parameter gradients are
+        propagated through optimizer steps: weights are fixed during the unroll.
+
+        D[j,k] = phi_embed'[j] * features[k]
+        C[i,j,k] = phi0'[i] W0[i,j] ((1+M0[i,j]) D[j,k] + x[j] trace[i,j,k])
+        raw_trace = lam*trace + eta*(post[i]*D[j,k] + x[j]*C[i,j,k])
+
+        C is the first MP block activation's sensitivity; its residual identity
+        path contributes D only to the gradient, not the Hebbian post write.
+        For hebb_pre, replace post by its constant and omit the x*C term.
+        The caller finalizes raw_trace AFTER M0's write using its actual gate.
+        Storage is O(batch * first_MP_width * embed_width * feature_count).
+        """
+        layer = self.mp_layers[0]
+        direct = embed_prime.unsqueeze(-1) * features.unsqueeze(1)
+        eligibility = (phi_prime[:, :, None, None] * layer.W[None, :, :, None]
+                       * ((1.0 + layer.M).unsqueeze(-1) * direct.unsqueeze(1)
+                          + x[:, None, :, None] * trace))
+        gradient = torch.einsum('bi,bijk->jk', signal, eligibility)
+        if self._residual_at[0]:
+            gradient = gradient + torch.einsum('bj,bjk->jk', signal, direct)
+        raw_trace = lam[None, :, :, None] * trace
+        if layer.m_update_type == 'hebb_assoc':
+            source = (post[:, :, None, None] * direct.unsqueeze(1)
+                      + x[:, None, :, None] * eligibility)
+        else:  # hebb_pre still depends on the embedding, unlike its MP W trace.
+            source = direct.unsqueeze(1) / math.sqrt(layer.n_output)
+        raw_trace = raw_trace + eta[None, :, :, None] * source
+        return gradient, raw_trace
+
+    def _finish_input_mtrace(self, proposed, previous, update_mask):
+        """Apply M0's write derivative, mask convention, and frozen-state zeros."""
+        layer = self.mp_layers[0]
+        gate = layer._modulation_write_derivative()
+        if layer.m_act == 'scaled_tanh':
+            proposed = proposed * gate.unsqueeze(-1)
+            updated = layer._apply_update_mask_4d(proposed, previous, update_mask)
+        else:
+            updated = layer._apply_update_mask_4d(proposed, previous, update_mask)
+            if gate is not None:
+                updated = updated * gate.unsqueeze(-1)
+        frozen = getattr(layer, '_plasticity_freeze_mask', None)
+        if frozen is not None:
+            updated[:, frozen[0], frozen[1], :] = 0
+        return updated
 
     # ── Deep-local forward + same-time boundary-signal helpers ────────────────
     # These implement the two ingredients the multi-MP-layer local rules need
@@ -2270,9 +2329,9 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
         Each layer keeps its own intra-layer eligibility (exact P/Q, diagonal A/Q,
         or direct); the inter-layer credit is the same-time spatial backprojection
         through the modulated weights, which drops temporal paths through upper
-        plastic layers. For a single MP layer this reduces to the previous
-        single-layer computation bit-for-bit (one top boundary matmul, same
-        scratch buffers, same einsums).
+        plastic layers. Input mode diag_mtrace additionally propagates the
+        first MP layer's diagonal-column sensitivities to embedding parameters;
+        it does not change MP parameter gradients or add deeper temporal paths.
 
         Loss handling mirrors MultiPlasticNet: default masked MSE is inline; a
         custom loss_and_grad triggers a forward-only pre-pass whose grad_output_seq
@@ -2317,10 +2376,18 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
                 mp.reset_diag_rflo_state(B=B)
 
         # Embedding gradients are gated PER TENSOR (weight/bias frozen independently):
-        # `embed` runs the shared 3-factor branch if EITHER is trainable; need_W_in /
+        # `embed` runs the selected input rule if EITHER is trainable; need_W_in /
         # need_b_in then decide which key to emit, matching _trainable_params exactly.
         need_W_in, need_b_in = self._embed_grad_flags()
         embed = need_W_in or need_b_in
+        input_mtrace = embed and self.input_mode == 'diag_mtrace'
+        if input_mtrace:
+            if self.feedback_mode != 'exact_spatial':
+                raise ValueError("diag_mtrace requires exact_spatial feedback")
+            feature_count = (self.n_input if need_W_in else 0) + int(need_b_in)
+            input_trace = torch.zeros(B, layers[0].n_output, layers[0].n_input,
+                                      feature_count, dtype=dt, device=dev)
+            grad_input = torch.zeros(layers[0].n_input, feature_count, dtype=dt, device=dev)
         step_fns = [mp.step_fn_for(mode) for mp in layers]   # per-layer rule, resolved once
 
         grad_W = [torch.zeros_like(mp.W) for mp in layers]
@@ -2372,7 +2439,7 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
         hid_seq = self._scratch('dlocal_hid', (T, B, top_hidden_dim), dt, dev)
         outputs = torch.empty(B, T, self.n_output, dtype=dt, device=dev) if need_outputs else None
         loss_sum = torch.zeros((), dtype=dt, device=dev)
-        if embed:
+        if embed and not input_mtrace:
             # ga_seq (= ell_h[0]⊙φ') feeds BOTH the W_in grad (⊗ u) and the b_in grad
             # (Σ), so it is needed whenever the branch runs; u_seq only when W_in does.
             ga_seq = self._scratch('dlocal_ga', (T, B, self.W_initial_linear.weight.shape[0]), dt, dev)
@@ -2401,15 +2468,23 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
             um = None if um_T is None else um_T[t]
 
             # 3. All same-time boundary signals, using the still-frozen M_{t-1}.
-            #    ell_h[n+1] credits MP layer n; ell_h[0] (only if the embedding is
-            #    trainable) credits the input embedding.
+            #    ell_h[n+1] credits MP layer n. Direct input gradients use ell_h[0];
+            #    diag_mtrace instead credits its first-layer eligibility with ell_h[1].
             ell_h = self._same_time_boundary_signals(grad_output, phi_p,
-                                                      need_input_signal=embed)
+                                                      need_input_signal=embed and not input_mtrace)
 
-            # 4. Trainable input embedding (3-factor direct rule); uses M_{t-1} via
-            #    ell_h[0], so it MUST precede the M updates. ga_seq feeds both W_in and
-            #    b_in; u_seq (for W_in) only stored when the weight is trainable.
-            if embed:
+            # 4. Input gradients consume M_{t-1}; the new trace is finalized only
+            #    after the first MP layer's write. The ordinary branch is unchanged.
+            if input_mtrace:
+                features = u_t if need_W_in else u_t[:, :0]
+                if need_b_in:
+                    features = torch.cat((features, torch.ones(B, 1, dtype=dt, device=dev)), dim=1)
+                post0 = h[1] - h[0] if self._residual_at[0] else h[1]
+                grad_t, proposed_input_trace = self._input_mtrace_step(
+                    input_trace, features, self.act_fn_p(embed_pre), h[0], post0,
+                    phi_p[0], ell_h[1], *eta_lam[0])
+                grad_input += grad_t
+            elif embed:
                 ga_seq[t] = ell_h[0] * self.act_fn_p(embed_pre)
                 if need_W_in:
                     u_seq[t] = u_t
@@ -2460,6 +2535,8 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
                 post = h[n + 1] - h[n] if self._residual_at[n] else h[n + 1]
                 mp.update_M_matrix_local_fast(
                     h[n], post, eta=eta_n, lam=lam_n, update_mask=um)
+                if input_mtrace and n == 0:
+                    input_trace = self._finish_input_mtrace(proposed_input_trace, input_trace, um)
 
             # Stash this step's state for next step's depth-1 correction (post-M-advance
             # is fine: the correction reads none of the just-advanced M; W_eff was
@@ -2493,7 +2570,12 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
             suffix = '' if n == 0 else str(n)
             all_grads[f'W{suffix}'] = grad_W[n]
             all_grads[f'b{suffix}'] = grad_b[n]
-        if embed:
+        if input_mtrace:
+            if need_W_in:
+                all_grads['W_in'] = grad_input[:, :self.n_input]
+            if need_b_in:
+                all_grads['b_in'] = grad_input[:, -1]
+        elif embed:
             # Emit each embedding key by its OWN trainability (weight/bias frozen
             # independently), matching _trainable_params so result has exactly its keys.
             if need_W_in:
@@ -2509,7 +2591,7 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
 
     def local_gradients(self, inputs, labels, masks, **kwargs):
         """Exact intra-layer row-local eligibility per MP layer + same-time
-        inter-layer learning signals + direct 3-factor input embedding. ONLY with
+        inter-layer learning signals + the selected local input rule. ONLY with
         feedback_mode='exact_spatial' is the TOP plastic layer's gradient exact vs
         BPTT for weights (and biases when local_bias_mode='exact'); LOWER plastic layers
         stay surrogates (they omit temporal paths through upper plastic layers), and
@@ -2518,7 +2600,7 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
 
     def local_diag_rflo_gradients(self, inputs, labels, masks, **kwargs):
         """Diagonal RFLO eligibility per MP layer + same-time inter-layer learning
-        signals + direct 3-factor input embedding. APPROXIMATE for EVERY plastic
+        signals + the selected local input rule. APPROXIMATE for EVERY plastic
         layer — including the top — regardless of feedback_mode, because the
         diagonal eligibility itself drops off-synapse plastic sensitivities (exact
         only when n_input == 1). The readout gradient stays exact."""
@@ -2526,9 +2608,10 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
 
     def local_direct_gradients(self, inputs, labels, masks, **kwargs):
         """Direct/instantaneous eligibility per MP layer + same-time inter-layer
-        learning signals + direct 3-factor input embedding. Treats every M_{t-1} as
-        a stop-gradient state (spatial backprop through the deep feedforward net with
-        frozen modulation). APPROXIMATE for EVERY plastic layer — including the top —
+        learning signals + the selected local input rule. For MP parameter gradients,
+        treats M_{t-1} as a stop-gradient state (spatial backprop through the deep
+        feedforward net with frozen modulation). APPROXIMATE for EVERY plastic
+        layer — including the top —
         regardless of feedback_mode (no plasticity-mediated temporal credit at all);
         exact only at T=1 or eta=0. The readout gradient stays exact."""
         return self._local_sequence_gradients(inputs, labels, masks, 'direct', **kwargs)
@@ -2552,15 +2635,16 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
         pass did not already produce for the embedding.
 
         The embedding's NATIVE rule is 'exact' under bptt and 'three_factor' under
-        any local rule (all local rules give the SAME embedding gradient — the
-        3-factor rule does not depend on the MP eligibility mode). So a splice is
+        any local rule unless diag_mtrace is selected. Both local input rules are
+        independent of the MP eligibility mode. A splice is
         needed only when input_mode disagrees with that native rule:
           input_mode='exact'        on a LOCAL run → take W_in/b_in from a BPTT pass.
           input_mode='three_factor' on a BPTT run  → take W_in/b_in from a local pass
                                                       (local_direct is the cheapest).
+        diag_mtrace is handled inside local passes and leaves BPTT unchanged.
         'match', a non-trainable embedding, or an already-matching native rule → no-op.
         The extra pass recomputes the full gradient but only W_in/b_in are kept."""
-        if self.input_mode == 'match' or not self._has_trainable_embed():
+        if self.input_mode in ('match', 'diag_mtrace') or not self._has_trainable_embed():
             return grads
         native_is_exact = (self.learning_rule == 'bptt')
         want_exact = (self.input_mode == 'exact')
@@ -2575,8 +2659,8 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
 
     def sequence_gradients(self, inputs, labels, masks, **kwargs):
         """Dispatch on self.learning_rule; write grads into each param's .grad.
-        If input_mode != 'match', the trainable input embedding's W_in/b_in grad is
-        then overridden to the input_mode's rule (see _apply_input_mode)."""
+        Input modes exact/three_factor may splice W_in/b_in from another pass.
+        diag_mtrace runs inside the local pass and leaves BPTT unchanged."""
         grads = self._grads_for_rule(self.learning_rule, inputs, labels, masks, **kwargs)
         grads = self._apply_input_mode(grads, inputs, labels, masks, **kwargs)
 

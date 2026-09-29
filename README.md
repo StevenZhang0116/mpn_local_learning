@@ -29,8 +29,9 @@ feedback for the hidden learning signal. Readout gradients are always exact.
   (adding-problem generator + Task), `_bootstrap.py` (path setup).
 - `tests/` — `validate_local_learning.py` (rule correctness vs BPTT, all tiers),
   `test_tasks.py` (task-adapter + integration tests). See `tests/README.md`.
-- `notebooks/` — Python analysis scripts: `visualize_performance.py`,
-  `visualize_trained_networks.py`, and `compare_mpn_rnn_performance.py`.
+- `notebooks/` — Python analysis scripts: `visualize_trained_networks.py`
+  (checkpoint selection, loading, parameter and performance plots), and
+  `compare_mpn_rnn_performance.py`.
 - `utils/` — `clean.py` (remove saved outputs, safe by default).
 - Outputs (git-ignored): `figure/` (PNGs), `figure_data/` (`.npz` behind each figure),
   `checkpoints/` (`.pt` trained nets), `log/` (`train_mpn` console output).
@@ -69,6 +70,23 @@ behind it to `figure_data/`, and (MPN) trained nets to `checkpoints/`. Reload fi
 without retraining via `replot_from_npz(data_path())`; explore results with the
 analysis scripts in `notebooks/`.
 
+For temporal input-layer credit without an extra BPTT pass, select
+`--input-mode diag_mtrace --feedback exact_spatial` on a `dmpn` run. Local rules
+then track the first MP layer's modulation-column sensitivities to the matching
+embedding weights and bias; BPTT remains a full-gradient reference. This is a
+diagonal-column approximation: other modulation columns and deeper-layer temporal
+paths are omitted. MP parameter updates retain their selected learning rule.
+It supports unbounded, hard-clipped, and scaled-tanh modulation, residuals,
+input normalization, and independently frozen input weights/biases. Trace memory
+scales as batch × first MP width × embedding width × (raw input width + bias),
+independently of sequence length. See [the derivation and limitations](docs/input_modulation_trace.md).
+
+For example, change `--input-mode match` to `--input-mode diag_mtrace` in a local
+learning comparison. Keep `--cross-layer-steps 0` for the original MP update rules;
+`1` adds its separate correction to MP parameters only. The saved run stem contains
+`_in-diag_mtrace`, and checkpoint loading restores this input mode. Existing
+`match`, `exact`, and `three_factor` modes retain their behavior.
+
 `train_mpn.py` defaults to hard modulation bounds `[-1, 1]` and no regularization:
 `MODULATION_MODE="hard"`, `MODULATION_BOUND=1.0`, and `REG_LAMBDA=0.0`.
 Use `--modulation-mode none` for unbounded writes,
@@ -99,29 +117,72 @@ The former notebooks are standalone Python scripts. They use Matplotlib's Agg
 backend, save every figure as a 150-dpi PNG with tight bounding boxes, and close
 figures after saving. No Jupyter kernel or graphical display is required.
 
-From the project root, select saved data with these options:
+From the project root, run both parameter and performance analyses together:
 
 ```bash
-python notebooks/visualize_performance.py --ckpt-stem "$CKPT_STEM" --seed "$SEED" --trials 500
-python notebooks/visualize_trained_networks.py --ckpt-stem "$CKPT_STEM" --seed "$SEED"
+python notebooks/visualize_trained_networks.py
+```
+
+This selects a complete checkpoint group containing BPTT, diagonal RFLO, and
+direct for the same run and seed. Groups are ranked by the newest requested
+checkpoint's modification time, then stem and numeric seed (largest wins).
+Incomplete groups are skipped; training status is not checked. The selected stem
+and seed are printed. Networks are loaded once and task settings come from the
+first requested rule's checkpoint, so no task setup or manually chosen seed is
+needed. These plots support deep MPN (`dmpn`) checkpoints.
+
+Optional overrides and separate analyses:
+
+```bash
+python notebooks/visualize_trained_networks.py --ckpt-stem "$CKPT_STEM" --trials 2000
+python notebooks/visualize_trained_networks.py --analysis weights --seed 37
+python notebooks/visualize_trained_networks.py --analysis performance --ckpt-stem "$CKPT_STEM"
 python notebooks/compare_mpn_rnn_performance.py --mpn-file "$MPN_NPZ" --rnn-file "$RNN_NPZ"
 ```
 
 `CKPT_STEM` is the checkpoint filename prefix before `<rule>_seed<seed>.pt`,
-including its trailing underscore. Set `SEED` to the saved seed, and `MPN_NPZ`
-and `RNN_NPZ` to existing plot-data files (bare names also resolve in
-`figure_data/`). The default selections retain the old notebook settings;
-override them when those runs are not present. Checkpoint scripts also accept
-`--ckpt-dir` and `--rules`. All scripts expose `--help` and `--output-dir`.
+including its trailing underscore. `--seed` pins a saved seed; otherwise the
+newest complete seed matching the requested stem/rules is selected automatically.
+`MPN_NPZ` and `RNN_NPZ` select existing plot-data files (bare names also resolve in
+`figure_data/`). Checkpoint scripts also accept `--ckpt-dir` and `--rules`.
+All scripts expose `--help` and `--output-dir`. Performance figures require
+ring-task settings stored in `task_params`; older checkpoints without them can
+still use `--analysis weights`. `--trials` defaults to 2,000 per task rule per
+timing mode; forward passes use minibatches of at most 32 trials.
+Example-trial plots, modulation trajectories, and all three active-fraction
+plots use `mode_input="random_batch"`, with independently randomized task-period
+timing across trials. The accuracy/MSE figure compares this batch against an
+additional `random` batch, whose trials share period timing within each task.
+Both modes use the same saved seed and trial count; each learning rule is
+evaluated on the same batch within a mode.
 
-Default outputs are project-root-relative, independent of the working directory:
+Default output folders depend on the script, even when `--analysis` changes.
+They are project-root-relative, independent of the working directory:
 
-- `notebooks/visualize_performance/`: accuracy, example trials, modulation
-  trajectories, and accuracy JSON. Modulation histories are stored only for the
-  representative trials actually plotted.
 - `notebooks/visualize_trained_networks/`: weight heatmaps, weight/bias
-  alignment to BPTT, weight distributions, and bias-alignment JSON. Alignment
-  plots are skipped if there is no BPTT reference or no other rule to compare.
+  alignment to BPTT, diagonal-RFLO/direct parameter cosine similarity, weight
+  distributions, accuracy, example trials, and modulation trajectories.
+  Use `--analysis weights` or `--analysis performance` for only that subset;
+  the default `--analysis all` produces both. Alignment plots are skipped when
+  their comparison rules are absent. Figures are saved as PNGs only.
+  Modulation histories are stored only for the
+  representative trials actually plotted, showing the first, middle, and last MP
+  layers (all layers for depths up to three; the later middle layer for even depths).
+  The `modulation_active_fraction_threshold0.3`,
+  `modulation_active_fraction_threshold0.6`, and
+  `modulation_active_fraction_threshold0.9` figures plot the percentage of all
+  synapses with `abs(M)` strictly above the named threshold at each time step.
+  These figures show every MP layer using the same representative trials as
+  the modulation trajectories. Each panel overlays learning rules on a shared
+  0–100% scale. Fractions are computed during rollout without storing full
+  modulation histories for the additional layers.
+  The console reports the time-averaged, peak, and final percentages for each
+  rule/layer/trial, using M after each update and all time steps.
+  The `accuracy_angle_stimulus` figure has two rows: `random` on top and
+  `random_batch` below. Each row includes angle accuracy, stimulus accuracy,
+  and masked MSE loss on that mode's trials. Matching metrics share y-axis
+  limits across rows. MSE uses the training cost mask and averages over all
+  batch/time/output elements, excluding weight regularization.
 - `notebooks/compare_mpn_rnn_performance/`: combined learning curves;
   filenames include a source-pair identifier to distinguish different runs.
 

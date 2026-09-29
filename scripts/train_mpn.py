@@ -14,11 +14,12 @@ For each of N_RUNS seeds we train the RULES_TO_RUN networks in lockstep:
   - 'bptt'            — autograd through the unrolled forward + M-update
   - 'local_diag_rflo' — diagonal / same-synapse RFLO local learning
   - 'local_direct'    — direct/instantaneous local approximation
-BPTT trains every parameter (input embedding included) exactly. Under the LOCAL
-rules the MP layer uses eligibility traces and the input embedding uses a DIRECT
-3-factor rule (the RNN's RFLO treatment of its input weights — see
-DeepMultiPlasticNet._local_sequence_gradients). All start from the SAME init
-(deepcopy), SAME per-step data, SAME held-out valid set, own Adam + scheduler,
+BPTT with input_mode=match/exact/diag_mtrace trains every parameter exactly.
+Local MP layers use the selected eligibility rule. Input mode match uses direct
+three-factor input gradients; exact uses a BPTT input splice; diag_mtrace adds
+first-MP-layer modulation-column sensitivities for input weights and biases.
+three_factor forces direct input gradients even under BPTT. All start from the
+SAME init (deepcopy), SAME per-step data, SAME held-out valid set, own Adam + scheduler,
 via sequence_gradients() which writes .grad for optimizer.step().
 
 Output: one figure with two panels — training and testing (held-out) accuracy vs
@@ -97,6 +98,8 @@ FEEDBACK_MODE = "exact_spatial"
 #                    local run — costs an extra BPTT pass for that rule).
 #   'three_factor' — embedding ALWAYS uses the direct 3-factor local rule (even in
 #                    the bptt run — MP+readout stay exact-autograd). --input-mode on CLI.
+#   'diag_mtrace'  — local runs use a first-MP-layer diagonal-column modulation
+#                    sensitivity trace; BPTT stays exact. Needs exact_spatial.
 INPUT_MODE = "exact"
 # --dfa selects 'direct' for both local variants to isolate weight traces.
 # Use --local-bias-mode exact for the manuscript's row-local bias variant.
@@ -489,12 +492,14 @@ def _parse_args():
                         "the random modes at any depth; layerwise_fa vs direct_fa "
                         "differ only with >1 trainable boundary (dmpn's embedding "
                         "counts). 'exact_readout' is the legacy name for 'exact_spatial'.")
-    p.add_argument("--input-mode", choices=["match", "exact", "three_factor"],
+    p.add_argument("--input-mode", choices=["match", "exact", "three_factor", "diag_mtrace"],
                    default=None,
                    help="input-embedding learning rule (dmpn), decoupled from the "
-                        "MP-layer rule: 'match' = per-rule native (default), 'exact' "
+                        "MP-layer rule: 'match' = per-rule native, 'exact' "
                         "= always BPTT gradient, 'three_factor' = always the direct "
-                        "local rule. Default: %(default)s.")
+                        "local rule; 'diag_mtrace' = first-MP-layer modulation-column "
+                        "traces for local runs, BPTT unchanged (requires dmpn and "
+                        f"exact_spatial). Default: {INPUT_MODE}; --dfa selects match.")
     p.add_argument("--input-normalize", action=argparse.BooleanOptionalAction,
                    default=INPUT_NORMALIZE,
                    help="fixed per-feature standardization of the raw input u_t "
@@ -542,6 +547,9 @@ def _parse_args():
     args.local_bias_mode = args.local_bias_mode or ("direct" if args.dfa else LOCAL_BIAS_MODE)
     args.rules = args.rules or (["bptt", "local_exact_rowlocal", "local_diag_rflo"]
                                if args.dfa else RULES_TO_RUN)
+    if args.input_mode == 'diag_mtrace' and (args.net != 'dmpn' or
+                                            mpn.canonical_feedback_mode(args.feedback) != 'exact_spatial'):
+        p.error("--input-mode diag_mtrace requires --net dmpn and --feedback exact_spatial")
     if args.dfa and (args.feedback != "direct_fa" or args.input_mode != "match"
                      or args.cross_layer_steps != 0):
         p.error("--dfa requires --feedback direct_fa, --input-mode match, "
