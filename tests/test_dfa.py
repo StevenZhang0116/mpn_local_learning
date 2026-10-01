@@ -163,7 +163,7 @@ class TestDFA(unittest.TestCase):
     def test_modulation_cli_modes_and_scales(self):
         import train_mpn
 
-        for mode, tag in (('none', ''), ('hard', '_mb-0.4-0.4'), ('scaled_tanh', '_mtanh-0.4')):
+        for mode in ('none', 'hard', 'scaled_tanh'):
             with self.subTest(mode=mode):
                 with patch.object(sys, 'argv', ['train_mpn.py', '--dfa', '--modulation-mode', mode,
                                                '--modulation-bound', '0.4']):
@@ -178,12 +178,7 @@ class TestDFA(unittest.TestCase):
                     self.assertEqual(layer_params['modulation_bounds'], mode == 'hard')
                     self.assertEqual(layer_params['m_activation'],
                                      'scaled_tanh' if mode == 'scaled_tanh' else 'linear')
-                    actual_tag = train_mpn._cfg().tag_extra
-                    if tag:
-                        self.assertIn(tag, actual_tag)
-                    else:
-                        self.assertNotIn('_mb-', actual_tag)
-                        self.assertNotIn('_mtanh-', actual_tag)
+                    self.assertEqual(layer_params['m_bounds'], (-.4, .4))
         for invalid in (0., -1., float('nan'), float('inf')):
             with self.subTest(invalid=invalid):
                 with patch.object(sys, 'argv', ['train_mpn.py', f'--modulation-bound={invalid}']):
@@ -209,18 +204,16 @@ class TestDFA(unittest.TestCase):
             make_net(), .001, weight_decay=train_params['reg_lambda'])
         self.assertTrue(all(group['weight_decay'] == 0 for group in optimizer.param_groups))
         config = train_mpn._cfg()
-        tag = config.tag_extra
-        self.assertIn('_mb-1-1', tag)
-        self.assertNotIn('_l2-', tag)
         with patch.object(train_mpn, 'MODULATION_BOUNDS', False):
             unbounded_config = train_mpn._cfg()
         for path_builder in (train_common.fig_path, train_common.data_path,
                              train_common.config_path, train_common.align_fig_path):
             bounded_path = path_builder(config)
-            self.assertIn('_mb-1-1', bounded_path)
-            self.assertEqual(bounded_path.replace('_mb-1-1', ''), path_builder(unbounded_config))
+            self.assertNotIn('_mb-1-1', bounded_path)
+            self.assertNotEqual(bounded_path, path_builder(unbounded_config))
         for rule in ('bptt', 'local_diag_rflo', 'local_direct'):
-            self.assertIn('_mb-1-1', train_common.ckpt_path(config, rule, 291))
+            self.assertTrue(train_common.ckpt_path(config, rule, 291).endswith(
+                f'{config.run_id}/seed291/{rule}.pt'))
 
     def test_runner_modulation_modes_and_regularization_for_all_rules(self):
         import train_common

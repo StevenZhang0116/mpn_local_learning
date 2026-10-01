@@ -1,25 +1,14 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-# # Compare MPN vs RNN performance on the same figure
-#
-# Overlay the accuracy curves from a `train_mpn.py` run and a `train_rnn.py` run
-# (both saved as `.npz` under `figure_data/`) on a single train/test figure, so
-# the two model families' learning rules can be compared directly.
-#
-# Just set the two `.npz` file names in the config cell below (with or without the
-# `.npz` extension, stem or full path — both are resolved against `figure_data/`).
-# The **task name**, **hidden size**, and **output-training mode** (`exact_readout`
-# etc.) are all read from the file names; the hidden size and output-training mode
-# **must agree** between the two runs (else the comparison isn't apples-to-apples,
-# so the notebook stops), and all three are shown in the figure title.
-#
-# **Convention:** MPN rules are drawn as **solid** lines, RNN rules as **dashed**;
-# color still encodes the learning rule (BPTT blue, diagonal RFLO red, direct
-# purple), reusing the same `RULE_COLOR` / `RULE_LABEL` maps as the train scripts.
+"""Overlay saved MPN and RNN train/test curves from --mpn-file and --rnn-file.
 
-# In[1]:
-
+Names (with optional .npz extension) resolve against figure_data/; explicit paths
+are also accepted. Task, hidden widths, and feedback mode come from saved metadata,
+with filename parsing as a fallback for legacy files. Hidden widths, feedback,
+and plotted metric must match; different tasks produce a warning.
+MPN curves are solid, RNN curves dashed, and colors identify learning rules.
+"""
 
 import argparse
 import hashlib
@@ -41,22 +30,9 @@ FIG_DATA_DIR = _bootstrap.ROOT / "figure_data"   # where the .npz files live
 FIG_OUT_DIR = _bootstrap.ROOT / "notebooks" / "compare_mpn_rnn_performance"
 
 
-# ## 1. Choose the two runs to overlay
-#
-# Set the MPN and RNN `.npz` names. These are the files `train_mpn.py` /
-# `train_rnn.py` write to `figure_data/` (same stem as their `.png`). The
-# extension is optional; a bare stem is resolved against `figure_data/`.
-
-# In[2]:
-
-
-# --- run selection: fill in your two file names (stem, name.npz, or full path) ---
-MPN_FILE = "train_dmpn_contextdelaydm1_h200_b128_n5000_lr1e-03_exact_readout_eta1.00_lam0.99_runs3"
-RNN_FILE = "train_rnn_contextdelaydm1_h200_b128_n5000_lr1e-03_exact_readout_runs3"
-
 parser = argparse.ArgumentParser(description="Compare saved MPN and RNN learning curves.")
-parser.add_argument("--mpn-file", default=MPN_FILE)
-parser.add_argument("--rnn-file", default=RNN_FILE)
+parser.add_argument("--mpn-file", required=True, help="saved MPN .npz name or path")
+parser.add_argument("--rnn-file", required=True, help="saved RNN .npz name or path")
 parser.add_argument("--output-dir", type=pathlib.Path, default=FIG_OUT_DIR)
 args = parser.parse_args()
 MPN_FILE, RNN_FILE = args.mpn_file, args.rnn_file
@@ -83,19 +59,9 @@ print(f"MPN <- {MPN_PATH}")
 print(f"RNN <- {RNN_PATH}")
 
 
-# ## 2. Load the curves; extract & cross-check the run descriptors
-#
 # Each `.npz` (written by `train_common.save_plot_data`) stores the x-axis
 # (`record_steps`), the list of `rules`, and per-rule `mean__<rule>__<split>` /
 # `std__<rule>__<split>` arrays for `split` in `{train, valid}`.
-#
-# The **task name**, **hidden size**, and **output-training mode** are parsed
-# straight out of the file names (`train_<net>_<task>_h<hidden>_..._<readout>_...`).
-# The hidden size and output-training mode **must match** between the two runs —
-# otherwise the overlay compares networks trained under different conditions, so we
-# raise. (The task is also cross-checked; a mismatch warns but still plots.)
-
-# In[ ]:
 
 
 def load_curves(path):
@@ -113,7 +79,7 @@ def load_curves(path):
     scalar = lambda k: (d[k].item() if k in d.files and d[k].shape == () else None)
     meta = {k: scalar(k) for k in ("ruleset", "n_hidden", "n_runs", "batch",
                                    "lr", "feedback_mode", "title", "metric",
-                                   "acc_label")}
+                                   "acc_label", "arch_tag")}
     # metric/acc_label were added later; default to accuracy for older .npz.
     meta["metric"] = meta["metric"] or "accuracy"
     meta["acc_label"] = meta["acc_label"] or "angle accuracy (%)"
@@ -122,10 +88,11 @@ def load_curves(path):
 
 
 def parse_descriptors(name):
-    """Pull (task, hidden, readout) out of a train_{dmpn,mpn1,rnn}_... file name.
-    hidden is the '_h<N>_' field (int); readout is the output-training / feedback
-    mode ('exact_readout' or 'random_fixed'); task is everything between the net
-    tag and '_h<N>'."""
+    """Legacy filename fallback: (task, hidden width or width tuple, feedback mode).
+
+    Recognizes current feedback names and the older exact_readout/random_fixed
+    names. Compact run IDs need metadata and return None for missing fields.
+    """
     stem = pathlib.Path(str(name)).name
     task = re.search(r"train_(?:dmpn|mpn1|rnn)_(.+?)_h\d+", stem)
     hidden = re.search(r"_h(\d+(?:-\d+)*)_", stem)
@@ -136,22 +103,34 @@ def parse_descriptors(name):
             readout.group(1) if readout else None)
 
 
+def run_descriptors(path, meta):
+    """Prefer saved architecture/feedback over filenames, including deep stacks."""
+    task, hidden, feedback = parse_descriptors(path)
+    arch_tag = meta.get('arch_tag')
+    if arch_tag:
+        match = re.fullmatch(r'h(\d+(?:-\d+)*)', arch_tag)
+        if not match:
+            raise ValueError(f"Unsupported saved arch_tag {arch_tag!r} in {path}")
+        widths = tuple(int(width) for width in match[1].split('-'))
+        hidden = widths[0] if len(widths) == 1 else widths
+    elif meta.get('n_hidden') is not None:
+        hidden = meta['n_hidden']
+    feedback = meta.get('feedback_mode') or feedback
+    if feedback == 'exact_readout':
+        feedback = 'exact_spatial'
+    return meta.get('ruleset') or task, hidden, feedback
+
+
 mpn_steps, mpn_rules, mpn_agg, mpn_meta = load_curves(MPN_PATH)
 rnn_steps, rnn_rules, rnn_agg, rnn_meta = load_curves(RNN_PATH)
 
-mpn_task, mpn_hidden, mpn_readout = parse_descriptors(MPN_PATH)
-rnn_task, rnn_hidden, rnn_readout = parse_descriptors(RNN_PATH)
-mpn_task, rnn_task = mpn_meta['ruleset'] or mpn_task, rnn_meta['ruleset'] or rnn_task
-mpn_hidden, rnn_hidden = mpn_hidden or mpn_meta['n_hidden'], rnn_hidden or rnn_meta['n_hidden']
-mpn_readout = mpn_meta['feedback_mode'] or mpn_readout
-rnn_readout = rnn_meta['feedback_mode'] or rnn_readout
-mpn_readout = 'exact_spatial' if mpn_readout == 'exact_readout' else mpn_readout
-rnn_readout = 'exact_spatial' if rnn_readout == 'exact_readout' else rnn_readout
+mpn_task, mpn_hidden, mpn_readout = run_descriptors(MPN_PATH, mpn_meta)
+rnn_task, rnn_hidden, rnn_readout = run_descriptors(RNN_PATH, rnn_meta)
 
-# Hidden size, output-training mode, and plotted metric MUST agree for a fair,
+# Hidden widths, feedback mode, and plotted metric must agree for a
 # same-axes comparison.
 for label, mval, rval in [("hidden size", mpn_hidden, rnn_hidden),
-                          ("output-training mode", mpn_readout, rnn_readout),
+                          ("feedback mode", mpn_readout, rnn_readout),
                           ("plotted metric", mpn_meta["metric"], rnn_meta["metric"])]:
     if mval is None or rval is None:
         raise ValueError(f"could not read {label} (MPN={mval!r}, RNN={rval!r}).")
@@ -167,20 +146,16 @@ if mpn_task != rnn_task:
 
 TASK, HIDDEN, READOUT = mpn_task, mpn_hidden, mpn_readout
 METRIC, Y_LABEL = mpn_meta["metric"], mpn_meta["acc_label"]
-print(f"task = {TASK}   hidden = {HIDDEN}   output training = {READOUT}   metric = {METRIC}")
+print(f"task = {TASK}   hidden = {HIDDEN}   feedback = {READOUT}   metric = {METRIC}")
 print(f"MPN rules: {mpn_rules}  ->  {[tm.RULE_LABEL.get(r, r) for r in mpn_rules]}")
 print(f"RNN rules: {rnn_rules}  ->  {[tr.RULE_LABEL.get(r, r) for r in rnn_rules]}")
 print(f"n_runs: MPN={mpn_meta['n_runs']}  RNN={rnn_meta['n_runs']}")
 
 
-# ## 3. Overlay MPN and RNN on one figure
-#
 # Two panels (train / test) like the per-model figures, but with **both** models on
 # each: MPN solid, RNN dashed, color per learning rule (mean line + ± std band).
 # The legend is tagged `MODEL: rule` so every curve is unambiguous, and the title
-# records the (shared) task, hidden size, and output-training mode.
-
-# In[ ]:
+# records the task, hidden widths, and feedback mode.
 
 
 # Per-model style: solid MPN, dashed RNN; reuse each script's rule color/label maps.
@@ -221,17 +196,13 @@ axes[1].legend(loc="best" if is_loss else "lower right", frameon=False, fontsize
 n_runs = mpn_meta["n_runs"] if mpn_meta["n_runs"] == rnn_meta["n_runs"] else \
     f"{mpn_meta['n_runs']}/{rnn_meta['n_runs']}"
 fig.suptitle(f"{TASK}: MPN vs RNN — BPTT vs local learning  "
-             f"(hidden={HIDDEN}, output training={READOUT}, "
+             f"(hidden={HIDDEN}, feedback={READOUT}, "
              f"mean ± std over {n_runs} runs)")
 fig.tight_layout()
 
 
-# ## 4. Save the combined figure
-#
 # Writes to `notebooks/compare_mpn_rnn_performance/`; descriptors and a source-pair
 # identifier distinguish different comparisons.
-
-# In[5]:
 
 
 FIG_OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -240,4 +211,3 @@ out_path = FIG_OUT_DIR / f"compare_mpn_rnn_{TASK}_h{HIDDEN}_{READOUT}_{source_ta
 fig.savefig(out_path, dpi=150, bbox_inches="tight")
 plt.close(fig)
 print(f"Saved figure: {out_path}")
-

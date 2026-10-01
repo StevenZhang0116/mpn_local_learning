@@ -22,7 +22,7 @@ import gc
 import json
 import os
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Callable
 
 import numpy as np
@@ -33,7 +33,7 @@ matplotlib.use("Agg")  # headless: write PNG, no display
 import matplotlib.pyplot as plt
 
 import tasks  # Task adapters (data/metric seam); make_task(ruleset) picks one
-from mpn import masked_mse_loss_and_output_grad  # one shared masked-MSE definition
+from mpn import masked_mse_loss_and_output_grad, resolve_input_mode
 
 
 @dataclass
@@ -41,8 +41,8 @@ class RunConfig:
     """All knobs + hooks for one train/compare experiment. Callers build this
     fresh from their module globals (see _cfg() in the train scripts)."""
     # identity / presentation
-    file_prefix: str            # figure/data filename stem, e.g. "train_mpn"
-    ckpt_prefix: str            # checkpoint filename stem, e.g. "mpn" ("" → no save)
+    file_prefix: str            # legacy figure/data prefix (when run_id is empty)
+    ckpt_prefix: str            # legacy checkpoint prefix; empty disables net saving
     title: str                  # figure suptitle prefix (before the mean±std note)
     header_note: str            # extra text in the console header, e.g. " (leaky RNN)"
     rule_label: dict
@@ -70,41 +70,38 @@ class RunConfig:
     build_params: Callable      # () -> (task_params, train_params, net_params)
     net_factory: Callable       # (net_params, verbose) -> net
     eval_outputs: Callable      # (net, inputs) -> outputs (B, T, n_output), no grad
+    # Nonempty opts into compact output names and run/seed checkpoint folders.
+    # Callers keep this ID stable across path-helper calls for one experiment.
+    run_id: str = ""
     # Task adapter (the data/metric seam): provides init_params / valid_batch /
     # train_batch / accuracy. Defaults to None, resolved to tasks.make_task(ruleset)
     # in run_seed so callers that don't set it keep the ring-task behaviour.
     task: object = None
     # Input-embedding learning rule (dmpn), decoupled from the per-rule MP-layer
-    # rule (see mpn.DeepMultiPlasticNet input_mode). Presentation only here (console
-    # log + an "_in-<mode>" filename fragment); the net reads it from net_params.
-    # 'match' (default) keeps logs/filenames byte-for-byte as before.
+    # rule (see mpn.DeepMultiPlasticNet input_mode). Recorded in metadata and logs;
+    # the net reads it from net_params. Legacy filenames also include this setting.
+    # 'paired' is resolved per rule by the model after cloning.
     input_mode: str = "match"
     # Fixed input standardization (see mpn.MultiPlasticNetBase.set_input_norm_stats).
     # When on, run_seed estimates per-feature input mean/std from a task sample of
     # input_norm_sample trials and freezes them into the base net (shared by every
-    # rule via the deepcopy) BEFORE training. Adds a "_inorm" filename fragment + a
-    # console/figure note. False (default) keeps logs/filenames byte-for-byte.
+    # rule via the deepcopy) BEFORE training. Recorded in metadata and the
+    # console/figure note (also an "_inorm" fragment in legacy filenames).
     input_normalize: bool = False
     input_norm_sample: int = 2048
     # Identity skip (residual) connections around each equal-width MP block (dmpn;
-    # see mpn.DeepMultiPlasticNet mp_residual). Presentation only here (console log +
-    # a "_res" filename fragment + a figure-title note); the net reads it from
-    # net_params. False (default) keeps logs/filenames byte-for-byte as before.
+    # see mpn.DeepMultiPlasticNet mp_residual). Recorded in metadata and console/
+    # figure notes; the net reads it from net_params. Legacy names include "_res".
     mp_residual: bool = False
     # Cross-layer temporal correction depth for the local rules (dmpn; see
-    # mpn.DeepMultiPlasticNet cross_layer_steps). Presentation only here (a "_xl{k}"
-    # filename fragment + a figure-title note); the net reads it from net_params.
-    # 0 (default) keeps logs/filenames byte-for-byte as before.
+    # mpn.DeepMultiPlasticNet cross_layer_steps). Recorded in metadata and figure
+    # notes; the net reads it from net_params. Legacy names include "_xl{k}".
     cross_layer_steps: int = 0
-    # optional extra string appended to the filename param tag (e.g. eta/lambda);
+    # Optional extra string appended to the legacy filename tag (e.g. eta/lambda);
     # keep it filename-safe. Empty by default.
     tag_extra: str = ""
-    # Architecture fragment for filenames (figure / data / checkpoint). When set,
-    # it REPLACES the default single-scalar "h{n_hidden}" fragment in param_tag, so
-    # a multi-MP-layer / embedding stack is distinguishable on disk (e.g.
-    # "e200-h150-100" for a 200-wide embedding then MP 200->150->100). Leave empty
-    # (the default) to keep the historical "h{n_hidden}" name byte-for-byte — a
-    # single-hidden run's filenames are then unchanged. Keep it filename-safe.
+    # Architecture metadata label, also used in legacy filenames. Empty uses
+    # the scalar n_hidden fallback; full architecture is always in net_params.
     arch_tag: str = ""
     # Human-readable architecture for the figure title / suffix and .npz provenance
     # (e.g. "arch=[20, 200, 150, 100, 3]"). Empty → the suffix falls back to
@@ -125,11 +122,11 @@ class RunConfig:
     log_grad_align: bool = True
     # ─ Weights & Biases logging (opt-in; see scripts/wandb_logging.py) ─
     # When use_wandb is True, run_seed opens ONE W&B run per (rule × seed) grouped
-    # under the run's output save-stem (run_stem, == the figure/.npz/JSON name), so
+    # under the run's output save-stem (run_stem, the figure/.npz name), so
     # a single invocation shows K = len(rules_to_run) colors (group/color by 'rule')
     # with each of the n_runs seeds as its own curve; a summary run logs the
-    # aggregate figures. False (the default) is a no-op — wandb is never imported and
-    # every existing output is byte-for-byte unchanged. wandb_project/entity/mode/dir
+    # aggregate figures. False (the default) does not import wandb or create W&B runs.
+    # wandb_project/entity/mode/dir
     # /group/tags are forwarded to wandb.init (None → wandb's own defaults; mode None
     # → online).
     use_wandb: bool = False
@@ -143,26 +140,18 @@ class RunConfig:
 
 # ─── Path helpers (read the passed cfg, i.e. the caller's live globals) ───────
 def param_tag(cfg):
-    # Architecture fragment: cfg.arch_tag if provided (multi-layer stacks), else
-    # the historical single-scalar "h{n_hidden}" (so single-hidden filenames are
-    # unchanged byte-for-byte).
+    """Detailed parameter tag for legacy flat outputs (no run_id)."""
+    # Full stack label when available; otherwise use the scalar hidden width.
     arch = cfg.arch_tag if getattr(cfg, "arch_tag", "") else f"h{cfg.n_hidden}"
     tag = (f"{cfg.ruleset}_{arch}_b{cfg.batch}_n{cfg.n_datasets}"
            f"_lr{cfg.lr:.0e}_{cfg.feedback_mode}")
-    # Append "_inorm" only when fixed input standardization is on, so filenames for
-    # existing (normalization-off) runs are unchanged byte-for-byte.
     if getattr(cfg, "input_normalize", False):
         tag += "_inorm"
-    # Append "_res" only when identity skip connections are on (unchanged otherwise).
     if getattr(cfg, "mp_residual", False):
         tag += "_res"
-    # Append "_xl{k}" only when the cross-layer temporal correction is on (unchanged
-    # otherwise), so corrected runs are distinguishable on disk from same-time runs.
     if getattr(cfg, "cross_layer_steps", 0):
         tag += f"_xl{cfg.cross_layer_steps}"
-    # Always record the input-embedding rule "_in-<mode>" (incl. the default
-    # 'match'), so every output filename (figure / checkpoint / .npz) is
-    # self-describing about how the input layer was trained.
+    # Legacy filenames record the input-embedding rule, including default 'match'.
     tag += f"_in-{getattr(cfg, 'input_mode', 'match')}"
     if cfg.tag_extra:
         tag += f"_{cfg.tag_extra}"
@@ -170,36 +159,36 @@ def param_tag(cfg):
 
 
 def run_stem(cfg):
-    """The shared output save-stem for this invocation — the common filename the
-    figure (.png), plot-data (.npz) and config (.json) are all built from
-    (`{file_prefix}_{param_tag}_runs{n_runs}`). Used as the W&B experiment/group
-    name so 'experiment name == the current file save name' (the user's request):
-    every rule × seed of one run lands in this group. Config-unique, so different
-    hyperparameters form different experiments."""
+    """Shared figure/data stem and W&B group; use legacy naming without run_id."""
+    if cfg.run_id:
+        return cfg.run_id
     return f"{cfg.file_prefix}_{param_tag(cfg)}_runs{cfg.n_runs}"
 
 
 def fig_path(cfg):
-    return os.path.join(cfg.fig_dir, f"{cfg.file_prefix}_{param_tag(cfg)}_runs{cfg.n_runs}.png")
+    return os.path.join(cfg.fig_dir, f"{run_stem(cfg)}.png")
 
 
 def data_path(cfg):
-    return os.path.join(cfg.data_dir, f"{cfg.file_prefix}_{param_tag(cfg)}_runs{cfg.n_runs}.npz")
+    return os.path.join(cfg.data_dir, f"{run_stem(cfg)}.npz")
 
 
 def config_path(cfg):
-    """Where the run's config JSON is written — the figure dir, same stem as the
-    figure/.npz (so the three outputs of a run share a name)."""
-    return os.path.join(cfg.fig_dir, f"{cfg.file_prefix}_{param_tag(cfg)}_runs{cfg.n_runs}.json")
+    """Compact saved-net runs use <run-id>/config.json; otherwise beside the figure."""
+    if cfg.run_id and cfg.save_nets and cfg.ckpt_prefix:
+        return os.path.join(cfg.ckpt_dir, cfg.run_id, "config.json")
+    return os.path.join(cfg.fig_dir, f"{run_stem(cfg)}.json")
 
 
 def align_fig_path(cfg):
     """Gradient-alignment-vs-BPTT figure path (figure dir, '_gradalign' suffix)."""
     return os.path.join(cfg.fig_dir,
-                        f"{cfg.file_prefix}_{param_tag(cfg)}_runs{cfg.n_runs}_gradalign.png")
+                        f"{run_stem(cfg)}_gradalign.png")
 
 
 def ckpt_path(cfg, rule, seed):
+    if cfg.run_id:
+        return os.path.join(cfg.ckpt_dir, cfg.run_id, f"seed{seed}", f"{rule}.pt")
     return os.path.join(cfg.ckpt_dir, f"{cfg.ckpt_prefix}_{param_tag(cfg)}_{rule}_seed{seed}.pt")
 
 
@@ -376,6 +365,9 @@ def run_seed(cfg, seed, record_steps, run_idx=0, wandb_logger=None):
     for rule in cfg.rules_to_run:
         net = copy.deepcopy(base)
         net.learning_rule = rule
+        resolved_input = getattr(net, 'resolved_input_mode', None)
+        if resolved_input is not None:
+            print(f"  {rule}: input_mode={net.input_mode}, resolved_input_mode={resolved_input}")
         nets[rule] = net
         optims[rule] = make_optim(net, cfg.lr, weight_decay=weight_decay)
 
@@ -583,12 +575,13 @@ def run_seed(cfg, seed, record_steps, run_idx=0, wandb_logger=None):
     # build_params() with a matching config (see notebooks/visualize_trained_networks.py).
     # ruleset is duplicated at top level for convenient labeling.
     if cfg.save_nets and cfg.ckpt_prefix:
-        os.makedirs(cfg.ckpt_dir, exist_ok=True)
         for rule in cfg.rules_to_run:
             path = ckpt_path(cfg, rule, seed)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
             torch.save({
+                "run_id": cfg.run_id,
                 "state_dict": nets[rule].state_dict(),
-                "net_params": net_params,
+                "net_params": {**net_params, "learning_rule": rule},
                 "task_params": task_params,
                 "train_params": train_params,
                 "ruleset": cfg.ruleset,
@@ -597,6 +590,7 @@ def run_seed(cfg, seed, record_steps, run_idx=0, wandb_logger=None):
                 "input_normalize": cfg.input_normalize,
                 "mp_residual": cfg.mp_residual,
                 "input_mode": cfg.input_mode,
+                "resolved_input_mode": getattr(nets[rule], 'resolved_input_mode', None),
                 "seed": seed,
             }, path)
             print(f"  saved network: {path}")
@@ -699,6 +693,7 @@ def save_plot_data(cfg, record_steps, runs, agg, path=None,
         "rules": np.asarray(cfg.rules_to_run),
         "seeds": np.asarray([cfg.seed + k for k in range(cfg.n_runs)]),
         # scalar/string config for provenance + title reconstruction
+        "run_id": cfg.run_id,
         "ruleset": cfg.ruleset, "n_hidden": cfg.n_hidden, "batch": cfg.batch,
         "n_datasets": cfg.n_datasets, "lr": cfg.lr, "n_runs": cfg.n_runs,
         "feedback_mode": cfg.feedback_mode, "input_normalize": cfg.input_normalize,
@@ -755,8 +750,8 @@ def _json_safe(x):
 
 
 def save_config(cfg, path=None):
-    """Write a JSON of the run's training + network setup next to the figure (same
-    stem). Records the RunConfig scalars plus the RESOLVED net_params / task_params /
+    """Write training + network setup to config_path(cfg), or an explicit path.
+    Records the RunConfig scalars plus the RESOLVED net_params / task_params /
     train_params (built once via the cfg hooks, exactly as run_seed builds them), so
     the JSON fully describes how the nets were configured. Best-effort: any value
     that is not natively JSON-serializable is coerced by _json_safe, and the whole
@@ -769,6 +764,7 @@ def save_config(cfg, path=None):
             task_params, train_params, net_params)
         record = {
             # run / experiment
+            "run_id": cfg.run_id,
             "file_prefix": cfg.file_prefix, "title": cfg.title,
             "ruleset": cfg.ruleset, "rules_to_run": list(cfg.rules_to_run),
             "seed": cfg.seed, "n_runs": cfg.n_runs,
@@ -784,9 +780,14 @@ def save_config(cfg, path=None):
             "arch_desc": getattr(cfg, "arch_desc", ""),
             "feedback_mode": cfg.feedback_mode,
             "input_normalize": cfg.input_normalize,
+            "input_norm_sample": cfg.input_norm_sample,
+            "log_grad_align": cfg.log_grad_align,
             "mp_residual": cfg.mp_residual,
             "cross_layer_steps": getattr(cfg, "cross_layer_steps", 0),
             "input_mode": cfg.input_mode,
+            "resolved_input_modes": {
+                rule: resolve_input_mode(cfg.input_mode, rule) for rule in cfg.rules_to_run
+            } if net_params.get("net_type") == "dmpn" else {},
             # the resolved param dicts the nets are actually built from
             "net_params": _json_safe(net_params),
             "task_params": _json_safe(task_params),
@@ -831,6 +832,10 @@ def replot_from_npz(cfg, npz_path, save_to=None):
 def run_experiment(cfg):
     """Full experiment: train every rule in lockstep across cfg.n_runs seeds,
     aggregate mean/std, save plot data, render the figure, print a summary."""
+    print(f"Run: {run_stem(cfg)}")
+    # Keep setup available even if training stops before every seed finishes.
+    if cfg.run_id:
+        save_config(cfg)
     print(f"Task: {cfg.ruleset}{cfg.header_note}  |  rules: {cfg.rules_to_run}  |  "
           f"runs: {cfg.n_runs}  |  {arch_suffix(cfg)} batch={cfg.batch} "
           f"steps={cfg.n_datasets} lr={cfg.lr} clip={cfg.grad_clip}")
@@ -841,7 +846,7 @@ def run_experiment(cfg):
           f"  input_mode: {getattr(cfg, 'input_mode', 'match')}\n")
 
     # Weights & Biases (opt-in). Import lazily so non-W&B runs never touch wandb.
-    # The experiment name == the output save-stem (figure/.npz/JSON share it), used
+    # The experiment name == the output save-stem (figure/.npz share it), used
     # as the W&B group so all K rules × n_runs seeds compare on one page.
     wb = None
     experiment = run_stem(cfg)
@@ -905,7 +910,8 @@ def run_experiment(cfg):
 
     save_plot_data(cfg, record_steps, runs, agg, align_runs=align_runs,
                    align_agg=align_agg)
-    save_config(cfg)   # JSON of the training + network setup, next to the figure
+    if not cfg.run_id:
+        save_config(cfg)   # legacy config beside the figure; compact runs save at startup
     # Append notes to the figure title only when the feature is on / non-default, so
     # existing (norm-off, match) figure titles are unchanged.
     inorm_note = ", input norm" if getattr(cfg, "input_normalize", False) else ""

@@ -43,6 +43,7 @@ import torch
 from torch import nn
 from torch.utils.data import TensorDataset
 import torch.nn.functional as F
+
 from torch.nn.init import orthogonal_
 
 import math
@@ -52,6 +53,24 @@ import time
 
 from net_helpers import BaseNetwork, BaseNetworkFunctions
 from net_helpers import rand_weight_init, get_activation_function
+
+
+def resolve_input_mode(input_mode, learning_rule):
+    """Resolve the input-gradient algorithm for a rule, before trainability checks."""
+    if input_mode == 'paired':
+        paired = {'bptt': 'exact', 'local_direct': 'three_factor',
+                  'local_diag_rflo': 'diag_mtrace'}
+        if learning_rule not in paired:
+            raise ValueError(f"input_mode='paired' does not support {learning_rule!r}; "
+                             "use match or an explicit input mode")
+        return paired[learning_rule]
+    if input_mode == 'match':
+        return 'exact' if learning_rule == 'bptt' else 'three_factor'
+    if input_mode == 'diag_mtrace':
+        return 'exact' if learning_rule == 'bptt' else 'diag_mtrace'
+    if input_mode in ('exact', 'three_factor'):
+        return input_mode
+    raise ValueError(f"unknown input_mode {input_mode!r}")
 
 
 # ─── Feedback (learning-signal) modes ─────────────────────────────────────────
@@ -1643,19 +1662,20 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
         #   'diag_mtrace'  — local runs track the first MP layer's modulation-column
         #                    sensitivity to the corresponding embedding row. BPTT
         #                    stays exact. Requires exact_spatial feedback.
+        #   'paired'       — bptt: exact; local_direct: three_factor;
+        #                    local_diag_rflo: diag_mtrace. No row-local mapping.
         # exact/three_factor use a gradient splice; diag_mtrace runs forward-mode
         # sensitivities inside the local pass, without an additional BPTT pass.
         self.input_mode = cfg.get('input_mode', 'match')
-        assert self.input_mode in ('match', 'exact', 'three_factor', 'diag_mtrace'), \
-            f"unknown input_mode '{self.input_mode}'"
+        resolve_input_mode(self.input_mode, self.learning_rule)
         # feedback_mode governs how each hidden layer's learning signal is formed
         # in the local rules (see the _FEEDBACK_MODES table and
         # _same_time_boundary_signals). B_feedback_init is stashed for the
         # per-layer FA buffers built after the MP layers exist.
         self.feedback_mode = canonical_feedback_mode(cfg.get('feedback_mode', 'exact_spatial'))
-        if self.input_mode == 'diag_mtrace':
+        if self.input_mode in ('diag_mtrace', 'paired'):
             if not self.input_layer_active or self.feedback_mode != 'exact_spatial':
-                raise ValueError("diag_mtrace requires an input embedding and exact_spatial feedback")
+                raise ValueError(f"{self.input_mode} requires an input embedding and exact_spatial feedback")
         self._B_feedback_init = cfg.get('B_feedback_init', 'xavier')
         # cross_layer_steps: depth of the cross-layer TEMPORAL correction added to the
         # surrogate lower-layer local gradients (see _cross_layer_correction). 0 (the
@@ -2342,6 +2362,12 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
         for mp in layers:
             mp.assert_local_config()
         assert mode in ('exact', 'diag', 'direct')
+        # Resolve before hebb_pre can collapse the MP eligibility mode to direct.
+        # Public gradient methods can run independently of self.learning_rule.
+        input_mode = resolve_input_mode(self.input_mode, {
+            'exact': 'local_exact_rowlocal', 'diag': 'local_diag_rflo',
+            'direct': 'local_direct',
+        }[mode])
         # hebb_pre: M input-only → dM/dW = dM/db = 0, every plastic trace is zero,
         # so the trace modes collapse to the direct rule (per layer). _assoc already
         # zeroes the trace terms, but routing to 'direct' also skips the unused
@@ -2380,7 +2406,7 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
         # need_b_in then decide which key to emit, matching _trainable_params exactly.
         need_W_in, need_b_in = self._embed_grad_flags()
         embed = need_W_in or need_b_in
-        input_mtrace = embed and self.input_mode == 'diag_mtrace'
+        input_mtrace = embed and input_mode == 'diag_mtrace'
         if input_mtrace:
             if self.feedback_mode != 'exact_spatial':
                 raise ValueError("diag_mtrace requires exact_spatial feedback")
@@ -2630,6 +2656,11 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
             return self.local_direct_gradients(inputs, labels, masks, **kwargs)
         raise ValueError(f"unknown learning_rule '{rule}'")
 
+    @property
+    def resolved_input_mode(self):
+        """Input algorithm for the current rule; recomputed after cloning/reloading."""
+        return resolve_input_mode(self.input_mode, self.learning_rule)
+
     def _apply_input_mode(self, grads, inputs, labels, masks, **kwargs):
         """Override W_in/b_in in `grads` when input_mode requests a rule the native
         pass did not already produce for the embedding.
@@ -2641,10 +2672,10 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
           input_mode='exact'        on a LOCAL run → take W_in/b_in from a BPTT pass.
           input_mode='three_factor' on a BPTT run  → take W_in/b_in from a local pass
                                                       (local_direct is the cheapest).
-        diag_mtrace is handled inside local passes and leaves BPTT unchanged.
+        diag_mtrace and paired are handled inside the selected pass; BPTT stays exact.
         'match', a non-trainable embedding, or an already-matching native rule → no-op.
         The extra pass recomputes the full gradient but only W_in/b_in are kept."""
-        if self.input_mode in ('match', 'diag_mtrace') or not self._has_trainable_embed():
+        if self.input_mode in ('match', 'diag_mtrace', 'paired') or not self._has_trainable_embed():
             return grads
         native_is_exact = (self.learning_rule == 'bptt')
         want_exact = (self.input_mode == 'exact')
@@ -2660,7 +2691,7 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
     def sequence_gradients(self, inputs, labels, masks, **kwargs):
         """Dispatch on self.learning_rule; write grads into each param's .grad.
         Input modes exact/three_factor may splice W_in/b_in from another pass.
-        diag_mtrace runs inside the local pass and leaves BPTT unchanged."""
+        diag_mtrace/paired run inside the selected pass and leave BPTT unchanged."""
         grads = self._grads_for_rule(self.learning_rule, inputs, labels, masks, **kwargs)
         grads = self._apply_input_mode(grads, inputs, labels, masks, **kwargs)
 

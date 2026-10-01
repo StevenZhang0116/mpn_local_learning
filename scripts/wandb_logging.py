@@ -5,13 +5,12 @@ Optional Weights & Biases logging for the train_common experiment loop.
 
 Isolated in this module so the `wandb` dependency is only touched when a run
 opts in (RunConfig.use_wandb=True, e.g. `python train_mpn.py --wandb`);
-train_common imports it lazily, so train_rnn / non-W&B runs never load wandb and
-stay byte-for-byte identical.
+train_common imports it lazily, so non-W&B runs never load wandb.
 
 Run layout — ONE W&B run per (rule × seed):
   * project  : cfg.wandb_project
-  * group    : the run's output save-stem — the SAME stem the figure / .npz /
-               config-JSON share (train_common.run_stem). This is the
+  * group    : the output save-stem shared by the figure / .npz
+               (train_common.run_stem; also the MPN checkpoint-folder ID). This is the
                "experiment name": all K rules × N_RUNS seeds of one invocation
                land in it and compare on one page.
   * name     : "<rule>_<save-stem>_seed<seed>" — the rule + the output save-stem

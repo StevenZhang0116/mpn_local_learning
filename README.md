@@ -66,9 +66,32 @@ credit-assignment benchmark: its BPTT-vs-local gap should widen with sequence
 length — the central question this project studies.
 
 Each run writes a two-panel (train / test accuracy) figure to `figure/`, the arrays
-behind it to `figure_data/`, and (MPN) trained nets to `checkpoints/`. Reload figures
-without retraining via `replot_from_npz(data_path())`; explore results with the
-analysis scripts in `notebooks/`.
+behind it to `figure_data/`, and (MPN) trained nets to `checkpoints/`. MPN outputs
+use a short `<model>_<task>_<unique-id>` run ID, for example:
+
+```text
+checkpoints/dmpn_contextdelaydm1_a1b2c3d4e5f6/
+  config.json
+  seed288/
+    bptt.pt
+    local_diag_rflo.pt
+    local_direct.pt
+  seed289/
+    ...
+figure/dmpn_contextdelaydm1_a1b2c3d4e5f6.png
+figure_data/dmpn_contextdelaydm1_a1b2c3d4e5f6.npz
+```
+
+One CLI invocation gets one folder, with a subfolder for each seed. Separate
+invocations get different IDs even with identical settings. Batch size, learning
+rate, steps, full architecture, input mode, modulation settings, and task setup
+are saved in metadata rather than filenames. `config.json` is written before
+training; each checkpoint also contains its own model, task, and training setup.
+When checkpoint saving is disabled, the config JSON goes beside the figure.
+RNN output naming is unchanged. Reload a saved figure without retraining via
+`replot_from_npz("figure_data/<run-id>.npz")`; path helpers such as `data_path()`
+refer to the current process's experiment. Explore results with the analysis
+scripts in `notebooks/`.
 
 For temporal input-layer credit without an extra BPTT pass, select
 `--input-mode diag_mtrace --feedback exact_spatial` on a `dmpn` run. Local rules
@@ -83,9 +106,37 @@ independently of sequence length. See [the derivation and limitations](docs/inpu
 
 For example, change `--input-mode match` to `--input-mode diag_mtrace` in a local
 learning comparison. Keep `--cross-layer-steps 0` for the original MP update rules;
-`1` adds its separate correction to MP parameters only. The saved run stem contains
-`_in-diag_mtrace`, and checkpoint loading restores this input mode. Existing
+`1` adds its separate correction to MP parameters only. Metadata records
+`input_mode="diag_mtrace"`, and checkpoint loading restores this input mode. Existing
 `match`, `exact`, and `three_factor` modes retain their behavior.
+
+For a comparison of complete algorithm pairings, use:
+
+```bash
+python scripts/train_mpn.py --input-mode paired --feedback exact_spatial --cross-layer-steps 0 --local-bias-mode direct
+```
+
+`paired` defaults to BPTT, diagonal RFLO, and direct when `--rules` is omitted:
+
+| Learning rule | Input embedding update under `paired` |
+|---|---|
+| `bptt` | Full BPTT (`exact`) |
+| `local_diag_rflo` | First-layer modulation-column trace (`diag_mtrace`) |
+| `local_direct` | Direct three-factor update (`three_factor`) |
+
+It requires `dmpn`, an input embedding, and `exact_spatial` feedback.
+`local_exact_rowlocal` is rejected because its pairing is undefined. `match`
+retains its historical mapping: full BPTT for BPTT and three-factor input updates
+for every local rule. To isolate the input-trace contribution, compare paired
+diagonal RFLO with diagonal RFLO using `--input-mode match`, keeping all other
+settings fixed. The command above explicitly disables cross-layer temporal
+corrections and selects direct MP bias updates; `paired` itself changes only
+the input-update policy, not those independent settings.
+
+Metadata records `input_mode="paired"`. Console logs and checkpoints record each
+model's `resolved_input_mode`; the config JSON records `resolved_input_modes`
+for all selected rules. The requested `input_mode` remains `paired`, and the
+effective mapping is recomputed whenever the model's learning rule changes.
 
 `train_mpn.py` defaults to hard modulation bounds `[-1, 1]` and no regularization:
 `MODULATION_MODE="hard"`, `MODULATION_BOUND=1.0`, and `REG_LAMBDA=0.0`.
@@ -99,10 +150,9 @@ and frozen-state mask. Set `REG_LAMBDA=1e-4` for L2 weight regularization.
 Adam applies coupled weight decay to
 trainable weight matrices only, with penalty `(REG_LAMBDA / 2) * sum(W**2)`;
 biases and activities are not regularized. Decay is applied after task-gradient
-clipping; logged losses, scheduling, and alignment remain task-only. Filename
-tags are `_mb-B-B` for hard clipping, `_mtanh-B` for smooth modulation, and
-`_l2-1e-04` for that regularization setting. The unbounded mode has no modulation
-tag. Existing hard-bound filenames stay unchanged at `B=1`.
+clipping; logged losses, scheduling, and alignment remain task-only. The config
+JSON and checkpoints store modulation bounds/activation/scale in
+`net_params.ml_params` and regularization in `train_params.reg_lambda`.
 
 Every `train_mpn.py` CLI invocation also mirrors stdout and stderr to
 `log/train_mpn_YYYYMMDD_HHMMSS_PID.log`, following the `MultiTaskMPN` logging
@@ -123,9 +173,11 @@ From the project root, run both parameter and performance analyses together:
 python notebooks/visualize_trained_networks.py
 ```
 
-This selects a complete checkpoint group containing BPTT, diagonal RFLO, and
-direct for the same run and seed. Groups are ranked by the newest requested
-checkpoint's modification time, then stem and numeric seed (largest wins).
+This searches `checkpoints/` recursively, supporting both the new run/seed folders
+and existing flat checkpoint filenames. It selects a complete group containing
+BPTT, diagonal RFLO, and direct for the same run and seed. Groups are ranked by
+the newest requested checkpoint's modification time, then stem, numeric seed,
+and directory (largest wins).
 Incomplete groups are skipped; training status is not checked. The selected stem
 and seed are printed. Networks are loaded once and task settings come from the
 first requested rule's checkpoint, so no task setup or manually chosen seed is
@@ -134,14 +186,16 @@ needed. These plots support deep MPN (`dmpn`) checkpoints.
 Optional overrides and separate analyses:
 
 ```bash
-python notebooks/visualize_trained_networks.py --ckpt-stem "$CKPT_STEM" --trials 2000
+python notebooks/visualize_trained_networks.py --run-dir checkpoints/dmpn_contextdelaydm1_a1b2c3d4e5f6 --trials 2000
 python notebooks/visualize_trained_networks.py --analysis weights --seed 37
 python notebooks/visualize_trained_networks.py --analysis performance --ckpt-stem "$CKPT_STEM"
 python notebooks/compare_mpn_rnn_performance.py --mpn-file "$MPN_NPZ" --rnn-file "$RNN_NPZ"
 ```
 
-`CKPT_STEM` is the checkpoint filename prefix before `<rule>_seed<seed>.pt`,
-including its trailing underscore. `--seed` pins a saved seed; otherwise the
+`--run-dir` (an alias for `--ckpt-dir`) accepts a checkpoint root, one run folder,
+or one seed folder. `CKPT_STEM` is either a new run-folder name or the legacy
+filename prefix before `<rule>_seed<seed>.pt`, including its trailing underscore.
+`--seed` pins a saved seed; otherwise the
 newest complete seed matching the requested stem/rules is selected automatically.
 `MPN_NPZ` and `RNN_NPZ` select existing plot-data files (bare names also resolve in
 `figure_data/`). Checkpoint scripts also accept `--ckpt-dir` and `--rules`.
@@ -164,7 +218,9 @@ They are project-root-relative, independent of the working directory:
   distributions, accuracy, example trials, and modulation trajectories.
   Use `--analysis weights` or `--analysis performance` for only that subset;
   the default `--analysis all` produces both. Alignment plots are skipped when
-  their comparison rules are absent. Figures are saved as PNGs only.
+  their comparison rules are absent. New-layout checkpoints produce short PNG
+  filenames under `<output-dir>/<run-id>/seed<N>/` (e.g. `weight_heatmaps.png`).
+  Legacy checkpoints keep their existing figure naming.
   Modulation histories are stored only for the
   representative trials actually plotted, showing the first, middle, and last MP
   layers (all layers for depths up to three; the later middle layer for even depths).
@@ -185,6 +241,10 @@ They are project-root-relative, independent of the working directory:
   batch/time/output elements, excluding weight regularization.
 - `notebooks/compare_mpn_rnn_performance/`: combined learning curves;
   filenames include a source-pair identifier to distinguish different runs.
+  Supply both `--mpn-file` and `--rnn-file`. The script reads task, hidden widths,
+  and feedback mode from `.npz` metadata, with a legacy filename fallback when
+  metadata is missing. It checks the full hidden-layer stack, feedback mode, and
+  plotted metric for agreement; task differences produce a warning.
 
 These analysis output directories are Git-ignored. Training-script figures
 continue to use `figure/`.

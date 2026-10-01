@@ -29,40 +29,51 @@ DEFAULT_RULES = ("bptt", "local_diag_rflo", "local_direct")
 
 
 def select_checkpoints(directory, rules, stem=None, seed=None):
-    """Pick the newest complete group containing every requested rule.
+    """Recursively pick a complete group from run/seed folders or legacy files.
 
     Rank groups by the newest requested member's file modification time, then
-    stem and numeric seed (largest wins). This does not inspect training status.
-    Explicit stem/seed values filter candidates; groups are never mixed.
+    stem, numeric seed, and directory (largest wins). This does not inspect
+    training status.
+    Explicit stem/seed values filter candidates; directories are never mixed.
+    For compact checkpoints, stem is the run-folder name (trailing '_' optional).
     Return (stem, seed, paths_by_rule), preserving the requested rule order.
     """
     pattern = re.compile(r"^(?P<stem>.+_)(?P<rule>" +
                          "|".join(map(re.escape, RULE_LABEL)) +
                          r")_seed(?P<seed>\d+)\.pt$")
     groups = {}
-    for path in Path(directory).expanduser().glob("*.pt"):
+    for path in Path(directory).expanduser().rglob("*.pt"):
         match = pattern.fullmatch(path.name)
-        if not match or not path.is_file():
+        if not path.is_file():
             continue
-        found_stem, found_seed = match["stem"], int(match["seed"])
-        if stem is not None and found_stem != stem:
+        seed_dir = re.fullmatch(r"seed(\d+)", path.parent.name)
+        if path.stem in RULE_LABEL and seed_dir:
+            found_stem = path.parent.parent.name + "_"
+            found_seed, rule = int(seed_dir[1]), path.stem
+            matches_stem = stem in (None, found_stem, found_stem[:-1])
+        elif match:
+            found_stem, found_seed, rule = match["stem"], int(match["seed"]), match["rule"]
+            matches_stem = stem in (None, found_stem)
+        else:
+            continue
+        if not matches_stem:
             continue
         if seed is not None and found_seed != seed:
             continue
-        groups.setdefault((found_stem, found_seed), {})[match["rule"]] = path
+        groups.setdefault((found_stem, found_seed, str(path.parent.resolve())), {})[rule] = path
     complete = {key: paths for key, paths in groups.items()
                 if all(rule in paths for rule in rules)}
     if not complete:
         available = "; ".join(
             f"{s}seed{n}: missing {', '.join(r for r in rules if r not in paths)}"
-            for (s, n), paths in sorted(groups.items()))
+            for (s, n, _), paths in sorted(groups.items()))
         raise ValueError(
             f"No complete checkpoint group in {directory} for rules {', '.join(rules)} "
             f"(stem={stem!r}, seed={seed!r}). " +
             (available or "Check --ckpt-dir, --ckpt-stem, and --seed."))
     key = max(complete, key=lambda k: (
-        max(complete[k][r].stat().st_mtime_ns for r in rules), k[0], k[1]))
-    return *key, {rule: complete[key][rule] for rule in rules}
+        max(complete[k][r].stat().st_mtime_ns for r in rules), *k))
+    return key[0], key[1], {rule: complete[key][rule] for rule in rules}
 
 
 @dataclass
@@ -76,6 +87,7 @@ class AnalysisContext:
     task_params: Optional[dict]
     output_dir: Path
     trials: int
+    compact_output: bool = False
 
     @property
     def rules(self):
@@ -83,7 +95,8 @@ class AnalysisContext:
 
     def save_fig(self, fig, suffix, dpi=150):
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        path = self.output_dir / f"{self.stem}seed{self.seed}_{suffix}.png"
+        name = suffix if self.compact_output else f"{self.stem}seed{self.seed}_{suffix}"
+        path = self.output_dir / f"{name}.png"
         fig.savefig(path, dpi=dpi, bbox_inches="tight")
         plt.close(fig)
         print(f"saved figure -> {path}")
@@ -118,8 +131,12 @@ def load_context(args):
                              "(hp and rules). Use --analysis weights for older or "
                              "non-ring checkpoints; current training settings are not substituted.")
     ruleset = first.get("ruleset") or first["net_params"].get("ruleset", "?")
+    compact = all(path.name == f"{rule}.pt" for rule, path in paths.items())
+    output_dir = args.output_dir.expanduser().resolve()
+    if compact:
+        output_dir = output_dir / stem[:-1] / f"seed{seed}"
     context = AnalysisContext(stem, seed, nets, ruleset, task_params,
-                              args.output_dir.expanduser().resolve(), args.trials)
+                              output_dir, args.trials, compact_output=compact)
     print(f"ruleset={ruleset}; figures will be saved to: {context.output_dir}")
     return context
 
@@ -759,8 +776,9 @@ def main():
     """Run parameter, performance, or both analyses from one checkpoint group."""
     parser = argparse.ArgumentParser(
         description="Save trained MPN parameter and performance figures from one checkpoint group.")
-    parser.add_argument("--ckpt-dir", type=Path, default=_bootstrap.ROOT / "checkpoints")
-    parser.add_argument("--ckpt-stem", help="checkpoint prefix; default: newest complete group")
+    parser.add_argument("--ckpt-dir", "--run-dir", type=Path, default=_bootstrap.ROOT / "checkpoints",
+                        help="checkpoint root, run folder, or seed folder (searched recursively)")
+    parser.add_argument("--ckpt-stem", help="run-folder name or legacy filename prefix; default: newest complete group")
     parser.add_argument("--seed", type=int, help="saved seed; default: newest complete group")
     parser.add_argument("--rules", nargs="+", choices=list(RULE_LABEL), default=list(DEFAULT_RULES))
     parser.add_argument("--analysis", choices=("all", "weights", "performance"), default="all")

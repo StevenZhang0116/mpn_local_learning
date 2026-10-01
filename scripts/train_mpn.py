@@ -14,10 +14,12 @@ For each of N_RUNS seeds we train the RULES_TO_RUN networks in lockstep:
   - 'bptt'            — autograd through the unrolled forward + M-update
   - 'local_diag_rflo' — diagonal / same-synapse RFLO local learning
   - 'local_direct'    — direct/instantaneous local approximation
-BPTT with input_mode=match/exact/diag_mtrace trains every parameter exactly.
+BPTT with input_mode=match/exact/diag_mtrace/paired trains every parameter exactly.
 Local MP layers use the selected eligibility rule. Input mode match uses direct
 three-factor input gradients; exact uses a BPTT input splice; diag_mtrace adds
 first-MP-layer modulation-column sensitivities for input weights and biases.
+paired uses diag_mtrace only for local_diag_rflo, direct three-factor input
+updates for local_direct, and full BPTT for bptt; row-local is unsupported.
 three_factor forces direct input gradients even under BPTT. All start from the
 SAME init (deepcopy), SAME per-step data, SAME held-out valid set, own Adam + scheduler,
 via sequence_gradients() which writes .grad for optimizer.step().
@@ -42,28 +44,30 @@ that also computes BPTT input gradients during local runs. Example:
 DFA, but no longer the strictly synapse-local diagonal variant).
 
 Weights & Biases (https://wandb.ai): pass --wandb to log every run live. Each
-invocation becomes ONE W&B experiment named after this run's output save-stem (the
-same name the figure/.npz/JSON share), containing K = len(RULES_TO_RUN) × N_RUNS
-runs — one per (rule × seed). Group/color by 'rule' in the W&B UI to see exactly K
-colors, with each of the N_RUNS seeds drawn as its own separate curve; a summary
-run also logs the aggregate mean±std figures. Off by default (no wandb import, all
-outputs byte-for-byte unchanged). See scripts/wandb_logging.py.
+invocation becomes ONE W&B experiment named after this run's output ID (also used
+for the figure/.npz and checkpoint folder), containing len(RULES_TO_RUN) × N_RUNS
+runs — one per (rule × seed). Group/color by 'rule' in the W&B UI to use one color
+per learning rule, with each seed drawn as its own separate curve; a summary
+run also logs the aggregate mean±std figures. Off by default; wandb is only
+imported when enabled. See scripts/wandb_logging.py.
 
 Run from this directory:
     python train_mpn.py                        # deep MPN (default)
     python train_mpn.py --wandb                # + log to Weights & Biases
-    python train_mpn.py --net mpn1             # single MP layer, no input embedding
+    python train_mpn.py --net mpn1 --no-residual  # single MP layer, no embedding
     python train_mpn.py --net dmpn --hidden 100 --runs 3 --task delaygo
     python train_mpn.py --net dmpn --hidden 150 100   # deep MP stack (two MP layers)
 
 The MP-layer stack depth follows --hidden: one width → one MP layer; several
-widths → one MP layer per width (a deep stack, dmpn only). The architecture is
-encoded in every output filename (figure / checkpoint / .npz) and the figure
-title, so multi-layer runs are self-describing and don't collide with the
-single-layer runs on disk.
+widths → one MP layer per width (a deep stack, dmpn only). Outputs use a short
+<model>_<task>_<unique-id> name. Checkpoints live under
+checkpoints/<run-id>/seed<N>/<rule>.pt, with the full setup in config.json in
+the run folder and in each checkpoint. Architecture is also in figure titles
+and plot-data metadata. Separate CLI invocations get different IDs.
 """
 import argparse
-import os
+import json
+import uuid
 import torch
 import numpy as np 
 
@@ -74,7 +78,10 @@ import train_common as tc
 from run_logging import tee_output
 
 # ─── Configuration (aligned with MultiTaskMPN/one_task/one_task.py) ───────────
-SEED = np.random.randint(0, 1000)  # random seed for this run (small → short run names)
+SEED = np.random.randint(0, 1000)  # starting seed; subsequent runs increment it
+# Stable path helpers within this process; separate configurations/invocations
+# receive distinct IDs, including repeated CLI runs with identical seeds.
+_RUN_IDS = {}
 RULESET = "contextdelaydm1"           # single task to train on
 # Network: 'dmpn' = DeepMultiPlasticNet (trainable input embedding + MP layer,
 # RNN-comparable); 'mpn1' = MultiPlasticNet (single MP layer, no embedding).
@@ -100,6 +107,8 @@ FEEDBACK_MODE = "exact_spatial"
 #                    the bptt run — MP+readout stay exact-autograd). --input-mode on CLI.
 #   'diag_mtrace'  — local runs use a first-MP-layer diagonal-column modulation
 #                    sensitivity trace; BPTT stays exact. Needs exact_spatial.
+#   'paired'       — bptt: exact; local_direct: three_factor; local_diag_rflo:
+#                    diag_mtrace. Requires dmpn/exact_spatial; excludes row-local.
 INPUT_MODE = "exact"
 # --dfa selects 'direct' for both local variants to isolate weight traces.
 # Use --local-bias-mode exact for the manuscript's row-local bias variant.
@@ -114,7 +123,7 @@ REG_LAMBDA = 0.0
 # conditions the modulation dynamics; standardizing by FIXED per-feature statistics
 # (estimated once from a task sample, then frozen and applied identically to every
 # rule + validation) removes that scale artifact without adding any adaptive/learned
-# norm. Off by default (identity → existing runs/filenames unchanged byte-for-byte).
+# norm. Off by default (identity); recorded in checkpoint/config metadata.
 # --input-normalize on CLI. The sample size used to estimate the stats:
 INPUT_NORMALIZE = False
 INPUT_NORM_SAMPLE = 2048      # #trials sampled to estimate the fixed input stats
@@ -136,8 +145,8 @@ MP_RESIDUAL = True
 # weight/bias eligibility. It need not improve gradient error at longer T (see mpn.DeepMultiPlasticNet._cross_layer_correction and
 # tests/validate_local_learning tier17). It costs one extra downward adjoint sweep +
 # a step of stored state per training step, and applies to every non-bptt rule
-# (bptt is already exact). 0 (default) = the pure same-time rule, byte-for-byte as
-# before. Only 0 and 1 are implemented. --cross-layer-steps on CLI.
+# (bptt is already exact). 0 selects the pure same-time rule. Only 0 and 1 are
+# implemented; the default below is 1, while --dfa selects 0.
 CROSS_LAYER_STEPS = 1
 N_RUNS = 1                    # independent seeds per rule
 # Hidden width(s) of the MP-layer stack. A single int → one MP layer (the classic
@@ -164,12 +173,12 @@ DTYPE = torch.float32         # float32 for speed (one_task.py also runs float32
 
 # ─── Weights & Biases (https://wandb.ai) logging (opt-in) ─────────────────────
 # When USE_WANDB is on (--wandb), each invocation opens ONE W&B run per
-# (rule × seed), all grouped under this run's output save-stem — the SAME name the
-# figure/.npz/JSON share (train_common.run_stem) — which becomes the W&B
+# (rule × seed), all grouped under the output ID shared by the figure/.npz and
+# checkpoint folder (train_common.run_stem), which becomes the W&B
 # experiment/group. Group/color by 'rule' in the UI to see exactly K = len(
 # RULES_TO_RUN) colors, with each of the N_RUNS seeds drawn as its own separate
 # curve; a final summary run logs the aggregate mean±std figures. Off by default →
-# wandb is never imported and all outputs are byte-for-byte unchanged.
+# wandb is not imported and no W&B runs are created.
 USE_WANDB = False
 WANDB_PROJECT = "mpn_local_learning"   # W&B project the runs land in
 WANDB_ENTITY = None                    # None → your default W&B entity (user/team)
@@ -277,7 +286,7 @@ def build_params():
         "input_normalize": INPUT_NORMALIZE,  # fixed per-feature input standardization
         "mp_residual": _mp_residual(),   # identity skip around each equal-width MP block
         "cross_layer_steps": CROSS_LAYER_STEPS,  # depth-1 cross-layer temporal correction
-        "input_mode": INPUT_MODE,        # input-embedding rule (match/exact/three_factor)
+        "input_mode": INPUT_MODE,        # requested input-embedding policy
         "ml_params": {
             "bias": True,
             "local_bias_mode": LOCAL_BIAS_MODE,
@@ -347,29 +356,11 @@ def _net_class():
     return m.DeepMultiPlasticNet if NET_TYPE == "dmpn" else m.MultiPlasticNet
 
 
-def _eta_lam_tag():
-    """Filename fragment for the MP-layer eta/lambda init, e.g. 'eta1.00_lam0.99'.
-    Derived from build_params the same way MultiPlasticLayer initializes them:
-    eta = eta_clamp (default 1.0); lambda = 1 - dt/m_time_scale."""
-    task_params, _, net_params = build_params()
-    ml = net_params["ml_params"]
-    eta0 = ml.get("eta_clamp", 1.00)                      # default eta init
-    dt = task_params.get("dt", 40)
-    lam0 = 1.0 - dt / ml["m_time_scale"]                  # default lambda init
-    return f"eta{eta0:.2f}_lam{lam0:.2f}"
-
-
 def _arch_tag():
-    """Filename-safe architecture fragment for the MP-layer stack, so multi-MP-layer
-    runs don't collide on disk. Returns "" for a SINGLE hidden width — param_tag
-    then falls back to the historical 'h{n_hidden}', so existing single-layer
-    checkpoints/figures resolve byte-for-byte. For a deep stack it returns the
-    joined widths, e.g. N_HIDDEN=[150, 100] -> 'h150-100'. (Embedding presence is
-    already encoded by the dmpn/mpn1 filename prefix; the FULL arch, embedding
-    included, appears in the figure title/provenance via _arch_desc.)"""
+    """MP-stack metadata label; a single width uses the scalar n_hidden fallback."""
     widths = _hidden_widths()
     if len(widths) == 1:
-        return ""                                     # → legacy 'h{n_hidden}' tag
+        return ""                                     # use n_hidden metadata
     return "h" + "-".join(str(w) for w in widths)     # e.g. 'h150-100'
 
 
@@ -390,11 +381,16 @@ def _cfg():
     (e.g. NET_TYPE, N_HIDDEN, FEEDBACK_MODE) before any path/build helper below."""
     net_cls = _net_class()
     desc = "deep MPN" if NET_TYPE == "dmpn" else "MPN"
-    # NET_TYPE is part of the prefix so dmpn/mpn1 runs don't overwrite each other.
-    # n_hidden stays a SCALAR (the first MP-layer width) for the legacy 'h{n_hidden}'
-    # single-layer filename fallback + provenance; the full stack rides in
-    # arch_tag (filenames) and arch_desc (title/provenance).
+    # Repeated helper calls for the same setup must resolve the same output paths.
+    # Keep configuration details in metadata rather than encoding them in names.
+    signature = json.dumps(tc._json_safe([
+        build_params(), SEED, N_RUNS, RULES_TO_RUN, LOG_EVERY, LOG_GRAD_ALIGN,
+        INPUT_NORM_SAMPLE, str(DEVICE), str(DTYPE),
+    ]), sort_keys=True)
+    if signature not in _RUN_IDS:
+        _RUN_IDS[signature] = f"{NET_TYPE}_{RULESET}_{uuid.uuid4().hex[:12]}"
     return tc.RunConfig(
+        run_id=_RUN_IDS[signature],
         file_prefix=f"train_{NET_TYPE}", ckpt_prefix=NET_TYPE,
         title=f"{RULESET} ({desc}): BPTT vs local", header_note=f" ({desc})",
         rule_label=({**RULE_LABEL,
@@ -419,12 +415,6 @@ def _cfg():
         task=tasks.make_task(RULESET),
         acc_label=tasks.acc_label_for(RULESET),
         metric=tasks.metric_for(RULESET),
-        tag_extra=(_eta_lam_tag() +
-                   ("_bias-direct" if LOCAL_BIAS_MODE == "direct" else "") +
-                   (f"_mtanh-{MODULATION_BOUND:g}" if MODULATION_MODE == "scaled_tanh"
-                    else f"_mb-{MODULATION_BOUND:g}-{MODULATION_BOUND:g}" if MODULATION_BOUNDS
-                    else "") +
-                   (f"_l2-{REG_LAMBDA:.0e}" if REG_LAMBDA else "")),
     )
 
 
@@ -441,7 +431,8 @@ def load_net(path, device=None, dtype=DTYPE):
     """Reload a network saved during training. Reconstructs whichever class the
     checkpoint's net_params describes ('dmpn' → DeepMultiPlasticNet, else
     MultiPlasticNet), independent of the current NET_TYPE, with trained weights
-    and learning_rule restored.  Example:  net = load_net(ckpt_path('bptt', 42))"""
+    and learning_rule restored. Pass an existing checkpoint path; ckpt_path()
+    refers to the current process's experiment, not a previous CLI invocation."""
     device = device or DEVICE
     ckpt = torch.load(path, map_location=device, weights_only=False)
     m = _mpn()  # the MPN implementation module (core/mpn.py)
@@ -492,14 +483,17 @@ def _parse_args():
                         "the random modes at any depth; layerwise_fa vs direct_fa "
                         "differ only with >1 trainable boundary (dmpn's embedding "
                         "counts). 'exact_readout' is the legacy name for 'exact_spatial'.")
-    p.add_argument("--input-mode", choices=["match", "exact", "three_factor", "diag_mtrace"],
+    p.add_argument("--input-mode", choices=["match", "exact", "three_factor", "diag_mtrace", "paired"],
                    default=None,
                    help="input-embedding learning rule (dmpn), decoupled from the "
                         "MP-layer rule: 'match' = per-rule native, 'exact' "
                         "= always BPTT gradient, 'three_factor' = always the direct "
                         "local rule; 'diag_mtrace' = first-MP-layer modulation-column "
                         "traces for local runs, BPTT unchanged (requires dmpn and "
-                        f"exact_spatial). Default: {INPUT_MODE}; --dfa selects match.")
+                        "exact_spatial); 'paired' = BPTT exact, direct three-factor, "
+                        "diagonal RFLO diag_mtrace (dmpn/exact_spatial only; defaults "
+                        "to these three rules, rejects local_exact_rowlocal). "
+                        f"Default: {INPUT_MODE}; --dfa selects match.")
     p.add_argument("--input-normalize", action=argparse.BooleanOptionalAction,
                    default=INPUT_NORMALIZE,
                    help="fixed per-feature standardization of the raw input u_t "
@@ -518,11 +512,12 @@ def _parse_args():
     p.add_argument("--cross-layer-steps", type=int, choices=[0, 1],
                    default=None,
                    help="depth of the cross-layer TEMPORAL correction to the local "
-                        "rules (dmpn, multi-MP-layer): 0 = pure same-time surrogate "
-                        "(default); 1 = add the exact one-temporal-hop term (exact vs "
+                        "rules (dmpn, multi-MP-layer): 0 = pure same-time surrogate; "
+                        "1 = add the exact one-temporal-hop term (exact vs "
                         "BPTT for MP layers at T=2 only with exact feedback and "
                         "eligibility; no general improvement guarantee). Applies to "
-                        "every non-bptt rule. Costs one extra adjoint sweep/step.")
+                        "every non-bptt rule. Costs one extra adjoint sweep/step. "
+                        f"Default: {CROSS_LAYER_STEPS}; --dfa selects 0.")
     p.add_argument("--wandb", dest="use_wandb", action="store_true", default=USE_WANDB,
                    help="log to Weights & Biases (https://wandb.ai): one run per "
                         "(rule × seed), all grouped under this run's output save-stem "
@@ -545,11 +540,16 @@ def _parse_args():
     if args.cross_layer_steps is None:
         args.cross_layer_steps = 0 if args.dfa else CROSS_LAYER_STEPS
     args.local_bias_mode = args.local_bias_mode or ("direct" if args.dfa else LOCAL_BIAS_MODE)
-    args.rules = args.rules or (["bptt", "local_exact_rowlocal", "local_diag_rflo"]
-                               if args.dfa else RULES_TO_RUN)
-    if args.input_mode == 'diag_mtrace' and (args.net != 'dmpn' or
-                                            mpn.canonical_feedback_mode(args.feedback) != 'exact_spatial'):
-        p.error("--input-mode diag_mtrace requires --net dmpn and --feedback exact_spatial")
+    if args.rules is None:
+        args.rules = (["bptt", "local_exact_rowlocal", "local_diag_rflo"] if args.dfa
+                      else ["bptt", "local_diag_rflo", "local_direct"]
+                      if args.input_mode == 'paired' else RULES_TO_RUN)
+    if args.input_mode in ('diag_mtrace', 'paired') and (args.net != 'dmpn' or
+            mpn.canonical_feedback_mode(args.feedback) != 'exact_spatial'):
+        p.error(f"--input-mode {args.input_mode} requires --net dmpn and --feedback exact_spatial")
+    if args.input_mode == 'paired' and 'local_exact_rowlocal' in args.rules:
+        p.error("--input-mode paired does not support local_exact_rowlocal; "
+                "use match or an explicit input mode")
     if args.dfa and (args.feedback != "direct_fa" or args.input_mode != "match"
                      or args.cross_layer_steps != 0):
         p.error("--dfa requires --feedback direct_fa, --input-mode match, "

@@ -52,14 +52,14 @@ class TestAnalysisScripts(unittest.TestCase):
         self.rules = ['bptt', 'local_diag_rflo', 'local_direct']
         self.stem = 'dmpn_delaygo_h4-4_test_'
 
-    def run_script(self, name, *arguments):
+    def run_script(self, name, *arguments, expected_returncode=0):
         environment = dict(os.environ, OMP_NUM_THREADS='1', MKL_NUM_THREADS='1',
                            CUDA_VISIBLE_DEVICES='', MPLBACKEND='Agg')
         result = subprocess.run(
             [sys.executable, str(_bootstrap.ROOT / 'notebooks' / name),
              *map(str, arguments), '--output-dir', str(self.output)],
             cwd=self.root, env=environment, capture_output=True, text=True, timeout=120)
-        self.assertEqual(result.returncode, 0, result.stdout + '\n' + result.stderr)
+        self.assertEqual(result.returncode, expected_returncode, result.stdout + '\n' + result.stderr)
         return result
 
     def assert_figures(self, suffixes):
@@ -154,6 +154,45 @@ class TestAnalysisScripts(unittest.TestCase):
             select_checkpoints(self.root, self.rules, self.stem, seed=99)
         self.assertEqual(select_checkpoints(self.root, ['bptt'], stem='other_')[1], 99)
 
+    def test_nested_checkpoint_analysis(self):
+        self.make_checkpoints()
+        run_dir = self.root / 'dmpn_delaygo_abc123'
+        seed_dir = run_dir / 'seed37'
+        seed_dir.mkdir(parents=True)
+        for rule in self.rules:
+            (self.root / f'{self.stem}{rule}_seed37.pt').rename(seed_dir / f'{rule}.pt')
+        for directory in (self.root, run_dir, seed_dir):
+            stem, seed, paths = select_checkpoints(directory, self.rules, stem=run_dir.name)
+            self.assertEqual((stem, seed), (run_dir.name + '_', 37))
+            self.assertEqual(paths, {r: seed_dir / f'{r}.pt' for r in self.rules})
+        result = self.run_script('visualize_trained_networks.py', '--run-dir', run_dir,
+                                 '--analysis', 'weights')
+        self.assertIn(f'Selected checkpoint group: {run_dir.name}_seed37', result.stdout)
+        self.output = self.output / run_dir.name / 'seed37'
+        self.assert_figures(['weight_heatmaps', 'weight_alignment_to_bptt',
+                             'bias_alignment_to_bptt', 'parameter_cosine_diag_rflo_vs_direct',
+                             'weight_distributions'])
+        self.assertTrue((self.output / 'weight_heatmaps.png').is_file())
+
+    def test_nested_and_legacy_groups_never_mix(self):
+        self.make_checkpoints()
+        run_dir = self.root / 'new_run'
+        seed_dir = run_dir / 'seed38'
+        seed_dir.mkdir(parents=True)
+        (seed_dir / 'bptt.pt').touch()
+        # Newer incomplete nested group must not displace complete legacy files.
+        self.assertEqual(select_checkpoints(self.root, self.rules)[:2], (self.stem, 37))
+        for rule in self.rules[1:]:
+            (seed_dir / f'{rule}.pt').touch()
+        self.assertEqual(select_checkpoints(self.root, self.rules)[:2], ('new_run_', 38))
+        # Same run name and seed in different directories must not be combined.
+        for branch, rule in zip(('a', 'b', 'c'), self.rules):
+            directory = self.root / branch / 'duplicate' / 'seed37'
+            directory.mkdir(parents=True)
+            (directory / f'{rule}.pt').touch()
+        with self.assertRaisesRegex(ValueError, 'No complete checkpoint group'):
+            select_checkpoints(self.root, self.rules, stem='duplicate')
+
     def test_performance_requires_saved_task_setup(self):
         self.make_checkpoints()
         path = self.root / f'{self.stem}bptt_seed37.pt'
@@ -169,13 +208,17 @@ class TestAnalysisScripts(unittest.TestCase):
         self.assertIn('requires saved ring-task task_params', result.stderr)
         self.assertFalse(self.output.exists())
 
-    def test_comparison_uses_metadata_and_distinct_source_names(self):
+    def curve_data(self):
         values = dict(rules=np.asarray(['bptt']), record_steps=np.asarray([0, 10, 20]),
                       ruleset='delaygo', n_hidden=4, n_runs=1, metric='accuracy',
                       acc_label='accuracy (%)', feedback_mode='exact_spatial')
         for split in ('train', 'valid'):
             values[f'mean__bptt__{split}'] = np.asarray([.1, .4, .8])
             values[f'std__bptt__{split}'] = np.asarray([.01, .02, .01])
+        return values
+
+    def test_comparison_uses_metadata_and_distinct_source_names(self):
+        values = self.curve_data()
         mpn_path, rnn_path = self.root / 'mpn.npz', self.root / 'rnn.npz'
         np.savez(mpn_path, **values)
         np.savez(rnn_path, **values)
@@ -187,6 +230,39 @@ class TestAnalysisScripts(unittest.TestCase):
         np.savez(alternate, **values)
         self.run_script('compare_mpn_rnn_performance.py', '--mpn-file', mpn_path, '--rnn-file', alternate)
         self.assertEqual(len(list(self.output.glob('*.png'))), 2)
+
+    def test_comparison_checks_full_architecture_with_short_filenames(self):
+        values = self.curve_data()
+        mpn_path, rnn_path = self.root / 'dmpn_delaygo_abc123.npz', self.root / 'rnn.npz'
+        np.savez(mpn_path, **values, arch_tag='h4-4-4')
+        np.savez(rnn_path, **values)
+        result = self.run_script('compare_mpn_rnn_performance.py', '--mpn-file', mpn_path,
+                                 '--rnn-file', rnn_path, expected_returncode=1)
+        self.assertIn('hidden size differs', result.stderr)
+        self.assertIn('MPN=(4, 4, 4) vs RNN=4', result.stderr)
+        self.assertFalse(self.output.exists())
+
+    def test_comparison_prefers_metadata_over_stale_filename(self):
+        values = self.curve_data()
+        mpn_path = self.root / 'train_dmpn_oldtask_h999_direct_fa_runs1.npz'
+        rnn_path = self.root / 'rnn.npz'
+        np.savez(mpn_path, **values, arch_tag='h4')
+        np.savez(rnn_path, **values)
+        result = self.run_script('compare_mpn_rnn_performance.py', '--mpn-file', mpn_path,
+                                 '--rnn-file', rnn_path)
+        self.assertIn('task = delaygo   hidden = 4   feedback = exact_spatial', result.stdout)
+
+    def test_comparison_keeps_legacy_filename_fallback(self):
+        values = self.curve_data()
+        for field in ('ruleset', 'n_hidden', 'feedback_mode'):
+            del values[field]
+        mpn_path = self.root / 'train_dmpn_delaygo_h4_exact_readout_runs1.npz'
+        rnn_path = self.root / 'train_rnn_delaygo_h4_exact_spatial_runs1.npz'
+        np.savez(mpn_path, **values)
+        np.savez(rnn_path, **values)
+        result = self.run_script('compare_mpn_rnn_performance.py', '--mpn-file', mpn_path,
+                                 '--rnn-file', rnn_path)
+        self.assertIn('task = delaygo   hidden = 4   feedback = exact_spatial', result.stdout)
 
 
 if __name__ == '__main__':

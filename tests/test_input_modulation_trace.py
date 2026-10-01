@@ -6,6 +6,7 @@ from itertools import product
 import sys
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -248,6 +249,132 @@ class TestInputModulationTrace(unittest.TestCase):
             actual = loaded.sequence_gradients(x, y, mask)
         for key in expected:
             torch.testing.assert_close(actual[key], expected[key], rtol=0, atol=0)
+
+
+class TestPairedInputMode(unittest.TestCase):
+    mapping = {'bptt': 'exact', 'local_direct': 'three_factor',
+               'local_diag_rflo': 'diag_mtrace'}
+
+    def test_pairing_matches_explicit_algorithms_after_cloning(self):
+        x, y, mask, active = data()
+        for kind in ('hebb_assoc', 'hebb_pre'):
+            base, _ = make_net(rule='bptt', input_mode='paired', kind=kind)
+            for rule, expected_mode in self.mapping.items():
+                with self.subTest(rule=rule, kind=kind):
+                    net = copy.deepcopy(base)
+                    net.learning_rule = rule
+                    reference = copy.deepcopy(net)
+                    reference.input_mode = expected_mode
+                    self.assertEqual(net.resolved_input_mode, expected_mode)
+                    kwargs = {} if rule == 'bptt' else {'update_masks': active}
+                    expected = reference.sequence_gradients(x, y, mask, **kwargs)
+                    with patch.object(net, 'bptt_gradients', wraps=net.bptt_gradients) as bptt:
+                        actual = net.sequence_gradients(x, y, mask, **kwargs)
+                    self.assertEqual(bptt.call_count, int(rule == 'bptt'))
+                    for key in expected:
+                        torch.testing.assert_close(actual[key], expected[key], rtol=0, atol=0)
+                    for key, parameter in net._trainable_params().items():
+                        torch.testing.assert_close(parameter.grad, actual[key], rtol=0, atol=0)
+
+    def test_direct_gradient_methods_resolve_the_requested_rule(self):
+        # A diagnostic can call a local method on a net configured as BPTT.
+        x, y, mask, _ = data()
+        net, _ = make_net(rule='bptt', input_mode='paired', kind='hebb_pre')
+        for rule in ('local_direct', 'local_diag_rflo'):
+            reference = copy.deepcopy(net)
+            reference.input_mode = self.mapping[rule]
+            actual = getattr(net, rule + '_gradients')(x, y, mask)
+            expected = getattr(reference, rule + '_gradients')(x, y, mask)
+            for key in expected:
+                torch.testing.assert_close(actual[key], expected[key], rtol=0, atol=0)
+
+    def test_cli_defaults_and_guards(self):
+        command = ['train_mpn.py', '--input-mode', 'paired', '--feedback', 'exact_spatial']
+        with patch.object(sys, 'argv', command):
+            args = train_mpn._parse_args()
+        self.assertEqual(args.input_mode, 'paired')
+        self.assertEqual(args.rules, ['bptt', 'local_diag_rflo', 'local_direct'])
+        for extra in (['--net', 'mpn1'], ['--feedback', 'direct_fa'],
+                      ['--feedback', 'layerwise_fa'], ['--dfa'],
+                      ['--rules', 'local_exact_rowlocal']):
+            with self.subTest(extra=extra), patch.object(sys, 'argv', command + extra):
+                with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                    train_mpn._parse_args()
+        with patch.object(sys, 'argv', command + ['--rules', 'local_direct']):
+            self.assertEqual(train_mpn._parse_args().rules, ['local_direct'])
+
+    def test_model_guards_and_legacy_mapping(self):
+        with self.assertRaisesRegex(ValueError, 'does not support'):
+            make_net(rule='local_exact_rowlocal', input_mode='paired')
+        net, cfg = make_net(rule='bptt', input_mode='paired')
+        net.learning_rule = 'local_exact_rowlocal'
+        x, y, mask, _ = data()
+        with self.assertRaisesRegex(ValueError, 'does not support'):
+            net.sequence_gradients(x, y, mask)
+        for feedback in ('direct_fa', 'layerwise_fa'):
+            with self.assertRaisesRegex(ValueError, 'exact_spatial'):
+                mpn.DeepMultiPlasticNet({**cfg, 'feedback_mode': feedback})
+        with self.assertRaisesRegex(ValueError, 'input embedding'):
+            mpn.DeepMultiPlasticNet({**cfg, 'input_layer_add': False})
+        for rule in (*self.mapping, 'local_exact_rowlocal'):
+            self.assertEqual(mpn.resolve_input_mode('match', rule),
+                             'exact' if rule == 'bptt' else 'three_factor')
+            self.assertEqual(mpn.resolve_input_mode('diag_mtrace', rule),
+                             'exact' if rule == 'bptt' else 'diag_mtrace')
+
+    def test_checkpoint_reload_resolves_per_rule(self):
+        x, y, mask, _ = data()
+        base, cfg = make_net(rule='bptt', input_mode='paired')
+        with tempfile.TemporaryDirectory() as directory:
+            for rule, expected_mode in self.mapping.items():
+                net = copy.deepcopy(base)
+                net.learning_rule = rule
+                expected = net.sequence_gradients(x, y, mask)
+                path = Path(directory) / f'{rule}.pt'
+                # Also covers older checkpoint structure: base BPTT in net_params,
+                # actual rule at the top level, restored after construction.
+                torch.save(dict(net_params=cfg, state_dict=net.state_dict(),
+                                learning_rule=rule, resolved_input_mode=expected_mode), path)
+                with contextlib.redirect_stdout(io.StringIO()):
+                    loaded = train_mpn.load_net(path, device=torch.device('cpu'), dtype=torch.double)
+                self.assertEqual(loaded.input_mode, 'paired')
+                self.assertEqual(loaded.resolved_input_mode, expected_mode)
+                actual = loaded.sequence_gradients(x, y, mask)
+                for key in expected:
+                    torch.testing.assert_close(actual[key], expected[key], rtol=0, atol=0)
+
+    def test_training_checkpoint_and_log_record_resolved_modes(self):
+        # Exercise production cloning and persistence with zero optimizer steps.
+        _, net_params = make_net(rule='bptt', input_mode='paired')
+        x, y, mask, _ = data()
+        cfg = train_mpn._cfg()
+        cfg.rules_to_run = list(self.mapping)
+        cfg.input_mode = 'paired'
+        cfg.input_normalize = False
+        cfg.n_datasets = 0
+        cfg.log_grad_align = False
+        cfg.device, cfg.dtype = torch.device('cpu'), torch.double
+        cfg.build_params = lambda: ({}, {}, net_params)
+        cfg.net_factory = lambda params, verbose: mpn.DeepMultiPlasticNet(params, verbose=False)
+        cfg.task = SimpleNamespace(init_params=lambda *params: params,
+                                   valid_batch=lambda *args: (x, y, mask))
+        cfg.save_nets = True
+        with tempfile.TemporaryDirectory() as directory:
+            cfg.ckpt_dir = directory
+            log = io.StringIO()
+            with contextlib.redirect_stdout(log):
+                train_mpn.tc.run_seed(cfg, 13, [])
+            for rule, expected_mode in self.mapping.items():
+                checkpoint = torch.load(train_mpn.tc.ckpt_path(cfg, rule, 13), weights_only=False)
+                self.assertEqual(checkpoint['input_mode'], 'paired')
+                self.assertEqual(checkpoint['net_params']['input_mode'], 'paired')
+                self.assertEqual(checkpoint['net_params']['learning_rule'], rule)
+                self.assertEqual(checkpoint['resolved_input_mode'], expected_mode)
+                self.assertEqual(checkpoint['run_id'], cfg.run_id)
+                self.assertIn(f'{rule}: input_mode=paired, resolved_input_mode={expected_mode}',
+                              log.getvalue())
+            self.assertEqual(Path(train_mpn.tc.ckpt_path(cfg, rule, 13)).relative_to(directory),
+                             Path(cfg.run_id) / 'seed13' / f'{rule}.pt')
 
 
 if __name__ == '__main__':

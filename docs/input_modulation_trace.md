@@ -79,6 +79,12 @@ performed for local rules.
 
 ## Scope and costs
 
+`--input-mode paired` selects this input trace only for `local_diag_rflo`.
+It uses direct three-factor input updates for `local_direct` and full BPTT for
+`bptt`. The preset requires a deep MPN with an embedding and `exact_spatial`
+feedback, and rejects `local_exact_rowlocal`. The explicit `diag_mtrace` mode
+still selects the input trace for all local rules, and `match` remains unchanged.
+
 - Only input-layer gradients change. MP weights/biases and readout gradients
   continue to use the selected learning rule.
 - `--local-bias-mode` controls MP biases; input biases follow `diag_mtrace`.
@@ -92,7 +98,7 @@ performed for local rules.
   requires 56 MiB in float32 or 112 MiB in float64. There is no sequence-length
   factor in this added trace storage; total training memory includes other buffers.
 - Trace tensors are temporary sequence state, not checkpoint entries. The input
-  mode is stored in `net_params` and the run filename includes `_in-diag_mtrace`.
+  mode is stored in `net_params` and the run's config JSON as `input_mode`.
 
 ## Validation
 
