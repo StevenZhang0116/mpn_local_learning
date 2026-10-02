@@ -97,6 +97,7 @@ RULES_TO_RUN = ["bptt", "local_exact_rowlocal", "local_diag_rflo", "local_direct
 # always has (MP layer + trainable input embedding), so they differ here even for
 # a single MP layer. (Legacy 'exact_readout' still loads.)
 FEEDBACK_MODE = "exact_spatial"
+DFA_PRESET = False             # records whether the CLI --dfa preset was selected
 # Learning rule for the TRAINABLE INPUT EMBEDDING (dmpn only), decoupled from the
 # per-rule MP-layer learning_rule so any RULES_TO_RUN × input-rule combo compares:
 #   'match'        — embedding follows each rule (exact under bptt, 3-factor local
@@ -385,12 +386,13 @@ def _cfg():
     # Keep configuration details in metadata rather than encoding them in names.
     signature = json.dumps(tc._json_safe([
         build_params(), SEED, N_RUNS, RULES_TO_RUN, LOG_EVERY, LOG_GRAD_ALIGN,
-        INPUT_NORM_SAMPLE, str(DEVICE), str(DTYPE),
+        INPUT_NORM_SAMPLE, str(DEVICE), str(DTYPE), DFA_PRESET,
     ]), sort_keys=True)
     if signature not in _RUN_IDS:
         _RUN_IDS[signature] = f"{NET_TYPE}_{RULESET}_{uuid.uuid4().hex[:12]}"
     return tc.RunConfig(
         run_id=_RUN_IDS[signature],
+        dfa_preset=DFA_PRESET,
         file_prefix=f"train_{NET_TYPE}", ckpt_prefix=NET_TYPE,
         title=f"{RULESET} ({desc}): BPTT vs local", header_note=f" ({desc})",
         rule_label=({**RULE_LABEL,
@@ -566,7 +568,9 @@ def main():
     global INPUT_MODE, INPUT_NORMALIZE, MP_RESIDUAL, CROSS_LAYER_STEPS, LOCAL_BIAS_MODE, RULES_TO_RUN, LOG_GRAD_ALIGN
     global USE_WANDB, WANDB_PROJECT, WANDB_ENTITY, WANDB_MODE
     global MODULATION_MODE, MODULATION_BOUND, MODULATION_BOUNDS
+    global DFA_PRESET
     args = _parse_args()
+    DFA_PRESET = args.dfa
     NET_TYPE = args.net
     RULESET = args.task
     N_RUNS = args.runs

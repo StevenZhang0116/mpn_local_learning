@@ -73,6 +73,8 @@ class RunConfig:
     # Nonempty opts into compact output names and run/seed checkpoint folders.
     # Callers keep this ID stable across path-helper calls for one experiment.
     run_id: str = ""
+    # CLI provenance, distinct from whether an individual model uses DFA.
+    dfa_preset: bool = False
     # Task adapter (the data/metric seam): provides init_params / valid_batch /
     # train_batch / accuracy. Defaults to None, resolved to tasks.make_task(ruleset)
     # in run_seed so callers that don't set it keep the ring-task behaviour.
@@ -190,6 +192,12 @@ def ckpt_path(cfg, rule, seed):
     if cfg.run_id:
         return os.path.join(cfg.ckpt_dir, cfg.run_id, f"seed{seed}", f"{rule}.pt")
     return os.path.join(cfg.ckpt_dir, f"{cfg.ckpt_prefix}_{param_tag(cfg)}_{rule}_seed{seed}.pt")
+
+
+def uses_dfa(feedback_mode, rule, input_mode="match", trainable_embed=False):
+    """Whether parameter updates use DFA (including a hybrid BPTT input splice)."""
+    return feedback_mode == "direct_fa" and (
+        rule != "bptt" or (input_mode == "three_factor" and trainable_embed))
 
 
 def arch_suffix(cfg):
@@ -587,6 +595,11 @@ def run_seed(cfg, seed, record_steps, run_idx=0, wandb_logger=None):
                 "ruleset": cfg.ruleset,
                 "learning_rule": rule,
                 "feedback_mode": cfg.feedback_mode,
+                "dfa_preset": cfg.dfa_preset,
+                "uses_dfa": uses_dfa(
+                    getattr(nets[rule], "feedback_mode", cfg.feedback_mode), rule,
+                    getattr(nets[rule], "input_mode", cfg.input_mode),
+                    getattr(nets[rule], "_has_trainable_embed", lambda: False)()),
                 "input_normalize": cfg.input_normalize,
                 "mp_residual": cfg.mp_residual,
                 "input_mode": cfg.input_mode,
@@ -762,6 +775,14 @@ def save_config(cfg, path=None):
         task_params, train_params, net_params = cfg.build_params()
         task_params, train_params, net_params = task.init_params(
             task_params, train_params, net_params)
+        trainable_embed = bool(
+            net_params.get("net_type") == "dmpn" and net_params.get("input_layer_add", False)
+            and (net_params.get("input_layer_add_trainable", False)
+                 or net_params.get("input_layer_bias", False)))
+        dfa_by_rule = {
+            rule: uses_dfa(cfg.feedback_mode, rule, cfg.input_mode, trainable_embed)
+            for rule in cfg.rules_to_run
+        }
         record = {
             # run / experiment
             "run_id": cfg.run_id,
@@ -779,6 +800,9 @@ def save_config(cfg, path=None):
             "arch_tag": getattr(cfg, "arch_tag", ""),
             "arch_desc": getattr(cfg, "arch_desc", ""),
             "feedback_mode": cfg.feedback_mode,
+            "dfa_preset": cfg.dfa_preset,
+            "uses_dfa": any(dfa_by_rule.values()),
+            "uses_dfa_by_rule": dfa_by_rule,
             "input_normalize": cfg.input_normalize,
             "input_norm_sample": cfg.input_norm_sample,
             "log_grad_align": cfg.log_grad_align,

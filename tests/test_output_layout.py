@@ -4,8 +4,11 @@ import io
 import json
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
+
+import torch
 
 import _bootstrap
 import train_common as tc
@@ -50,6 +53,47 @@ class TestOutputLayout(unittest.TestCase):
             self.assertEqual(record['resolved_input_modes']['local_diag_rflo'], 'diag_mtrace')
             cfg.save_nets = False
             self.assertEqual(Path(tc.config_path(cfg)), Path(directory) / f'{cfg.run_id}.json')
+
+    def test_dfa_flags_record_preset_and_per_model_behavior(self):
+        # Exercise the real save path with tiny models and no optimizer steps.
+        cases = [('direct_fa', True, 'match', True),
+                 ('direct_fa', False, 'match', True),
+                 ('exact_spatial', False, 'match', True),
+                 ('layerwise_fa', False, 'match', True),
+                 ('direct_fa', False, 'three_factor', True),
+                 ('direct_fa', False, 'three_factor', False)]
+        for feedback, preset, input_mode, trainable_embed in cases:
+            with self.subTest(feedback=feedback, preset=preset, input_mode=input_mode,
+                              trainable_embed=trainable_embed), tempfile.TemporaryDirectory() as directory:
+                with patch.multiple(
+                        train_mpn, CKPT_DIR=directory, SAVE_NETS=True, N_HIDDEN=[2, 2],
+                        N_DATASETS=0, BATCH=2, N_RUNS=1, RULESET='delaygo',
+                        DEVICE=torch.device('cpu'), LOG_GRAD_ALIGN=False, CROSS_LAYER_STEPS=0,
+                        FEEDBACK_MODE=feedback, DFA_PRESET=preset, INPUT_MODE=input_mode,
+                        RULES_TO_RUN=['bptt', 'local_direct', 'local_diag_rflo']):
+                    cfg = train_mpn._cfg()
+                    params = cfg.task.init_params(*cfg.build_params())
+                net_params = params[2]
+                net_params['input_layer_add_trainable'] = trainable_embed
+                net_params['input_layer_bias'] = trainable_embed
+                inputs = torch.zeros(2, 1, net_params['n_neurons'][0])
+                labels = torch.zeros(2, 1, net_params['n_neurons'][-1])
+                cfg.task = SimpleNamespace(init_params=lambda *args: params,
+                                           valid_batch=lambda *args: (inputs, labels, torch.ones_like(labels)))
+                expected = {r: feedback == 'direct_fa' and (
+                    r != 'bptt' or (input_mode == 'three_factor' and trainable_embed))
+                    for r in cfg.rules_to_run}
+                with contextlib.redirect_stdout(io.StringIO()):
+                    tc.run_seed(cfg, 13, [])
+                    config = json.loads(Path(tc.save_config(cfg)).read_text())
+                self.assertIs(config['dfa_preset'], preset)
+                self.assertIs(config['uses_dfa'], any(expected.values()))
+                self.assertEqual(config['uses_dfa_by_rule'], expected)
+                for rule in cfg.rules_to_run:
+                    checkpoint = torch.load(tc.ckpt_path(cfg, rule, 13), weights_only=False)
+                    self.assertIs(checkpoint['dfa_preset'], preset)
+                    self.assertIs(checkpoint['uses_dfa'], expected[rule])
+                    self.assertEqual(checkpoint['feedback_mode'], feedback)
 
 
 if __name__ == '__main__':

@@ -87,6 +87,15 @@ invocations get different IDs even with identical settings. Batch size, learning
 rate, steps, full architecture, input mode, modulation settings, and task setup
 are saved in metadata rather than filenames. `config.json` is written before
 training; each checkpoint also contains its own model, task, and training setup.
+New checkpoints include two explicit DFA flags: `dfa_preset` records whether
+`--dfa` was passed, and `uses_dfa` records whether that model's parameter updates
+use DFA. With the preset, local-rule checkpoints have `uses_dfa=true` and the
+full-BPTT baseline has `uses_dfa=false`; all have `dfa_preset=true`. Manually
+configuring `direct_fa` can enable DFA without selecting the preset. The config
+JSON includes both flags and `uses_dfa_by_rule`; its `uses_dfa` means any selected
+model uses DFA. Hybrid BPTT with a trainable `three_factor` input embedding also
+counts as using DFA when its feedback is `direct_fa`. Older files lack these flags;
+absence does not mean false and cannot establish whether the CLI preset was used.
 When checkpoint saving is disabled, the config JSON goes beside the figure.
 RNN output naming is unchanged. Reload a saved figure without retraining via
 `replot_from_npz("figure_data/<run-id>.npz")`; path helpers such as `data_path()`

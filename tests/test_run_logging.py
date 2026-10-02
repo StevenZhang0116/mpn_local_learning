@@ -66,6 +66,7 @@ class TestRunLogging(unittest.TestCase):
         import train_common
 
         def fake_experiment(config):
+            self.assertTrue(config.dfa_preset)
             self.assertEqual(config.feedback_mode, "direct_fa")
             self.assertEqual(config.n_datasets, 1)
             print("experiment stdout")
