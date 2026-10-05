@@ -594,7 +594,8 @@ def parse_arguments(argv=None):
     g = p.add_argument_group(
         "learning algorithm",
         "local update = learning signal x eligibility; the input embedding is a third, "
-        "independent choice. bptt is full BPTT of the main loss whatever the signal.")
+        "independent choice. bptt is full BPTT of the main loss whatever the signal, "
+        "except that --input-mode three_factor makes its embedding a hybrid.")
     g.add_argument("--rules", nargs="+", choices=list(RULE_LABEL), default=None,
                    help="ELIGIBILITY axis — how MP parameters are updated: local_direct "
                         "(current activity and modulation, no history), local_diag_rflo "

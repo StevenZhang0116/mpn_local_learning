@@ -8,6 +8,7 @@ import contextlib
 import copy
 import io
 import sys
+import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -201,6 +202,37 @@ class TestEffectiveConfigLine(unittest.TestCase):
         self.assertIn('local_diag_rflo: input_mode=match, resolved_input_mode=three_factor, '
                       'signal=local_readout, feedback=exact_spatial, bias=exact, rho=none, '
                       'heads=2 active', text)
+        # bptt + three_factor is a HYBRID (the embedding uses the direct 3-factor rule
+        # under the global signal through the feedback pathway) and must never be
+        # summarized as a full-BPTT baseline — in the log and in the checkpoint.
+        cfg_h = train_mpn._cfg()
+        cfg_h.rules_to_run = ['bptt']
+        cfg_h.learning_signal, cfg_h.signal_mode, cfg_h.feedback_mode = 'global', 'dfa', 'direct_fa'
+        cfg_h.input_mode, cfg_h.cross_layer_steps = 'three_factor', 0
+        cfg_h.input_normalize, cfg_h.log_grad_align, cfg_h.save_nets, cfg_h.n_datasets = False, False, True, 0
+        cfg_h.device, cfg_h.dtype = torch.device('cpu'), torch.double
+        hybrid_params = make_cfg(signal='global', rule='bptt', input_mode='three_factor',
+                                 feedback='direct_fa')
+        cfg_h.build_params = lambda: ({}, {}, copy.deepcopy(hybrid_params))
+        cfg_h.net_factory = cfg.net_factory
+        cfg_h.task = cfg.task
+        expected_line = ('bptt: input_mode=three_factor, resolved_input_mode=three_factor, '
+                         'algorithm=hybrid, mp_update=BPTT, input_update=three_factor, '
+                         'input_signal=global, input_feedback=direct_fa, heads=unused')
+        with tempfile.TemporaryDirectory() as directory:
+            cfg_h.ckpt_dir = cfg_h.fig_dir = cfg_h.data_dir = directory
+            log = io.StringIO()
+            with contextlib.redirect_stdout(log):
+                train_common.run_seed(cfg_h, 13, [])
+            self.assertIn(expected_line, log.getvalue())
+            ckpt = torch.load(train_common.ckpt_path(cfg_h, 'bptt', 13), weights_only=False)
+            self.assertEqual(ckpt['effective_config'], expected_line.split(', ', 2)[2])
+            self.assertTrue(ckpt['uses_dfa'])
+        # Full BPTT (match) keeps the plain label even on the dfa pathway.
+        full = mpn.DeepMultiPlasticNet(make_cfg(signal='global', rule='bptt', feedback='direct_fa'),
+                                       verbose=False)
+        self.assertEqual(train_common.effective_rule_summary(cfg_h, full, 'bptt'),
+                         'mp_update=full BPTT (feedback/bias/heads unused)')
         # The same summary is what the checkpoint records (no nets saved here, so
         # exercise the helper directly on a head-less global net).
         glob = mpn.DeepMultiPlasticNet(make_cfg(signal='global', rule='local_diag_rflo'), verbose=False)

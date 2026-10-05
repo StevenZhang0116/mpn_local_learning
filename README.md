@@ -198,8 +198,12 @@ The five signal modes map onto the model's two fields (`learning_signal`, `feedb
 | `mixed` | `exact_spatial` plus `--local-signal-alpha` × the local head error | `mixed` | `exact_spatial` |
 
 `exact_spatial` qualifies the spatial pathway only; temporal credit is whatever the
-eligibility rule provides, so none of these is full BPTT. `bptt` is full BPTT of the
-main loss under every signal mode (its auxiliary heads, if any, receive no gradient).
+eligibility rule provides, so none of these is full BPTT. `bptt`'s MP layers and
+readout are full BPTT of the main loss under every signal mode (its auxiliary heads, if
+any, receive no gradient), and so is its embedding except under `--input-mode
+three_factor`, which splices the direct three-factor rule into the embedding under the
+global signal through the selected feedback pathway. That combination is a hybrid, not a
+full-BPTT baseline; the per-rule line below labels it `algorithm=hybrid`.
 
 Defaults are signal-independent, so switching `--learning-signal` alone changes only the
 signal. They changed in October 2026; old runs used the previous column:

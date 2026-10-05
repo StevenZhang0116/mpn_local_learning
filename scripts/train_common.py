@@ -327,6 +327,17 @@ def effective_rule_summary(cfg, net, rule):
     eligibility, the RFLO trace cap, and whether local readout heads are active.
     Separates 'which signal was selected' from 'is this run fully local'."""
     if rule == "bptt":
+        # bptt's MP layers and readout are always full BPTT. Its EMBEDDING is too,
+        # except under input_mode three_factor, where the direct 3-factor rule is
+        # spliced in under the GLOBAL signal (never a local head) through the net's
+        # feedback pathway — a HYBRID, so the feedback mode IS used there. Label it
+        # as such so the summary never calls a hybrid a full-BPTT baseline.
+        resolved = getattr(net, "resolved_input_mode", None)
+        has_embed = getattr(net, "_has_trainable_embed", lambda: False)()
+        if has_embed and resolved == "three_factor":
+            return ("algorithm=hybrid, mp_update=BPTT, input_update=three_factor, "
+                    "input_signal=global, "
+                    f"input_feedback={getattr(net, 'feedback_mode', 'n/a')}, heads=unused")
         return "mp_update=full BPTT (feedback/bias/heads unused)"
     layers = getattr(net, "mp_layers", [])
     signal = getattr(cfg, "signal_mode", "") or getattr(net, "learning_signal", "global")
