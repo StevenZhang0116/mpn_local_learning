@@ -290,7 +290,8 @@ non-top layer's gradient is then exact for its own head's loss. `--learning-sign
 mixed --local-signal-alpha a` adds `a` times the local signal to the global one,
 computed independently (head errors never enter the global recursion).
 
-Heads take part in training only; evaluation, the plotted/scheduled metrics and
+Heads take part in training only; evaluation, the plotted metrics, the default
+plateau scheduler's monitor, and
 `grads["loss"]` stay the main readout's. The console prints an `aux` sub-line per
 rule with each head's train loss and accuracy (also logged to W&B as
 `train/aux{n}_*`). Head gradients are norm-clipped as a separate group so they never
@@ -309,6 +310,38 @@ differs between the two commands):
 python scripts/train_mpn.py --task seqmnist --hidden 128 128 --seed 7
 python scripts/train_mpn.py --task seqmnist --hidden 128 128 --seed 7 --learning-signal local_readout
 ```
+
+Auxiliary readouts can use a separate Adam learning rate without changing the
+local loss, learning signal, eligibility rule, or forward network:
+
+```bash
+# Append to a local_readout/mixed comparison command:
+--lr 0.001 --head-lr-mult 3 --lr-schedule constant
+```
+
+`--head-lr-mult` multiplies the base `--lr` for auxiliary head weights **and biases**
+only. The input embedding, MP layers, and main output readout retain the base rate.
+It is ignored by BPTT (auxiliary heads remain untrained), global-signal models,
+and single-MP-layer models without auxiliary heads. The default multiplier is 1.
+`--lr-schedule plateau` preserves the existing `ReduceLROnPlateau` behavior driven
+by the main validation loss; it schedules both main and active head groups.
+`--lr-schedule constant` disables the scheduler, so validation loss cannot lower
+any rate. This schedule choice applies to **every** rule in the command, including
+BPTT; it does not change their gradient definitions. Per-module loss-driven
+schedulers are not introduced here.
+
+Start with a paired 2-by-2 comparison of head multipliers 1/3 and schedules
+plateau/constant, keeping the seed and all other flags fixed. These are optimization
+options, not a guarantee that a faster head improves task accuracy. Existing
+weight-vs-bias decay and separate main/head gradient clipping are preserved.
+
+The console's `lr(next)` line and W&B `lr/{parameter_name}` fields report the
+effective rate for each trainable matrix after scheduling (for the next update):
+`W_in`, `W`/`W1`/..., `W_output`, and active `head_W0`/... . Unused BPTT heads are
+omitted. Per-head train loss/accuracy remain in the existing console `aux` lines
+and W&B `train/aux{n}_*` fields. Requested multiplier/schedule are saved in config,
+checkpoint, plot-data and W&B metadata; checkpoints also record final effective
+`learning_rates`. Old checkpoints still load without these optional metadata keys.
 
 `learning_signal` / `local_signal_alpha` are saved in `net_params` (checkpoints and
 `config.json`) and in the `.npz` metadata; checkpoints with heads reload through

@@ -74,6 +74,8 @@ def _base_config(cfg, experiment):
         "batch": cfg.batch,
         "n_datasets": cfg.n_datasets,
         "lr": cfg.lr,
+        "head_lr_mult": cfg.head_lr_mult,
+        "lr_schedule": cfg.lr_schedule,
         "grad_clip": cfg.grad_clip,
         "metric": cfg.metric,
         "acc_label": cfg.acc_label,
