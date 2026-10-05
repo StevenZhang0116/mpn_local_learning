@@ -121,6 +121,38 @@ def canonical_feedback_mode(mode):
     return mode
 
 
+# ─── Learning-signal SOURCE (deep net only) ───────────────────────────────────
+# Orthogonal to feedback_mode (HOW a signal is transported) and to learning_rule
+# (WHICH eligibility consumes it): learning_signal selects WHERE each MP layer's
+# learning signal ell_h[n+1] comes from.
+#   'global'        the main readout's error, delivered to every layer by the
+#                   same-time inter-layer pathway of feedback_mode (the historical
+#                   behavior; default, byte-identical to before).
+#   'local_readout' every NON-TOP MP layer n < L-1 owns an auxiliary linear head
+#                   q^(n) = C_n h[n+1] + c_n trained on the SAME task loss/labels/
+#                   mask as the main readout; layer n's eligibility is credited by
+#                   its own head's error projected through C_n (ell_h[n+1] = e_n C_n)
+#                   and NOTHING is propagated down from the layers above. The top
+#                   layer keeps the true readout; the input embedding shares module
+#                   0's head through the unchanged layer-0 backprojection. Requires
+#                   exact_spatial feedback and cross_layer_steps=0 (both other
+#                   mechanisms are inter-module by construction).
+#   'mixed'         ell_h[n+1] = ell_global + local_signal_alpha * ell_local, the two
+#                   computed INDEPENDENTLY (the head errors never enter the global
+#                   recursion). Same constraints as local_readout.
+# The heads train only via the local passes; bptt ignores learning_signal (its heads
+# receive no gradient), so the BPTT baseline keeps its meaning.
+_LEARNING_SIGNALS = ('global', 'local_readout', 'mixed')
+
+
+def canonical_learning_signal(signal):
+    """Validate a learning_signal string against _LEARNING_SIGNALS."""
+    if signal not in _LEARNING_SIGNALS:
+        raise ValueError(
+            f"unknown learning_signal '{signal}'; expected one of {_LEARNING_SIGNALS}")
+    return signal
+
+
 def masked_mse_loss_and_output_grad(output, labels, mask):
     """Masked MSE identical to net_helpers.compute_loss (float 'cost' mask, mean
     reduction over all B*T*n_out elements) plus its analytic output gradient.
@@ -1309,6 +1341,12 @@ class MultiPlasticNet(MultiPlasticNetBase):
         assert _rule in ('bptt', 'local_exact_rowlocal', 'local_diag_rflo',
                          'local_direct'), f"unknown learning_rule '{_rule}'"
         self.learning_rule = _rule
+        # Local readout heads need a non-top MP layer to attach to; this net has
+        # exactly one MP layer and no embedding, so only the global signal exists.
+        if canonical_learning_signal(net_params.get('learning_signal', 'global')) != 'global':
+            raise ValueError(
+                "learning_signal requires DeepMultiPlasticNet (net_type 'dmpn'); "
+                "MultiPlasticNet has a single MP layer and no local readout heads.")
 
         # Learning signal for the hidden layer. This net has exactly ONE trainable
         # activity boundary (readout → hidden; no input embedding), so the two
@@ -1738,6 +1776,27 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
             raise NotImplementedError(
                 f"cross_layer_steps={self.cross_layer_steps}: only 0 (same-time) and 1 "
                 f"(exact depth-1 temporal correction) are implemented.")
+        # learning_signal: WHERE each MP layer's learning signal comes from (see the
+        # module-level _LEARNING_SIGNALS table). 'global' is the default and leaves
+        # every path byte-identical. The local modes replace/augment the inter-layer
+        # signal with per-layer auxiliary readout heads (built last, below), so the
+        # two inter-MODULE mechanisms — random/recursive feedback transport and the
+        # cross-layer temporal correction — are rejected with them.
+        self.learning_signal = canonical_learning_signal(cfg.get('learning_signal', 'global'))
+        self.local_signal_alpha = float(cfg.get('local_signal_alpha', 1.0))
+        if self.learning_signal != 'global':
+            if self.feedback_mode != 'exact_spatial':
+                raise ValueError(
+                    f"learning_signal='{self.learning_signal}' requires feedback_mode="
+                    "'exact_spatial': the local heads define the only inter-layer signal, "
+                    "so layerwise_fa/direct_fa have nothing to transport.")
+            if self.cross_layer_steps != 0:
+                raise ValueError(
+                    f"learning_signal='{self.learning_signal}' requires cross_layer_steps=0: "
+                    "the depth-1 correction credits a layer through the layers above it, "
+                    "which is inter-module by construction.")
+            if not math.isfinite(self.local_signal_alpha):
+                raise ValueError("local_signal_alpha must be finite")
 
         super().__init__(cfg, cfg['n_neurons'][-2], output_matrix=self.output_matrix, verbose=verbose)
 
@@ -1886,6 +1945,50 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
                 print(f'  [mp_residual] skip DISABLED at MP layer {n}: width '
                       f'{mp.n_input}->{mp.n_output} (identity residual needs equal widths).')
             self._residual_at.append(ok)
+
+        # ── Local readout heads (opt-in; learning_signal != 'global') ────────
+        # One auxiliary linear readout per NON-TOP MP layer n = 0..L-2, reading that
+        # layer's output stream h[n+1] and trained on the SAME task loss/labels/mask
+        # as the main readout (bias present iff the main readout's is). The head's
+        # output error projected through its weights forms layer n's learning
+        # signal in the local passes (see _same_time_boundary_signals); the top
+        # layer keeps the true readout W_output and the embedding shares module 0's
+        # head via the unchanged layer-0 backprojection. Heads take part in
+        # TRAINING ONLY — forward()/network_step() and every evaluation path are
+        # untouched — and are keyed separately from _trainable_params (see
+        # _aux_params) so bptt_gradients, the alignment diagnostic and the weight-
+        # decay grouping never see them.
+        #
+        # Construction is deliberately LAST and draws from a PRIVATE numpy stream
+        # (seeded from torch.initial_seed(), i.e. run_seed's per-seed manual_seed,
+        # or from local_head_seed when given) with the global numpy state saved and
+        # restored around rand_weight_init. The main parameters above and the
+        # training-data stream drawn after construction are therefore byte-identical
+        # to a learning_signal='global' net built under the same seed, making the
+        # two modes a PAIRED comparison. A single MP layer has no head at all, so
+        # local_readout then coincides with global.
+        self._head_names = []          # [(weight_name, bias_name_or_None)] per head
+        if self.learning_signal != 'global':
+            head_seed = cfg.get('local_head_seed', None)
+            if head_seed is None:
+                head_seed = torch.initial_seed() + 0x5EED
+            np_state = np.random.get_state()
+            np.random.seed(int(head_seed) % (2 ** 32))
+            try:
+                for n in range(L - 1):
+                    d_n = self.mp_layers[n].n_output          # width of h[n+1]
+                    w_name = f'head_W{n}'
+                    b_name = f'head_b{n}' if self.b_output_active else None
+                    self.register_parameter(w_name, nn.Parameter(torch.tensor(
+                        rand_weight_init(d_n, self.n_output, init_type=self.W_output_init),
+                        dtype=self.W_output.dtype)))
+                    if b_name is not None:
+                        self.register_parameter(b_name, nn.Parameter(torch.tensor(
+                            rand_weight_init(self.n_output, init_type=self.b_output_init),
+                            dtype=self.W_output.dtype)))
+                    self._head_names.append((w_name, b_name))
+            finally:
+                np.random.set_state(np_state)
 
 
     def forward(self, inputs, run_mode='minimal', verbose=False):
@@ -2108,8 +2211,21 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
         output = F.linear(h[-1], self.W_output, self.b_output)
         return output, h, z, phi_p, embed_pre
 
-    def _same_time_boundary_signals(self, grad_output, phi_p, need_input_signal):
+    def _same_time_boundary_signals(self, grad_output, phi_p, need_input_signal,
+                                    head_errors=None):
         """Same-time layer-boundary learning signals using the frozen M_{t-1}.
+
+        head_errors (local readout heads; see _LEARNING_SIGNALS): the per-head
+        output errors e_n = dL_n/dq^(n) for n = 0..L-2, or None (global signal).
+          local_readout — ell_h[n+1] = e_n @ C_n for every non-top layer; the
+            inter-layer recursion is SKIPPED (nothing descends from upper layers);
+            ell_h[L] stays grad_output @ W_output.
+          mixed — the global recursion runs unchanged on the MAIN readout error,
+            then alpha * e_n @ C_n is ADDED to ell_h[n+1]; the head errors never
+            enter the recursion, so no auxiliary loss reaches another module.
+        In both modes ell_h[0] (the embedding) is still derived from the FINAL
+        ell_h[1] through layer 0's backprojection (+ identity skip), i.e. the
+        embedding belongs to module 0 and follows module 0's signal.
 
         ell_h[n] is the surrogate dL/dh[n] (the signal at the INPUT boundary of MP
         layer n). How it is formed depends on self.feedback_mode (see _FEEDBACK_MODES):
@@ -2163,16 +2279,27 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
         # recurse down; ell_h[0] only when the trainable embedding needs it.
         layerwise = (self.feedback_mode == 'layerwise_fa')
         ell_h[L] = grad_output @ (self.B_feedback if layerwise else self.W_output)
-        for n in range(L - 1, 0, -1):
-            delta_n = ell_h[n + 1] * phi_p[n]
-            if layerwise:
-                ell_h[n] = delta_n @ getattr(self, self._B_inter_names[n])
-            else:
-                ell_h[n] = self.mp_layers[n].backproject_through_modulated_weights_fast(delta_n)
-            # Identity-skip Jacobian term: h[n+1]=a_n+h[n] adds ell_h[n+1] straight
-            # through (equal widths guaranteed by _residual_at[n]).
-            if self._residual_at[n]:
-                ell_h[n] = ell_h[n] + ell_h[n + 1]
+        # Pure local readout: no signal descends from the layers above, so the
+        # recursion is skipped entirely (each non-top layer is set from its head).
+        pure_local = head_errors is not None and self.learning_signal == 'local_readout'
+        if not pure_local:
+            for n in range(L - 1, 0, -1):
+                delta_n = ell_h[n + 1] * phi_p[n]
+                if layerwise:
+                    ell_h[n] = delta_n @ getattr(self, self._B_inter_names[n])
+                else:
+                    ell_h[n] = self.mp_layers[n].backproject_through_modulated_weights_fast(delta_n)
+                # Identity-skip Jacobian term: h[n+1]=a_n+h[n] adds ell_h[n+1] straight
+                # through (equal widths guaranteed by _residual_at[n]).
+                if self._residual_at[n]:
+                    ell_h[n] = ell_h[n] + ell_h[n + 1]
+        if head_errors is not None:
+            # Local head signals: e_n @ C_n lives at layer n's OUTPUT boundary h[n+1]
+            # (same row-vector convention as grad_output @ W_output above). Replaces
+            # the boundary signal under local_readout, is added under mixed.
+            for n, (w_name, _) in enumerate(self._head_names):
+                local_n = head_errors[n] @ getattr(self, w_name)
+                ell_h[n + 1] = local_n if pure_local else ell_h[n + 1] + self.local_signal_alpha * local_n
         if need_input_signal:
             delta_0 = ell_h[1] * phi_p[0]
             if layerwise:
@@ -2297,6 +2424,29 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
                 ps['b_in'] = self.W_initial_linear.bias
         return {k: v for k, v in ps.items() if v.requires_grad}
 
+    def _aux_params(self):
+        """Auxiliary (local readout head) parameters, keyed 'head_W{n}'/'head_b{n}'
+        by the MP layer n they read. Kept APART from _trainable_params: they are
+        trained only by the local passes (bptt_gradients never differentiates them,
+        so autograd sees no unused parameter), excluded from the BPTT-alignment
+        columns and from the weight-decay group (neither key starts with 'W'), and
+        get their .grad written by sequence_gradients only when the pass produced
+        one. Empty for learning_signal='global' or a single MP layer."""
+        ps = {}
+        for w_name, b_name in self._head_names:
+            ps[w_name] = getattr(self, w_name)
+            if b_name is not None:
+                ps[b_name] = getattr(self, b_name)
+        return {k: v for k, v in ps.items() if v.requires_grad}
+
+    def _head_outputs(self, h):
+        """Auxiliary head predictions q^(n) = C_n h[n+1] + c_n for every head, from
+        the per-step stream list h of _forward_local_stack. Linear, so dL/dC_n is
+        e_n^T h[n+1] and dL/dc_n is sum_B e_n (accumulated by the local loop)."""
+        return [F.linear(h[n + 1], getattr(self, w_name),
+                         None if b_name is None else getattr(self, b_name))
+                for n, (w_name, b_name) in enumerate(self._head_names)]
+
     def bptt_gradients(self, inputs, labels, masks,
                        loss_and_grad=masked_mse_loss_and_output_grad,
                        return_outputs=True):
@@ -2346,18 +2496,26 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
         """Forward-only pre-pass for a CUSTOM loss (deep net). Runs the embedding +
         full MP stack with the same clean-config fast M update the accumulation
         loop uses (for EVERY layer), builds the full output sequence, and returns
-        (loss, grad_output_seq) from loss_and_grad. See
+        (loss, grad_output_seq, aux_losses, aux_grad_seqs) from loss_and_grad. See
         MultiPlasticNet._prepass_output_grad. eta_lam is the per-layer list of
-        (eta, lam) expansions (one entry per MP layer)."""
+        (eta, lam) expansions (one entry per MP layer). The two aux lists hold one
+        entry per local readout head (the SAME loss helper applied to that head's
+        prediction sequence, so mask handling and normalization match the main
+        readout exactly); both are empty without heads."""
         layers = self.mp_layers
         B, T, _ = inputs.shape
         dev, dt = inputs.device, inputs.dtype
         self.reset_state(B=B)
         outputs = torch.empty(B, T, self.n_output, dtype=dt, device=dev)
+        aux_outputs = [torch.empty(B, T, self.n_output, dtype=dt, device=dev)
+                       for _ in self._head_names]
         for t in range(T):
             u_t = inputs[:, t, :]
             output, h, z, phi_p, embed_pre = self._forward_local_stack(u_t)
             outputs[:, t, :] = output
+            if aux_outputs:
+                for k, q_k in enumerate(self._head_outputs(h)):
+                    aux_outputs[k][:, t, :] = q_k
             um = None if update_masks is None else update_masks[:, t]
             for n, mp in enumerate(layers):
                 eta_n, lam_n = eta_lam[n]
@@ -2367,7 +2525,8 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
                 mp.update_M_matrix_local_fast(h[n], post, eta=eta_n, lam=lam_n,
                                               update_mask=um)
         loss, grad_output_seq = loss_and_grad(outputs, labels, masks)
-        return loss, grad_output_seq
+        aux = [loss_and_grad(q, labels, masks) for q in aux_outputs]
+        return loss, grad_output_seq, [a[0] for a in aux], [a[1] for a in aux]
 
     @torch.no_grad()
     def _local_sequence_gradients(self, inputs, labels, masks, mode,
@@ -2430,10 +2589,16 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
         # (see MultiPlasticNet._local_sequence_gradients / _prepass_output_grad).
         default_loss = (loss_and_grad is masked_mse_loss_and_output_grad)
         need_outputs = return_outputs or (not default_loss)
+        # Local readout heads (learning_signal != 'global'; none on a single MP
+        # layer, in which case this pass is byte-identical to the global one).
+        heads = self._head_names
+        n_heads = len(heads)
         prepass_loss, grad_output_seq = (None, None)
+        aux_prepass_loss, aux_grad_seq = ([], [])
         if not default_loss:
-            prepass_loss, grad_output_seq = self._prepass_output_grad(
-                inputs, labels, masks, loss_and_grad, eta_lam, update_masks)
+            prepass_loss, grad_output_seq, aux_prepass_loss, aux_grad_seq = \
+                self._prepass_output_grad(inputs, labels, masks, loss_and_grad,
+                                          eta_lam, update_masks)
 
         self.reset_state(B=B)
         for mp in layers:
@@ -2515,6 +2680,16 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
 
         N = B * T * self.n_output
 
+        # Local readout heads: per-head gradient accumulators (outer products summed
+        # per step — no (T,B,·) scratch), streamed aux losses, and (optionally) the
+        # head prediction sequences for accuracy logging.
+        if n_heads:
+            grad_head_W = [torch.zeros_like(getattr(self, w_name)) for w_name, _ in heads]
+            grad_head_b = [torch.zeros(self.n_output, dtype=dt, device=dev) for _ in heads]
+            aux_loss_sum = [torch.zeros((), dtype=dt, device=dev) for _ in heads]
+            aux_outputs = ([torch.empty(B, T, self.n_output, dtype=dt, device=dev) for _ in heads]
+                           if need_outputs else None)
+
         for t in range(T):
             u_t = inputs_T[t]
 
@@ -2532,13 +2707,37 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
             else:
                 grad_output = grad_output_seq[:, t, :]
 
+            # 2b. Local readout heads: each head's own output error on the SAME
+            #     labels/mask (same loss formula and 1/N normalization as the main
+            #     readout; custom losses come from the pre-pass), plus the head's
+            #     own gradient — q is linear in (C_n, c_n), so dL_n/dC_n = e_n^T h[n+1].
+            head_errors = None
+            if n_heads:
+                q = self._head_outputs(h)
+                head_errors = []
+                for k in range(n_heads):
+                    if default_loss:
+                        diff_k = m_t * q[k] - m_t * labels_T[t]
+                        e_k = (2.0 / N) * m_t * diff_k
+                        aux_loss_sum[k] = aux_loss_sum[k] + (diff_k * diff_k).sum()
+                    else:
+                        e_k = aux_grad_seq[k][:, t, :]
+                    head_errors.append(e_k)
+                    grad_head_W[k] += torch.einsum('Ba,Bi->ai', e_k, h[k + 1])
+                    grad_head_b[k] += e_k.sum(0)
+                    if aux_outputs is not None:
+                        aux_outputs[k][:, t, :] = q[k]
+
             um = None if um_T is None else um_T[t]
 
             # 3. All same-time boundary signals, using the still-frozen M_{t-1}.
             #    ell_h[n+1] credits MP layer n. Direct input gradients use ell_h[0];
             #    diag_mtrace instead credits its first-layer eligibility with ell_h[1].
+            #    With local readout heads, head_errors replace (local_readout) or
+            #    augment (mixed) the non-top boundary signals.
             ell_h = self._same_time_boundary_signals(grad_output, phi_p,
-                                                      need_input_signal=embed and not input_mtrace)
+                                                      need_input_signal=embed and not input_mtrace,
+                                                      head_errors=head_errors)
 
             # 4. Input gradients consume M_{t-1}; the new trace is finalized only
             #    after the first MP layer's write. The ordinary branch is unchanged.
@@ -2649,11 +2848,31 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
                 all_grads['W_in'] = torch.einsum('TBo,TBI->oI', ga_seq, u_seq)
             if need_b_in:
                 all_grads['b_in'] = ga_seq.sum(dim=(0, 1))
+        # Local readout heads: 'head_W{n}'/'head_b{n}' (see _aux_params).
+        if n_heads:
+            for k, (w_name, b_name) in enumerate(heads):
+                all_grads[w_name] = grad_head_W[k]
+                if b_name is not None:
+                    all_grads[b_name] = grad_head_b[k]
 
         params = self._trainable_params()
         result = {k: all_grads[k] for k in params}
+        for k in self._aux_params():
+            result[k] = all_grads[k]
         result['loss'] = loss.detach()
         result['outputs'] = outputs.detach() if return_outputs and outputs is not None else None
+        if n_heads:
+            # Per-head task losses (same objective as the main readout, on that
+            # head's prediction) and, when requested, the head prediction sequences.
+            # Reported SEPARATELY from 'loss', which stays the main readout's.
+            if default_loss:
+                result['aux_loss'] = [
+                    (masked_mse_loss_only(aux_outputs[k], labels, masks) if aux_outputs is not None
+                     else aux_loss_sum[k] / N).detach() for k in range(n_heads)]
+            else:
+                result['aux_loss'] = [l.detach() for l in aux_prepass_loss]
+            result['aux_outputs'] = ([o.detach() for o in aux_outputs]
+                                     if return_outputs and aux_outputs is not None else None)
         return result
 
     def local_gradients(self, inputs, labels, masks, **kwargs):
@@ -2723,6 +2942,11 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
         if want_exact == native_is_exact:
             return grads                      # native pass already produced it
         other_rule = 'bptt' if want_exact else 'local_direct'
+        if other_rule == 'bptt' and self.learning_signal != 'global':
+            raise ValueError(
+                "input_mode='exact' splices a full-BPTT embedding gradient into a local "
+                f"run, which is not local; under learning_signal='{self.learning_signal}' "
+                "use match, three_factor, diag_mtrace or paired.")
         other = self._grads_for_rule(other_rule, inputs, labels, masks, **kwargs)
         for k in ('W_in', 'b_in'):
             if k in grads and k in other:
@@ -2738,4 +2962,9 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
 
         for name, p in self._trainable_params().items():
             p.grad = grads[name].clone()
+        # Local readout heads are trained only by the local passes: bptt produces no
+        # head gradient, so its heads keep .grad=None and the optimizer skips them.
+        for name, p in self._aux_params().items():
+            if name in grads:
+                p.grad = grads[name].clone()
         return grads

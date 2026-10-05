@@ -43,6 +43,19 @@ that also computes BPTT input gradients during local runs. Example:
 --local-bias-mode exact retains exact bias traces (appropriate for row-local
 DFA, but no longer the strictly synapse-local diagonal variant).
 
+Use --learning-signal local_readout for per-layer LOCAL READOUT heads (dmpn,
+multi-MP-layer): every non-top MP layer gets an auxiliary linear head trained on
+the task loss, and that head's error — not a signal descending from the layers
+above — credits the layer's eligibility; the top layer keeps W_output and the
+embedding shares module 0's head. It needs exact_spatial feedback and
+cross-layer-steps 0 and cannot splice a BPTT input gradient, so the two module
+defaults that would conflict (input mode 'exact', cross-layer 1) switch to
+'match' / 0 unless set explicitly. bptt ignores the setting. Pair it with --seed
+so a global and a local_readout invocation share init and data:
+    python scripts/train_mpn.py --task seqmnist --hidden 128 128 --seed 7
+    python scripts/train_mpn.py --task seqmnist --hidden 128 128 --seed 7 \
+        --learning-signal local_readout
+
 Weights & Biases (https://wandb.ai): pass --wandb to log every run live. Each
 invocation becomes ONE W&B experiment named after this run's output ID (also used
 for the figure/.npz and checkpoint folder), containing len(RULES_TO_RUN) × N_RUNS
@@ -151,6 +164,21 @@ MP_RESIDUAL = True
 # (bptt is already exact). 0 selects the pure same-time rule. Only 0 and 1 are
 # implemented; the default below is 1, while --dfa selects 0.
 CROSS_LAYER_STEPS = 1
+# Learning-signal SOURCE for the local rules (dmpn, multi-MP-layer; see
+# mpn._LEARNING_SIGNALS). 'global' (default) = the main readout's error reaches
+# every layer through the inter-layer pathway — byte-identical to before.
+# 'local_readout' = every non-top MP layer owns an auxiliary linear head trained on
+# the same task loss; its error, projected through the head weights, is that layer's
+# learning signal and nothing descends from the layers above (the top layer keeps
+# W_output; the embedding shares module 0's head). 'mixed' adds alpha × the local
+# signal to the global one. Both local modes require exact_spatial feedback and
+# cross_layer_steps=0, and a local run may not splice a BPTT input gradient
+# (input_mode 'exact'); when those two defaults would conflict the CLI switches them
+# to 'match' / 0 unless you set them explicitly. bptt ignores the setting (its heads
+# receive no gradient), so the BPTT baseline is unchanged. Single-MP-layer nets have
+# no head, so local_readout then coincides with global. --learning-signal on CLI.
+LEARNING_SIGNAL = "global"
+LOCAL_SIGNAL_ALPHA = 1.0       # weight of the local signal under 'mixed' (--local-signal-alpha)
 N_RUNS = 1                    # independent seeds per rule
 # Hidden width(s) of the MP-layer stack. A single int → one MP layer (the classic
 # in→hidden→out net). A list of ints → one MP layer per width, i.e. a DEEP MP
@@ -270,6 +298,10 @@ def build_params():
         raise ValueError(
             "--residual (identity skip connections) is implemented for dmpn only; "
             "use --net dmpn.")
+    if LEARNING_SIGNAL != "global" and NET_TYPE != "dmpn":
+        raise ValueError(
+            f"--learning-signal {LEARNING_SIGNAL} (local readout heads) needs the deep "
+            "net's non-top MP layers; use --net dmpn.")
     net_params = {
         "net_type": NET_TYPE,            # 'dmpn' or 'mpn1'
         # [in, h1, h2, ..., out]; in/out overwritten below. One MP layer per hidden
@@ -290,6 +322,8 @@ def build_params():
         "mp_residual": _mp_residual(),   # identity skip around each equal-width MP block
         "cross_layer_steps": CROSS_LAYER_STEPS,  # depth-1 cross-layer temporal correction
         "input_mode": INPUT_MODE,        # requested input-embedding policy
+        "learning_signal": LEARNING_SIGNAL,      # global | local_readout | mixed
+        "local_signal_alpha": LOCAL_SIGNAL_ALPHA,  # local weight under 'mixed'
         "ml_params": {
             "bias": True,
             "local_bias_mode": LOCAL_BIAS_MODE,
@@ -412,7 +446,9 @@ def _cfg():
         feedback_mode=FEEDBACK_MODE,
         input_normalize=INPUT_NORMALIZE, input_norm_sample=INPUT_NORM_SAMPLE,
         mp_residual=_mp_residual(), cross_layer_steps=CROSS_LAYER_STEPS,
-        input_mode=INPUT_MODE, n_runs=N_RUNS, n_hidden=_hidden_widths()[0],
+        input_mode=INPUT_MODE, learning_signal=LEARNING_SIGNAL,
+        local_signal_alpha=LOCAL_SIGNAL_ALPHA,
+        n_runs=N_RUNS, n_hidden=_hidden_widths()[0],
         batch=BATCH, n_datasets=N_DATASETS, lr=LR, grad_clip=GRAD_CLIP,
         log_every=LOG_EVERY, log_grad_align=LOG_GRAD_ALIGN, device=DEVICE, dtype=DTYPE,
         fig_dir=FIG_DIR, ckpt_dir=CKPT_DIR, data_dir=DATA_DIR, save_nets=SAVE_NETS,
@@ -486,6 +522,24 @@ def _parse_args():
                    help="positive bound/scale B for hard or scaled_tanh (default: %(default)s)")
     p.add_argument("--task", default=RULESET, help="ruleset / task (default: %(default)s)")
     p.add_argument("--runs", type=int, default=N_RUNS, help="independent seeds")
+    p.add_argument("--seed", type=int, default=None,
+                   help="starting seed (subsequent runs increment it). Default: a "
+                        "random draw per invocation. Fix it to make two invocations "
+                        "(e.g. --learning-signal global vs local_readout) a PAIRED "
+                        "comparison with identical init and training data.")
+    p.add_argument("--learning-signal", choices=["global", "local_readout", "mixed"],
+                   default=None,
+                   help="where each MP layer's learning signal comes from (dmpn): "
+                        "'global' = the main readout error via the inter-layer pathway "
+                        "(default, unchanged); 'local_readout' = per-layer auxiliary "
+                        "heads trained on the task loss, nothing descends from upper "
+                        "layers; 'mixed' = global + alpha*local. Local modes need "
+                        "exact_spatial feedback and cross-layer-steps 0 and cannot use "
+                        "input-mode exact; those two defaults switch to match / 0 unless "
+                        f"set explicitly. Default: {LEARNING_SIGNAL}.")
+    p.add_argument("--local-signal-alpha", type=float, default=LOCAL_SIGNAL_ALPHA,
+                   help="weight of the local head signal under --learning-signal mixed "
+                        "(default: %(default)s).")
     p.add_argument("--hidden", type=int, nargs="+", default=None,
                    help="hidden width(s): one int → a single MP layer (classic); "
                         "several ints → a deep MP stack, one MP layer per width "
@@ -554,11 +608,36 @@ def _parse_args():
     args = p.parse_args()
     if args.grad_align is None:
         args.grad_align = False if args.dfa else LOG_GRAD_ALIGN
+    args.learning_signal = args.learning_signal or LEARNING_SIGNAL
+    local_signal = args.learning_signal != "global"
+    # Explicit flags always win. Otherwise a local signal swaps only the two module
+    # defaults that would conflict with it: an 'exact' input mode (a BPTT splice is
+    # not local) and a non-zero cross-layer correction (inter-module by construction).
+    default_input_mode = INPUT_MODE
+    if local_signal and default_input_mode == "exact":
+        default_input_mode = "match"
+    default_cross = CROSS_LAYER_STEPS
+    if local_signal and default_cross != 0:
+        default_cross = 0
     args.feedback = args.feedback or ("direct_fa" if args.dfa else FEEDBACK_MODE)
-    args.input_mode = args.input_mode or ("match" if args.dfa else INPUT_MODE)
+    args.input_mode = args.input_mode or ("match" if args.dfa else default_input_mode)
     if args.cross_layer_steps is None:
-        args.cross_layer_steps = 0 if args.dfa else CROSS_LAYER_STEPS
+        args.cross_layer_steps = 0 if args.dfa else default_cross
     args.local_bias_mode = args.local_bias_mode or ("direct" if args.dfa else LOCAL_BIAS_MODE)
+    if local_signal:
+        if args.net != "dmpn":
+            p.error(f"--learning-signal {args.learning_signal} requires --net dmpn")
+        if mpn.canonical_feedback_mode(args.feedback) != "exact_spatial":
+            p.error(f"--learning-signal {args.learning_signal} requires --feedback exact_spatial "
+                    "(the local heads define the inter-layer signal)")
+        if args.cross_layer_steps != 0:
+            p.error(f"--learning-signal {args.learning_signal} requires --cross-layer-steps 0")
+        if args.input_mode == "exact":
+            p.error(f"--learning-signal {args.learning_signal} cannot use --input-mode exact "
+                    "(a BPTT input splice is not local); use match, three_factor, "
+                    "diag_mtrace or paired")
+        if not np.isfinite(args.local_signal_alpha):
+            p.error("--local-signal-alpha must be finite")
     if args.rules is None:
         args.rules = (["bptt", "local_exact_rowlocal", "local_diag_rflo"] if args.dfa
                       else ["bptt", "local_diag_rflo", "local_direct"]
@@ -594,11 +673,16 @@ def main():
     global MODULATION_MODE, MODULATION_BOUND, MODULATION_BOUNDS
     global DFA_PRESET
     global RFLO_TRACE_RHO, LAM
+    global SEED, LEARNING_SIGNAL, LOCAL_SIGNAL_ALPHA
     args = _parse_args()
     DFA_PRESET = args.dfa
     NET_TYPE = args.net
     RULESET = args.task
     N_RUNS = args.runs
+    if args.seed is not None:
+        SEED = args.seed
+    LEARNING_SIGNAL = args.learning_signal
+    LOCAL_SIGNAL_ALPHA = args.local_signal_alpha
     if args.hidden is not None:
         # one int → scalar (single MP layer); several → list (deep MP stack).
         N_HIDDEN = args.hidden[0] if len(args.hidden) == 1 else args.hidden

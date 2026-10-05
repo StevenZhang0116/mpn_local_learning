@@ -172,6 +172,48 @@ model's `resolved_input_mode`; the config JSON records `resolved_input_modes`
 for all selected rules. The requested `input_mode` remains `paired`, and the
 effective mapping is recomputed whenever the model's learning rule changes.
 
+### Local readout heads (`--learning-signal`)
+
+By default every MP layer's learning signal is the main readout's error delivered
+through the inter-layer pathway (`--learning-signal global`). With
+`--learning-signal local_readout`, every non-top MP layer of a `dmpn` stack owns an
+auxiliary linear head trained on the same task loss, labels and mask as the main
+readout; the head's error projected through its weights is that layer's learning
+signal, and nothing descends from the layers above. The top MP layer keeps the true
+readout `W_output`, and the input embedding shares module 0's head through the
+unchanged layer-0 backprojection (plus the residual identity term), so module 0 is
+"embedding + first MP layer" and every other module is one MP layer. The
+eligibility rule (`local_direct`, `local_diag_rflo`, `local_exact_rowlocal`) is
+unchanged; only the signal it consumes changes. Under `local_exact_rowlocal` each
+non-top layer's gradient is then exact for its own head's loss. `--learning-signal
+mixed --local-signal-alpha a` adds `a` times the local signal to the global one,
+computed independently (head errors never enter the global recursion).
+
+Heads take part in training only; evaluation, the plotted/scheduled metrics and
+`grads["loss"]` stay the main readout's. The console prints an `aux` sub-line per
+rule with each head's train loss and accuracy (also logged to W&B as
+`train/aux{n}_*`). Head gradients are norm-clipped as a separate group so they never
+change the main network's clipped step. `bptt` ignores the setting (its heads get no
+gradient), so the BPTT baseline is unchanged; the gradient-alignment columns exclude
+the heads. The local modes require `--feedback exact_spatial` and
+`--cross-layer-steps 0`, and cannot use `--input-mode exact` (a BPTT input splice is
+not local): when those two module defaults would conflict they switch to `match` and
+`0` unless you set them explicitly. A single MP layer has no head, so
+`local_readout` then coincides with `global`. Heads are initialized from a private RNG
+stream, so a `global` and a `local_readout` invocation with the same `--seed` share
+init and training data:
+
+```bash
+python scripts/train_mpn.py --task seqmnist --hidden 128 128 --seed 7 --input-mode match --cross-layer-steps 0
+python scripts/train_mpn.py --task seqmnist --hidden 128 128 --seed 7 --learning-signal local_readout
+```
+
+`learning_signal` / `local_signal_alpha` are saved in `net_params` (checkpoints and
+`config.json`) and in the `.npz` metadata; checkpoints with heads reload through
+`load_net`, and pre-feature checkpoints build head-less nets. `--seed` fixes the
+starting seed for any task (ring-task trials are now seeded from the per-seed numpy
+stream rather than an import-time draw, so they too repeat across invocations).
+
 `train_mpn.py` defaults to hard modulation bounds `[-1, 1]` and no regularization:
 `MODULATION_MODE="hard"`, `MODULATION_BOUND=1.0`, and `REG_LAMBDA=0.0`.
 Use `--modulation-mode none` for unbounded writes,

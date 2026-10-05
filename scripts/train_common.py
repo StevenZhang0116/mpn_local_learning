@@ -99,6 +99,15 @@ class RunConfig:
     # mpn.DeepMultiPlasticNet cross_layer_steps). Recorded in metadata and figure
     # notes; the net reads it from net_params. Legacy names include "_xl{k}".
     cross_layer_steps: int = 0
+    # Learning-signal SOURCE for the local rules (dmpn; see mpn._LEARNING_SIGNALS):
+    # 'global' (default, unchanged) | 'local_readout' (per-layer auxiliary heads) |
+    # 'mixed' (global + local_signal_alpha × local). Recorded in metadata and the
+    # console/figure notes; the net reads it from net_params. Under the local modes
+    # run_seed clips the head gradients SEPARATELY from the main parameters and logs
+    # each head's train loss/accuracy next to the main readout's (which stay the
+    # plotted/scheduled metrics). Legacy names include "_ls-{signal}".
+    learning_signal: str = "global"
+    local_signal_alpha: float = 1.0
     # Optional extra string appended to the legacy filename tag (e.g. eta/lambda);
     # keep it filename-safe. Empty by default.
     tag_extra: str = ""
@@ -155,6 +164,8 @@ def param_tag(cfg):
         tag += f"_xl{cfg.cross_layer_steps}"
     # Legacy filenames record the input-embedding rule, including default 'match'.
     tag += f"_in-{getattr(cfg, 'input_mode', 'match')}"
+    if getattr(cfg, "learning_signal", "global") != "global":
+        tag += f"_ls-{cfg.learning_signal}"
     if cfg.tag_extra:
         tag += f"_{cfg.tag_extra}"
     return tag
@@ -293,12 +304,30 @@ def try_accuracy(task, net, output, labels, mask, inputs, isvalid=False):
         return float("nan")
 
 
+def aux_param_split(net, trainable):
+    """Split `trainable` into (main, aux): aux = the net's local readout head
+    parameters (mpn.DeepMultiPlasticNet._aux_params; empty for nets without heads
+    or without the method), main = everything else. Used to clip the two groups
+    SEPARATELY so head gradients never change the main network's clipped step."""
+    aux_fn = getattr(net, "_aux_params", None)
+    aux_ids = {id(p) for p in aux_fn().values()} if aux_fn is not None else set()
+    main = [p for p in trainable if id(p) not in aux_ids]
+    aux = [p for p in trainable if id(p) in aux_ids]
+    return main, aux
+
+
 def make_optim(net, lr, weight_decay=0.0):
-    """Adam with coupled L2: (weight_decay / 2) * sum(W**2), excluding biases."""
+    """Adam with coupled L2: (weight_decay / 2) * sum(W**2), excluding biases.
+    Weight matrices = every _trainable_params key starting with 'W' plus the local
+    readout heads' weights ('head_W*'), which are readouts like W_output."""
     trainable = [p for p in net.parameters() if p.requires_grad]
     if weight_decay:
         weight_ids = {id(parameter) for name, parameter in net._trainable_params().items()
                       if name.startswith('W')}
+        aux_fn = getattr(net, "_aux_params", None)
+        if aux_fn is not None:
+            weight_ids |= {id(parameter) for name, parameter in aux_fn().items()
+                           if name.startswith('head_W')}
         groups = [
             {'params': [parameter for parameter in trainable if id(parameter) in weight_ids],
              'weight_decay': weight_decay},
@@ -369,7 +398,7 @@ def run_seed(cfg, seed, record_steps, run_idx=0, wandb_logger=None):
                     if train_params.get('weight_reg') == 'L2' else 0.0)
     if weight_decay:
         print(f"  L2 weight regularization: {weight_decay:g} (Adam coupled decay; biases excluded)")
-    nets, optims = {}, {}
+    nets, optims, clip_groups = {}, {}, {}
     for rule in cfg.rules_to_run:
         net = copy.deepcopy(base)
         net.learning_rule = rule
@@ -378,6 +407,15 @@ def run_seed(cfg, seed, record_steps, run_idx=0, wandb_logger=None):
             print(f"  {rule}: input_mode={net.input_mode}, resolved_input_mode={resolved_input}")
         nets[rule] = net
         optims[rule] = make_optim(net, cfg.lr, weight_decay=weight_decay)
+        # Main parameters and local readout heads are norm-clipped as SEPARATE
+        # groups (same threshold), so the heads' gradients never alter the main
+        # network's clipped update. Without heads the aux group is empty and the
+        # main group is exactly the old `trainable` list.
+        clip_groups[rule] = aux_param_split(net, optims[rule][0])
+    n_heads = len(getattr(base, "_head_names", []))
+    if n_heads:
+        print(f"  learning_signal={cfg.learning_signal}: {n_heads} local readout head(s) "
+              f"(one per non-top MP layer); bptt ignores them.")
 
     # The task's objective. None → the net's default masked MSE; keeping it None
     # (not passing an explicit fn) preserves the local rules' single-pass fast
@@ -444,6 +482,7 @@ def run_seed(cfg, seed, record_steps, run_idx=0, wandb_logger=None):
 
         step_log = {}    # per-rule (train_loss, valid_loss, lr) for this step's log line
         step_align = {}  # per-rule {key: cosine vs BPTT} at record steps (local rules)
+        step_aux = {}    # per-rule [(head loss, head train acc)] at record steps (local heads)
         for rule in cfg.rules_to_run:
             net = nets[rule]
             trainable, opt, sch = optims[rule]
@@ -485,7 +524,10 @@ def run_seed(cfg, seed, record_steps, run_idx=0, wandb_logger=None):
 
             t0 = time.perf_counter()
             if cfg.grad_clip is not None:
-                torch.nn.utils.clip_grad_norm_(trainable, cfg.grad_clip)
+                main_params, aux_params = clip_groups[rule]
+                torch.nn.utils.clip_grad_norm_(main_params, cfg.grad_clip)
+                if aux_params:      # heads: own norm (no-op for bptt, whose heads have no grad)
+                    torch.nn.utils.clip_grad_norm_(aux_params, cfg.grad_clip)
             opt.step()
             if net.param_clamping:
                 net.param_clamp()
@@ -521,6 +563,16 @@ def run_seed(cfg, seed, record_steps, run_idx=0, wandb_logger=None):
                     curves[rule]["valid"].append(valid_acc)
                 step_log[rule] = (train_acc, valid_acc, train_loss, valid_loss,
                                   opt.param_groups[0]["lr"])
+                # Local readout heads (local rules under a local learning_signal):
+                # each head's train loss + train accuracy on this batch, logged
+                # BESIDE the main readout's (never mixed into it).
+                aux_losses = grads.get("aux_loss")
+                if aux_losses:
+                    aux_outs = grads.get("aux_outputs") or [None] * len(aux_losses)
+                    step_aux[rule] = [
+                        (float(l), (try_accuracy(task, net, o, labels, mask, inputs, isvalid=False)
+                                    if o is not None else float("nan")))
+                        for l, o in zip(aux_losses, aux_outs)]
 
         n_accum += 1   # one more timed step since the last log line
 
@@ -555,6 +607,13 @@ def run_seed(cfg, seed, record_steps, run_idx=0, wandb_logger=None):
                       f"{tr_acc:>7.3f} {va_acc:>7.3f}   "
                       f"{tr_loss:>9.3e} {va_loss:>9.3e}   {lr:>7.1e}   "
                       f"{fwd_ms:>7.1f} {bwd_ms:>7.1f} {opt_ms:>7.1f}{align_cols}")
+                # Local readout heads: one indented sub-line per rule that has them
+                # (head index = the MP layer it reads; the top layer is the main readout).
+                aux = step_aux.get(r)
+                if aux:
+                    heads_txt = "  ".join(f"head{k}: acc {a:.3f} loss {l:.3e}"
+                                          for k, (l, a) in enumerate(aux))
+                    print(f"    {' ' * 6}  {'':<{label_w}}   aux  {heads_txt}")
                 # Mirror this step's metrics to W&B (opt-in). One row into this
                 # rule's run for this seed; grouping/coloring by 'rule' in the UI
                 # then yields K curves with each seed drawn separately.
@@ -569,6 +628,9 @@ def run_seed(cfg, seed, record_steps, run_idx=0, wandb_logger=None):
                     }
                     for k in align_keys:
                         metrics[f"grad_align/{_short(k)}"] = al.get(k)
+                    for k, (l, a) in enumerate(step_aux.get(r, [])):
+                        metrics[f"train/aux{k}_loss"] = l
+                        metrics[f"train/aux{k}_accuracy"] = a
                     wandb_logger.log_step(r, step, metrics)
             # Reset the window accumulators after logging.
             t_fwd = {r: 0.0 for r in cfg.rules_to_run}
@@ -604,6 +666,7 @@ def run_seed(cfg, seed, record_steps, run_idx=0, wandb_logger=None):
                 "mp_residual": cfg.mp_residual,
                 "input_mode": cfg.input_mode,
                 "resolved_input_mode": getattr(nets[rule], 'resolved_input_mode', None),
+                "learning_signal": getattr(nets[rule], 'learning_signal', cfg.learning_signal),
                 "seed": seed,
             }, path)
             print(f"  saved network: {path}")
@@ -713,6 +776,8 @@ def save_plot_data(cfg, record_steps, runs, agg, path=None,
         "mp_residual": cfg.mp_residual,
         "cross_layer_steps": getattr(cfg, "cross_layer_steps", 0),
         "input_mode": cfg.input_mode, "title": cfg.title,
+        "learning_signal": getattr(cfg, "learning_signal", "global"),
+        "local_signal_alpha": getattr(cfg, "local_signal_alpha", 1.0),
         # full architecture (multi-layer stacks) for provenance + replot suffix
         "arch_tag": getattr(cfg, "arch_tag", ""),
         "arch_desc": getattr(cfg, "arch_desc", ""),
@@ -809,6 +874,8 @@ def save_config(cfg, path=None):
             "mp_residual": cfg.mp_residual,
             "cross_layer_steps": getattr(cfg, "cross_layer_steps", 0),
             "input_mode": cfg.input_mode,
+            "learning_signal": getattr(cfg, "learning_signal", "global"),
+            "local_signal_alpha": getattr(cfg, "local_signal_alpha", 1.0),
             "resolved_input_modes": {
                 rule: resolve_input_mode(cfg.input_mode, rule) for rule in cfg.rules_to_run
             } if net_params.get("net_type") == "dmpn" else {},
@@ -867,7 +934,9 @@ def run_experiment(cfg):
           f"{'  (input norm ON)' if getattr(cfg, 'input_normalize', False) else ''}"
           f"{'  (residual ON)' if getattr(cfg, 'mp_residual', False) else ''}"
           f"{f'  (cross-layer x{cfg.cross_layer_steps})' if getattr(cfg, 'cross_layer_steps', 0) else ''}"
-          f"  input_mode: {getattr(cfg, 'input_mode', 'match')}\n")
+          f"  input_mode: {getattr(cfg, 'input_mode', 'match')}"
+          f"{f'  learning_signal: {cfg.learning_signal}' if getattr(cfg, 'learning_signal', 'global') != 'global' else ''}"
+          f"{f' (alpha={cfg.local_signal_alpha:g})' if getattr(cfg, 'learning_signal', 'global') == 'mixed' else ''}\n")
 
     # Weights & Biases (opt-in). Import lazily so non-W&B runs never touch wandb.
     # The experiment name == the output save-stem (figure/.npz share it), used
@@ -944,8 +1013,11 @@ def run_experiment(cfg):
                if getattr(cfg, "cross_layer_steps", 0) else "")
     inmode_note = ("" if getattr(cfg, "input_mode", "match") == "match"
                    else f", input={cfg.input_mode}")
+    signal_note = ("" if getattr(cfg, "learning_signal", "global") == "global"
+                   else f", signal={cfg.learning_signal}"
+                   + (f" (alpha={cfg.local_signal_alpha:g})" if cfg.learning_signal == "mixed" else ""))
     plot(cfg, record_steps, agg, cfg.rules_to_run,
-         f"(mean ± std over {cfg.n_runs} runs, {arch_suffix(cfg)}{inorm_note}{resid_note}{xl_note}{inmode_note})",
+         f"(mean ± std over {cfg.n_runs} runs, {arch_suffix(cfg)}{inorm_note}{resid_note}{xl_note}{inmode_note}{signal_note})",
          fig_path(cfg))
 
     # Gradient-alignment-vs-BPTT figure (only when the diagnostic produced data).

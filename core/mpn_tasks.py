@@ -1799,9 +1799,16 @@ def convert_and_init_multitask_params(params):
     # 2025-10-30: overwrite alpha to be 0.8, to match with LD's paper
     net_params['alpha'] = 1 - net_params['dt'] / net_params['tau'] 
     
+    # Seed the task's trial generator from the GLOBAL numpy stream AT CALL TIME rather
+    # than from the module-level `seed` (an unseeded Python-random draw made once at
+    # import, which made ring-task data differ between invocations even under the
+    # same training seed). train_common.run_seed seeds np.random per seed before this
+    # runs, so two invocations with the same --seed now see identical trials — the
+    # same guarantee the seq-MNIST / adding tasks already had by drawing from np.random.
+    task_seed = int(np.random.randint(1, 2 ** 31 - 1))
     hp = {
-        'seed': seed,
-        'rng': np.random.RandomState(seed),
+        'seed': task_seed,
+        'rng': np.random.RandomState(task_seed),
         # 'ruleset': task_params['ruleset'],
         'in_out_mode': task_params['in_out_mode'],
         'batch_size_train': train_params['n_batches'], # number of batches for training

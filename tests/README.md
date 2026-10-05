@@ -15,6 +15,7 @@ etc. import cleanly. Run from this directory.
 | `test_output_layout.py` | Compact run IDs, nested checkpoint paths, full configuration metadata, and legacy RNN output naming. |
 | `test_analysis_scripts.py` | New/legacy checkpoint discovery, automatic seed selection, figure saving, and metadata-based MPN/RNN comparisons. |
 | `test_input_modulation_trace.py` | Input modulation sensitivities against independent autograd graphs, BPTT limiting cases, delayed credit, nonlinear writes/masks, residuals, freezing, custom losses, CLI validation, and checkpoint reload. |
+| `test_local_readouts.py` | Local readout heads (`learning_signal` = `local_readout` / `mixed`): head gradients vs independent autograd (MSE + CE), exact row-local gradients per layer against an isolated-layer oracle under each head's own loss, locality (one head perturbs one module), single-layer and `global` limiting cases (byte-identical), `mixed` linearity in alpha, private head RNG (paired init/data), bptt ignoring the heads, model/CLI guards, checkpoint round-trip, and the runner's separate clipping / head logging / metadata. |
 | `validate_local_learning.py` | Correctness of the local-learning rules vs BPTT (Tiers 1-8 + a real-task integration check). float64, tight tolerances. |
 | `test_tasks.py` | The task adapters in `scripts/tasks.py`: seq-MNIST data loading / batching / masking / metric / determinism, the registry, and an end-to-end "loss decreases" integration check for both MPN and RNN. |
 
