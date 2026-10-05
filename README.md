@@ -59,11 +59,36 @@ python test_tasks.py                                     # task-adapter tests
 - `adding` → the adding problem (seq_len=200, 2 marks); `adding_L<len>_m<marks>`
   sweeps the sequence length / mark count, e.g. `adding_L500_m3`.
 
-All tasks run for both models and both BPTT and local learning, framed as
-masked-MSE scored on the final step, so they drive the same loss/eligibility
-machinery the local rules are derived for. The adding problem is a long-range
+All tasks run for both models and both BPTT and local learning. Sequential MNIST
+uses cross-entropy at the final step; ring tasks use masked MSE at their scored
+times, and the adding problem uses final-step MSE. The task supplies the same
+objective to all learning rules. The adding problem is a long-range
 credit-assignment benchmark: its BPTT-vs-local gap should widen with sequence
 length — the central question this project studies.
+
+For long sequences, `train_mpn.py --batch-size 16` reduces the number of trials
+per training update (default 128). Validation uses three times the training batch
+size and evaluates in chunks of the training batch size. Both sizes are saved in
+the experiment metadata. `--no-grad-align` disables the extra full-BPTT reference
+passes used to log local/BPTT gradient cosine similarities; it does not disable
+the `bptt` training rule or an exact-BPTT input update.
+
+For example, a smaller-batch pixel-MNIST comparison with three MP layers:
+
+```bash
+python scripts/train_mpn.py --task seqmnist_pixel --hidden 128 128 128 \
+  --residual --rflo-trace-rho 0.99 --lam 0.99 \
+  --feedback exact_spatial --input-mode match --local-bias-mode direct \
+  --cross-layer-steps 0 --modulation-mode hard --modulation-bound 1 \
+  --rules local_direct local_diag_rflo bptt \
+  --batch-size 16 --no-grad-align --steps 5000 --runs 3
+```
+
+Full BPTT retains the 784-step computation graph, including the per-sample
+modulation matrices; use a smaller batch if it exceeds available GPU memory.
+Reducing batch size changes samples per optimizer step, not sequence length or
+the BPTT gradient definition. At batch 16, 5000 steps sample 80,000 images per
+rule/seed, versus 640,000 at batch 128 (sampling is with replacement).
 
 Each run writes a two-panel (train / test accuracy) figure to `figure/`, the arrays
 behind it to `figure_data/`, and (MPN) trained nets to `checkpoints/`. MPN outputs
@@ -163,6 +188,32 @@ clipping; logged losses, scheduling, and alignment remain task-only. The config
 JSON and checkpoints store modulation bounds/activation/scale in
 `net_params.ml_params` and regularization in `train_params.reg_lambda`.
 
+Use `--lam 0.9` to set the fixed modulation decay in every MP layer to 0.9 for
+all training rules. The value must be finite and in `[0, 1)`. Without this flag,
+the existing `m_time_scale=4000` setup gives lambda=0.99 at dt=40. An explicit
+value is saved as `net_params.ml_params.lam_clamp`, replacing `m_time_scale`;
+the core initializes lambda from it and derives the corresponding time constant.
+Eta remains 1.0. This parameter is separate from the RFLO trace-gain cap below.
+
+For diagonal RFLO, `--rflo-trace-rho 0.99` optionally caps the MP-weight trace
+recurrence gain. With `k = assoc * eta * phi_prime * x**2`, the candidate update is
+`A_new = clip(lambda + k*W, -rho, rho)*A_old + k*(1+M)`; existing update masks,
+write derivatives, and frozen-state gates are then applied in their usual order.
+`rho` must be finite and strictly between 0 and 1. Omit the flag to retain the
+original recurrence. This is an additional eligibility approximation: it limits
+repeated amplification of old traces, but does not guarantee better gradient
+alignment or training performance. It does not cap the drive term, forward
+modulation, exact bias traces, or input-layer sensitivity traces. Direct,
+row-local, and BPTT gradients do not use this cap. For an isolated comparison,
+use `--input-mode match --local-bias-mode direct --cross-layer-steps 0`.
+
+The cap is saved as `net_params.ml_params.rflo_trace_rho` in checkpoints and
+`config.json`, and restored by the diagnostic script. Legacy checkpoints with
+no such field use the original recurrence. Diagnostic `summary.json` records
+the setting; trace CSVs include `trace_gain_clipped_fraction`, the fraction of
+candidate gains outside `[-rho,rho]` before update masks/write gates (zero when
+the cap is disabled).
+
 Every `train_mpn.py` CLI invocation also mirrors stdout and stderr to
 `log/train_mpn_YYYYMMDD_HHMMSS_PID.log`, following the `MultiTaskMPN` logging
 pattern. The log directory is anchored to the project root regardless of the
@@ -257,6 +308,117 @@ They are project-root-relative, independent of the working directory:
 
 These analysis output directories are Git-ignored. Training-script figures
 continue to use `figure/`.
+
+### Compare gradients at direct-trained and RFLO-trained checkpoints
+
+`notebooks/diagnose_gradients.py` compares `local_direct`, `local_diag_rflo`, and
+full BPTT at each checkpoint's weights, using saved initial modulation and one
+shared batch. Run both trained states from one experiment with a single command:
+
+```bash
+python notebooks/diagnose_gradients.py \
+  --run-dir checkpoints/dmpn_contextdelaydm1_5e277d7bb0d8
+```
+
+The script automatically selects a seed containing both `local_direct.pt` and
+`local_diag_rflo.pt`, using the same newest-complete-group selection as
+`visualize_trained_networks.py`. It prints both selected paths. To select a
+particular seed, pass its folder, e.g. `--run-dir checkpoints/<run_id>/seed979`.
+It never pairs files across seed folders. The two checkpoints are evaluated
+sequentially to limit GPU memory use, each with all three gradient algorithms.
+No optimizer updates are performed; both checkpoint files remain untouched.
+
+Single-checkpoint analysis is also supported:
+
+```bash
+python notebooks/diagnose_gradients.py \
+  --checkpoint checkpoints/dmpn_contextdelaydm1_5e277d7bb0d8/seed979/local_diag_rflo.pt
+```
+
+The diagnostic supports deep MPNs with masked-MSE loss. It generates ring-task
+trials from saved task metadata (`random_batch`) with a fixed batch size of 128
+and data seed of 0, or loads an exported batch with its original size and values.
+CUDA is required; the script raises an error immediately if CUDA is unavailable.
+Checkpoint precision and saved feedback mode are used by default. Use
+`--dtype float64` to reduce numerical differences, or `--feedback exact_spatial`
+to examine traces independently of random-feedback approximations.
+
+Both local passes use `input_mode=match`, direct MP bias updates, and
+`cross_layer_steps=0` to isolate the diagonal MP weight trace. These may differ
+from training settings; both original and diagnostic settings are recorded.
+The BPTT reference always computes full gradients, including the input embedding.
+Gradients are measured before clipping, regularization, and Adam. Each pass
+resets M to saved `M_init`; eligibility traces start at zero. Forward outputs,
+losses, and unchanged checkpoint tensors are checked before reporting results.
+
+Outputs default to `notebooks/diagnose_gradients/<run-id>/`, matching the saved
+training experiment name. Checkpoints without a saved run ID fall back to their
+experiment folder name (for `seed<N>` folders) or checkpoint filename stem.
+Repeated analyses of one experiment overwrite the same report filenames; use
+`--output-dir` to keep different seeds/batches/settings separately.
+All files are saved directly in this directory,
+without `local_direct/` or `local_diag_rflo/` subfolders:
+
+- `gradient_metrics.csv`: per-parameter, per-layer, and global cosine, norms,
+  norm ratios, relative L2 errors, and nonfinite fractions; includes RFLO vs direct.
+- `trace_steps.csv` and `trace_summary.csv`: pre-update RMS of `WA`, `1+M`, and
+  their sum, correction/base RMS ratio, correction-dominance/sign-flip fractions,
+  and subsequent modulation-write clipping/zero-derivative fractions.
+- `checkpoint_comparison.png` (paired mode): gradient comparisons with one row
+  per trained checkpoint.
+- `trace_comparison.png` (paired mode): RFLO trace heatmaps with one row per
+  trained checkpoint and columns for `log10(1 + RMS(WA)/RMS(1+M))`, the fraction
+  `|WA| > |1+M|`, and the fraction of clipped modulation writes. Corresponding
+  columns share color scales across checkpoints; gray cells are undefined.
+  Single-checkpoint mode instead saves
+  `gradient_comparison.png` and `trace_diagnostics.png`.
+- `summary.json`: losses, consistency checks, settings, and checkpoint/batch
+  fingerprints.
+
+In paired mode, CSVs combine both checkpoints with a `source_checkpoint` column,
+and `summary.json` includes settings and checks for both. Each plot row compares
+against BPTT **at that row's own weights**; losses can differ between the two
+checkpoints. Both use precisely
+the same input/target/mask tensors and precision. The shared `batch.pt` is saved
+at the output root in either mode; use `--batch-file <path>/batch.pt` to reuse it.
+
+Layer metrics concatenate weights and biases; use the individual `W`, `W1`, …
+rows to inspect MP weights alone. Trace statistics include all times, including
+zero-loss periods. Near-zero bases are excluded from sign-flip fractions; RMS
+ratios avoid unstable elementwise division. Undefined/nonfinite metrics are
+JSON `null` or empty CSV cells, never silently replaced with zero. Trace summaries
+average/maximize defined per-step values. A one-batch comparison diagnoses local
+gradient geometry; it does not establish why an entire training run failed.
+
+### Test RFLO scaling in a single MP layer
+
+```bash
+python notebooks/verify_rflo_scaling.py \
+  --run-dir checkpoints/dmpn_contextdelaydm1_cc7fda16e6a4
+```
+
+This CUDA-only validation uses every direct/RFLO checkpoint pair in the experiment
+(or one seed folder), with eight shared batches of 128 trials and fixed data
+seeds 0–7. It requires exactly one MP layer and saved `exact_spatial` feedback.
+It compares MP weights alone, keeping local bias direct and input mode `match`.
+Full BPTT supplies the exact MP-weight reference at this depth. Checkpoints are
+unchanged; all measurements use their saved final weights in float32.
+
+`batch_metrics.csv` reports best common gains, residuals, gradient cosines,
+the parallel fraction of correction energy, sample/time contribution fits,
+temporal cancellation, and zero-base RFLO energy.
+`heldout_metrics.csv` fits common or positive per-parameter gains on batches 0–3
+and tests them on batches 4–7, without refitting. It also compares virtual Adam
+directions from the eight frozen-weight gradient batches, starting with zero
+moments and omitting clipping/decay. These are **not** the historical training
+updates and do not establish scale invariance throughout training.
+
+Outputs share one directory, by default
+`notebooks/verify_rflo_scaling/<run-id>_scaling/`: the CSVs, `trace_steps.csv`,
+`scaling_comparison.png`, `summary.json` (settings, hashes and consistency checks),
+`batches.pt`, and `mp_weight_gradients.pt`. `--output-dir` overrides this location.
+No per-rule result folders are created. Scalar residuals test a single shared
+gain; a large scalar residual alone does not rule out diagonal preconditioning.
 
 Validate all figure-saving workflows with small temporary fixtures:
 

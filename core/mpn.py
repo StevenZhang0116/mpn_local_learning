@@ -7,7 +7,8 @@ same public API (bptt_gradients / local_* / sequence_gradients), producing resul
 IDENTICAL to mpn_archive.py up to floating-point round-off (some changes are
 bitwise-exact, the speedups reorder ops). Verified by tests/test_mpn_revise.py:
 float64 diffs are ~1e-16 (pure round-off → same computation), float32 well within
-1e-5, across BPTT and all local rules on both nets.
+1e-5, across BPTT and all local rules on both nets for shared configurations.
+Optional rflo_trace_rho adds a capped-gain RFLO approximation beyond the archive.
 
 What is optimized (vs mpn_archive.py), all result-preserving:
   Forward / BPTT
@@ -186,6 +187,13 @@ class MultiPlasticLayer(BaseNetworkFunctions):
         self.local_bias_mode = ml_params.get('local_bias_mode', 'exact')
         if self.local_bias_mode not in ('exact', 'direct'):
             raise ValueError("local_bias_mode must be 'exact' or 'direct'")
+        # Optional stabilization of MP-weight diagonal traces, not forward M,
+        # bias traces, input sensitivities, or the other gradient algorithms.
+        self.rflo_trace_rho = ml_params.get('rflo_trace_rho')
+        if self.rflo_trace_rho is not None:
+            self.rflo_trace_rho = float(self.rflo_trace_rho)
+            if not math.isfinite(self.rflo_trace_rho) or not 0 < self.rflo_trace_rho < 1:
+                raise ValueError("rflo_trace_rho must be finite and strictly between 0 and 1")
 
         self.n_input = ml_params['n_input']
         self.n_output = ml_params['n_output']
@@ -492,18 +500,22 @@ class MultiPlasticLayer(BaseNetworkFunctions):
     # single same-synapse trace A_{iI} ~= P^I_{iI} (B,post,pre), dropping all
     # off-synapse (J != I) plastic sensitivities. The bias trace Q (B,post,pre)
     # is exact by default. local_bias_mode='direct' instead uses R=phi' with no Q.
-    # Intentionally an approximation to BPTT (grows with seq length and eta),
-    # except when n_input == 1, where there are no off-diagonal terms to drop.
+    # Intentionally an approximation to BPTT; omitted terms can matter more
+    # with longer sequences or stronger plasticity.
+    # With rflo_trace_rho=None, n_input == 1 has no off-diagonal terms to drop.
+    # Capping the recurrence introduces an additional approximation even then.
 
     def reset_diag_rflo_state(self, B=1):
         """Allocate the diagonal-RFLO traces (zeroed).
 
         A[b, i, I] ~= dM[b, i, I] / dW[i, I]   shape (B, n_output, n_input)
+        With rflo_trace_rho set, A is a stabilized surrogate sensitivity.
         Q[b, i, J]  = dM[b, i, J] / db[i]       shape (B, n_output, n_input)
         Q is None when local_bias_mode='direct'.
         """
         dev, dt = self.W.device, self.W.dtype
         self.A = torch.zeros(B, self.n_output, self.n_input, device=dev, dtype=dt)
+        self._diag_phi_prime = None
         self._local_trace_name = 'A'
         self._local_traces_pending = False
         self._smooth_trace_previous = {}
@@ -526,6 +538,10 @@ class MultiPlasticLayer(BaseNetworkFunctions):
         """
         M_prev = self.M   # (B, i, I) = M_{t-1}
         A_prev = self.A   # (B, i, I)
+        # The explicit trace update needs phi' itself: recovering it by dividing
+        # E by x*(1+M+W*A) would be undefined at zero inputs/factors.
+        if self.rflo_trace_rho is not None:
+            self._diag_phi_prime = phi_prime
 
         E = (phi_prime.unsqueeze(-1) * x.unsqueeze(1)
              * (1.0 + M_prev + self.W.unsqueeze(0) * A_prev))          # (B, i, I)
@@ -539,8 +555,11 @@ class MultiPlasticLayer(BaseNetworkFunctions):
     def update_diag_rflo_traces(self, x, E, R, update_mask=None, eta_lam=None):
         """Advance the diagonal-RFLO traces one step (uses M_t's eta/lam):
 
+        Without a gain cap:
         A_{iI,t} = lam_{iI} A_{iI,t-1} + eta_{iI} x_I E_hat^I_{i,t}
         Q_{iJ,t} = lam_{iJ} Q_{iJ,t-1} + eta_{iJ} x_J R_{i,t}          (exact)
+        With rflo_trace_rho set, cap the A recurrence via _capped_diag_trace.
+        The write derivative and frozen-state gate are applied after the M write.
 
         Call AFTER compute_diag_rflo_eligibility, in step with update_M_matrix.
         update_mask (B,) freezes traces for inactive batch rows.
@@ -549,10 +568,29 @@ class MultiPlasticLayer(BaseNetworkFunctions):
         eta, lam = eta_lam if eta_lam is not None else self._eta_lam_full()  # each (i, I)
         a = self._assoc  # 0 for hebb_pre → dM/dW = dM/db = 0, traces stay zero
 
-        A_new = lam[None] * self.A + a * eta[None] * x.unsqueeze(1) * E  # x_I E_hat^I_i
+        if self.rflo_trace_rho is None:
+            A_new = lam[None] * self.A + a * eta[None] * x.unsqueeze(1) * E  # x_I E_hat^I_i
+        else:
+            if self._diag_phi_prime is None:
+                raise RuntimeError("Compute diagonal eligibility before advancing capped traces")
+            A_new = self._capped_diag_trace(x, self._diag_phi_prime, eta, lam)
+            self._diag_phi_prime = None
 
         self.A = self._prepare_local_trace('A', A_new, self.A, update_mask)
         self._advance_local_bias_trace(x, R, eta, lam, update_mask)
+
+    def _capped_diag_trace(self, x, phi_prime, eta, lam):
+        """Candidate A update with bounded recurrence gain, before masks/gates.
+
+        k = assoc*eta*phi'*x^2; gain = clip(lam + k*W, -rho, rho).
+        Only the coefficient of old A is capped. The drive k*(1+M) is retained.
+        This is a surrogate eligibility, not the exact modulation derivative.
+        """
+        k = (self._assoc * eta.unsqueeze(0) * phi_prime.unsqueeze(-1)
+             * x.square().unsqueeze(1))
+        gain = lam.unsqueeze(0) + k * self.W.unsqueeze(0)
+        gain = gain.clamp(-self.rflo_trace_rho, self.rflo_trace_rho)
+        return gain * self.A + k * (1.0 + self.M)
 
     # ─── Direct / instantaneous local approximation ──────────────────────────
     # The strongest approximation: treat M_{t-1} as a stop-gradient modulatory
@@ -732,7 +770,7 @@ class MultiPlasticLayer(BaseNetworkFunctions):
 
     def _local_step_diag(self, x, phi_prime, ell, eta, lam, update_mask=None):
         """Diagonal RFLO: factor = 1 + M + W*A fused into grad_W and the A update
-        (E_hat = phi'*x*factor never built); configurable exact/direct bias."""
+        (E_hat never built); optional A-gain cap and configurable exact/direct bias."""
         W, M_prev = self.W, self.M
         a = self._assoc
         A_prev = self.A
@@ -744,9 +782,12 @@ class MultiPlasticLayer(BaseNetworkFunctions):
         R = self._local_bias_eligibility(x, phi_prime)
         grad_b_t = torch.einsum('Bi,Bi->i', ell, R)
 
-        A_new = (lam.unsqueeze(0) * A_prev
-                 + a * eta.unsqueeze(0) * phi_prime.unsqueeze(-1)
-                 * x.square().unsqueeze(1) * factor)
+        if self.rflo_trace_rho is None:
+            A_new = (lam.unsqueeze(0) * A_prev
+                     + a * eta.unsqueeze(0) * phi_prime.unsqueeze(-1)
+                     * x.square().unsqueeze(1) * factor)
+        else:
+            A_new = self._capped_diag_trace(x, phi_prime, eta, lam)
         self.A = self._prepare_local_trace('A', A_new, A_prev, update_mask)
         self._advance_local_bias_trace(x, R, eta, lam, update_mask)
         self.E, self.R = None, R

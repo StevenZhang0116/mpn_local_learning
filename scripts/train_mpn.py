@@ -114,6 +114,8 @@ INPUT_MODE = "exact"
 # --dfa selects 'direct' for both local variants to isolate weight traces.
 # Use --local-bias-mode exact for the manuscript's row-local bias variant.
 LOCAL_BIAS_MODE = "exact"
+RFLO_TRACE_RHO = None  # optional cap on the MP-weight diagonal trace recurrence gain
+LAM = None  # optional fixed modulation decay; None retains dt / m_time_scale setup
 LOG_GRAD_ALIGN = True  # --dfa disables the optional BPTT diagnostic by default
 MODULATION_BOUNDS = True
 MODULATION_MODE = "hard"       # none | hard | scaled_tanh
@@ -158,7 +160,7 @@ N_RUNS = 1                    # independent seeds per rule
 # several ints on the CLI.
 N_HIDDEN = 200                # one_task.py: n_hidden = 200
 N_DATASETS = 5000             # one_task.py: n_datasets = 3000 (heavy on CPU)
-BATCH = 128                   # one_task.py: n_batches = batch_size = 128
+BATCH = 128                   # --batch-size; validation uses 3*BATCH samples
 LR = 1e-3                     # one_task.py: lr = 1e-3
 GRAD_CLIP = 10                # one_task.py: gradient_clip = 10
 LOG_EVERY = 100               # record/print accuracy every this many steps
@@ -291,6 +293,7 @@ def build_params():
         "ml_params": {
             "bias": True,
             "local_bias_mode": LOCAL_BIAS_MODE,
+            "rflo_trace_rho": RFLO_TRACE_RHO,
             "mp_type": "mult",
             "m_update_type": "hebb_assoc",
             "m_activation": "scaled_tanh" if MODULATION_MODE == "scaled_tanh" else "linear",
@@ -300,7 +303,7 @@ def build_params():
             "eta_type": "scalar",
             "eta_train": False,
             "lam_type": "scalar",
-            "m_time_scale": 4000,          # dt=40 → lambda = 1 - dt/4000 = 0.99
+            "m_time_scale": 4000,          # default dt=40 → lambda=0.99; --lam overrides below
             "lam_train": False,
             "W_freeze": False,
         },
@@ -315,6 +318,11 @@ def build_params():
             "input_layer_bias": True,
             "input_init_type": "xavier",
         })
+    if LAM is not None:
+        # The core prioritizes m_time_scale over lam_clamp, so keep only the
+        # explicit decay when requested; its time constant is derived from dt.
+        net_params["ml_params"].pop("m_time_scale")
+        net_params["ml_params"]["lam_clamp"] = LAM
     return task_params, train_params, net_params
 
 
@@ -465,6 +473,12 @@ def _parse_args():
     p.add_argument("--local-bias-mode", choices=["exact", "direct"], default=None,
                    help="MP bias eligibility: exact row trace or direct phi'; "
                         "--dfa defaults to direct for a controlled comparison")
+    p.add_argument("--rflo-trace-rho", type=float, default=RFLO_TRACE_RHO,
+                   help="optional diagonal RFLO trace-gain cap: 0 < rho < 1; "
+                        "only MP-weight A traces are capped (default: disabled)")
+    p.add_argument("--lam", type=float, default=LAM,
+                   help="fixed modulation decay, 0 <= lambda < 1; "
+                        "default uses m_time_scale=4000 (lambda=0.99 at dt=40)")
     p.add_argument("--modulation-mode", choices=["none", "hard", "scaled_tanh"],
                    default=MODULATION_MODE if MODULATION_BOUNDS or MODULATION_MODE == "scaled_tanh" else "none",
                    help="modulation write: unbounded, hard clipping, or B*tanh(S/B)")
@@ -478,6 +492,9 @@ def _parse_args():
                         "(dmpn only), e.g. --hidden 150 100. Default: the N_HIDDEN "
                         "global.")
     p.add_argument("--steps", type=int, default=N_DATASETS, help="training batches")
+    p.add_argument("--batch-size", type=int, default=BATCH,
+                   help="training trials per update; validation uses 3 times this "
+                        "many trials, evaluated in chunks (default: %(default)s)")
     p.add_argument("--feedback",
                    choices=["exact_spatial", "layerwise_fa", "direct_fa", "exact_readout"],
                    default=None,
@@ -560,15 +577,23 @@ def _parse_args():
         p.error("direct_fa requires --cross-layer-steps 0 (or use --dfa)")
     if not np.isfinite(args.modulation_bound) or args.modulation_bound <= 0:
         p.error("--modulation-bound must be finite and positive")
+    if args.rflo_trace_rho is not None and (
+            not np.isfinite(args.rflo_trace_rho) or not 0 < args.rflo_trace_rho < 1):
+        p.error("--rflo-trace-rho must be finite and strictly between 0 and 1")
+    if args.lam is not None and (not np.isfinite(args.lam) or not 0 <= args.lam < 1):
+        p.error("--lam must be finite and satisfy 0 <= lambda < 1")
+    if args.batch_size <= 0:
+        p.error("--batch-size must be a positive integer")
     return args
 
 
 def main():
-    global NET_TYPE, RULESET, N_RUNS, N_HIDDEN, N_DATASETS, FEEDBACK_MODE
+    global NET_TYPE, RULESET, N_RUNS, N_HIDDEN, N_DATASETS, FEEDBACK_MODE, BATCH
     global INPUT_MODE, INPUT_NORMALIZE, MP_RESIDUAL, CROSS_LAYER_STEPS, LOCAL_BIAS_MODE, RULES_TO_RUN, LOG_GRAD_ALIGN
     global USE_WANDB, WANDB_PROJECT, WANDB_ENTITY, WANDB_MODE
     global MODULATION_MODE, MODULATION_BOUND, MODULATION_BOUNDS
     global DFA_PRESET
+    global RFLO_TRACE_RHO, LAM
     args = _parse_args()
     DFA_PRESET = args.dfa
     NET_TYPE = args.net
@@ -578,9 +603,12 @@ def main():
         # one int → scalar (single MP layer); several → list (deep MP stack).
         N_HIDDEN = args.hidden[0] if len(args.hidden) == 1 else args.hidden
     N_DATASETS = args.steps
+    BATCH = args.batch_size
     FEEDBACK_MODE = args.feedback
     INPUT_MODE = args.input_mode
     LOCAL_BIAS_MODE = args.local_bias_mode
+    RFLO_TRACE_RHO = args.rflo_trace_rho
+    LAM = args.lam
     MODULATION_MODE = args.modulation_mode
     MODULATION_BOUND = args.modulation_bound
     MODULATION_BOUNDS = args.modulation_mode == "hard"
