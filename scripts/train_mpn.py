@@ -152,6 +152,8 @@ INPUT_MODE = "match"
 # Default changed 2026-10 from 'exact' to 'direct' (the controlled comparison the
 # --dfa preset already used); pass --local-bias-mode exact for the row-local rule's
 # top-layer bias exactness or the manuscript's row-local bias variant.
+# 'match' selects direct for diagonal RFLO and exact for row-local; local_direct
+# always stays direct and bptt always uses autograd. Default remains unchanged.
 LOCAL_BIAS_MODE = "direct"
 RFLO_TRACE_RHO = None  # optional cap on the MP-weight diagonal trace recurrence gain
 LAM = None  # optional fixed modulation decay; None retains dt / m_time_scale setup
@@ -650,11 +652,13 @@ def parse_arguments(argv=None):
                         f"exact_spatial pathway. Default: {INPUT_MODE} (an 'exact' module "
                         "default switches to match under a local signal); --dfa selects "
                         "match.")
-    g.add_argument("--local-bias-mode", choices=["exact", "direct"], default=None,
+    g.add_argument("--local-bias-mode", choices=["exact", "direct", "match"], default=None,
                    help="MP bias eligibility for the row-local / diagonal rules: direct = "
                         "phi' only (no bias trace), exact = the row-local bias trace "
                         "(needed for local_exact_rowlocal's top-layer bias exactness). "
-                        "local_direct always uses direct. Default: "
+                        "match = direct under local_diag_rflo, exact under "
+                        "local_exact_rowlocal. local_direct always uses direct; bptt "
+                        "always uses autograd. Default: "
                         f"{LOCAL_BIAS_MODE}; --dfa selects direct.")
     g.add_argument("--cross-layer-steps", type=int, choices=[0, 1], default=None,
                    help="depth of the cross-layer TEMPORAL correction to the local rules "

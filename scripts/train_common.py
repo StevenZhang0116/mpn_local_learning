@@ -33,7 +33,7 @@ matplotlib.use("Agg")  # headless: write PNG, no display
 import matplotlib.pyplot as plt
 
 import tasks  # Task adapters (data/metric seam); make_task(ruleset) picks one
-from mpn import masked_mse_loss_and_output_grad, resolve_input_mode
+from mpn import masked_mse_loss_and_output_grad, resolve_input_mode, resolve_local_bias_mode
 
 
 @dataclass
@@ -345,7 +345,7 @@ def effective_rule_summary(cfg, net, rule):
     if rule == "local_direct":
         parts.append("bias=direct (rule-fixed)")
     else:
-        bias = sorted({mp.local_bias_mode for mp in layers})
+        bias = sorted({resolve_local_bias_mode(mp.local_bias_mode, rule) for mp in layers})
         parts.append(f"bias={'/'.join(bias) if bias else 'n/a'}")
     if rule == "local_diag_rflo":
         rho = sorted({mp.rflo_trace_rho for mp in layers
@@ -708,6 +708,7 @@ def run_seed(cfg, seed, record_steps, run_idx=0, wandb_logger=None):
                 "mp_residual": cfg.mp_residual,
                 "input_mode": cfg.input_mode,
                 "resolved_input_mode": getattr(nets[rule], 'resolved_input_mode', None),
+                "resolved_local_bias_modes": getattr(nets[rule], 'resolved_local_bias_modes', None),
                 "learning_signal": getattr(nets[rule], 'learning_signal', cfg.learning_signal),
                 "signal_mode": getattr(cfg, "signal_mode", ""),
                 "effective_config": effective_rule_summary(cfg, nets[rule], rule),

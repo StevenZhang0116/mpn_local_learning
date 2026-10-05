@@ -56,6 +56,26 @@ from net_helpers import BaseNetwork, BaseNetworkFunctions
 from net_helpers import rand_weight_init, get_activation_function
 
 
+def resolve_local_bias_mode(local_bias_mode, learning_rule):
+    """Resolve MP bias eligibility for a rule without changing the requested policy.
+
+    BPTT always differentiates biases with autograd; local_direct always uses the
+    instantaneous factor. match selects direct for diagonal RFLO and exact for
+    row-local. Explicit exact/direct retain their historical local-rule behavior.
+    """
+    if local_bias_mode not in ('exact', 'direct', 'match'):
+        raise ValueError("local_bias_mode must be 'exact', 'direct', or 'match'")
+    if learning_rule == 'bptt':
+        return 'exact'
+    if learning_rule == 'local_direct':
+        return 'direct'
+    if learning_rule not in ('local_diag_rflo', 'local_exact_rowlocal'):
+        raise ValueError(f"unknown learning_rule {learning_rule!r}")
+    if local_bias_mode == 'match':
+        return 'exact' if learning_rule == 'local_exact_rowlocal' else 'direct'
+    return local_bias_mode
+
+
 def resolve_input_mode(input_mode, learning_rule):
     """Resolve the input-gradient algorithm for a rule, before trainability checks."""
     if input_mode == 'paired':
@@ -216,9 +236,10 @@ class MultiPlasticLayer(BaseNetworkFunctions):
 
         # Independent of the weight-eligibility rule. Default preserves legacy
         # exact bias traces; 'direct' uses R=phi' and allocates no Q trace.
+        # 'match' is resolved by the actual trace initializer on EVERY pass, not
+        # the net's current learning_rule (public gradient methods may override it).
         self.local_bias_mode = ml_params.get('local_bias_mode', 'exact')
-        if self.local_bias_mode not in ('exact', 'direct'):
-            raise ValueError("local_bias_mode must be 'exact' or 'direct'")
+        resolve_local_bias_mode(self.local_bias_mode, 'local_exact_rowlocal')
         # Optional stabilization of MP-weight diagonal traces, not forward M,
         # bias traces, input sensitivities, or the other gradient algorithms.
         self.rflo_trace_rho = ml_params.get('rflo_trace_rho')
@@ -440,7 +461,7 @@ class MultiPlasticLayer(BaseNetworkFunctions):
 
         P[b, i, I, J] = dM[b, i, J] / dW[i, I]   shape (B, n_output, n_input, n_input)
         Q[b, i, J]    = dM[b, i, J] / db[i]      shape (B, n_output, n_input)
-        Q is None when local_bias_mode='direct'.
+        Q is None when local_bias_mode='direct'; 'match' selects exact here.
         """
         dev, dt = self.W.device, self.W.dtype
         self.P = torch.zeros(B, self.n_output, self.n_input, self.n_input, device=dev, dtype=dt)
@@ -448,7 +469,8 @@ class MultiPlasticLayer(BaseNetworkFunctions):
         self._local_traces_pending = False
         self._smooth_trace_previous = {}
         self.Q = (torch.zeros(B, self.n_output, self.n_input, device=dev, dtype=dt)
-                  if self.local_bias_mode == 'exact' else None)
+                  if resolve_local_bias_mode(self.local_bias_mode, 'local_exact_rowlocal') == 'exact'
+                  else None)
         self.E = None  # last computed dh/dW  (B, n_output, n_input)
         self.R = None  # last computed dh/db  (B, n_output)
 
@@ -478,14 +500,16 @@ class MultiPlasticLayer(BaseNetworkFunctions):
 
     def _local_bias_eligibility(self, x, phi_prime):
         """Exact row-local bias sensitivity or direct neuron-level factor."""
-        if self.local_bias_mode == 'direct':
+        # Q allocation resolves the requested policy for the actual pass; never
+        # overwrite local_bias_mode, which must survive rule switches/reloading.
+        if self.Q is None:
             return phi_prime
         recurrent = torch.einsum('iJ,BJ,BiJ->Bi', self.W, x, self.Q)
         return phi_prime * (1.0 + recurrent)
 
     def _advance_local_bias_trace(self, x, R, eta, lam, update_mask):
         self._local_traces_pending = True
-        if self.local_bias_mode == 'direct':
+        if self.Q is None:
             return
         Q_new = (lam[None] * self.Q
                  + self._assoc * eta[None] * R.unsqueeze(-1) * x.unsqueeze(1))
@@ -543,7 +567,7 @@ class MultiPlasticLayer(BaseNetworkFunctions):
         A[b, i, I] ~= dM[b, i, I] / dW[i, I]   shape (B, n_output, n_input)
         With rflo_trace_rho set, A is a stabilized surrogate sensitivity.
         Q[b, i, J]  = dM[b, i, J] / db[i]       shape (B, n_output, n_input)
-        Q is None when local_bias_mode='direct'.
+        Q is None when local_bias_mode='direct' or 'match'.
         """
         dev, dt = self.W.device, self.W.dtype
         self.A = torch.zeros(B, self.n_output, self.n_input, device=dev, dtype=dt)
@@ -552,7 +576,8 @@ class MultiPlasticLayer(BaseNetworkFunctions):
         self._local_traces_pending = False
         self._smooth_trace_previous = {}
         self.Q = (torch.zeros(B, self.n_output, self.n_input, device=dev, dtype=dt)
-                  if self.local_bias_mode == 'exact' else None)
+                  if resolve_local_bias_mode(self.local_bias_mode, 'local_diag_rflo') == 'exact'
+                  else None)
         self.E = None  # last computed (approx) dh/dW  (B, n_output, n_input)
         self.R = None  # last computed dh/db  (B, n_output)
 
@@ -1115,6 +1140,15 @@ class MultiPlasticNetBase(BaseNetwork):
     layers and activation functions that are mostly shared across all types of
     MPNs, no matter the connections that lead from input to output.
     """
+
+    @property
+    def resolved_local_bias_modes(self):
+        """Effective bias rule per MP layer, recomputed after cloning/rule changes.
+
+        'exact' under BPTT means autograd, not a row-local Q trace.
+        """
+        return [resolve_local_bias_mode(layer.local_bias_mode, self.learning_rule)
+                for layer in self.mp_layers]
 
     def __init__(self, net_params, n_output_pre, output_matrix="", verbose=False):
         # Note that this assumes self.output has already been set in child
