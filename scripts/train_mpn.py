@@ -34,28 +34,39 @@ Adam, ReduceLROnPlateau, tanh). Modulation bounds default to [-1, 1]; L2 weight
 regularization is disabled by default. Logged losses remain task losses.
 Shared machinery lives in train_common.py.
 
-Use --dfa for the manuscript's DFA comparison. It selects direct_fa,
-input_mode=match, cross_layer_steps=0, and direct MP bias updates. Local runs
-then contain no BPTT splice; the BPTT baseline still trains every parameter
-with autograd. Without this preset, input_mode='exact' is a hybrid baseline
-that also computes BPTT input gradients during local runs. Example:
-    python scripts/train_mpn.py --dfa --hidden 64 64 --task delaygo --steps 500
---local-bias-mode exact retains exact bias traces (appropriate for row-local
-DFA, but no longer the strictly synapse-local diagonal variant).
+A local update is LEARNING SIGNAL x ELIGIBILITY, and the three CLI axes are kept
+independent so one flag changes one thing:
+  --learning-signal  WHERE each MP layer's signal comes from (one of five modes):
+                     exact_spatial (default; main error through the true weights),
+                     layerwise_fa (fixed random matrix at every boundary), dfa (main
+                     error projected directly to every layer), local_readout (each
+                     module's own auxiliary head), mixed (exact_spatial + alpha*local).
+                     Internally this sets the model's feedback_mode + learning_signal.
+  --rules            WHICH eligibility consumes it (local_direct / local_diag_rflo /
+                     local_exact_rowlocal) or full bptt.
+  --input-mode       HOW the input embedding is trained (match / exact / three_factor /
+                     diag_mtrace / paired) — see INPUT_MODE below.
+Defaults are signal-independent: rules bptt+local_direct+local_diag_rflo, input
+mode match (bptt = full BPTT, local runs fully local), direct bias updates, no
+cross-layer correction, alignment diagnostic on. Switching only --learning-signal
+therefore changes only the signal. Example:
+    python scripts/train_mpn.py --learning-signal dfa --hidden 64 64 --task delaygo --steps 500
+--dfa is kept as the LEGACY preset (direct_fa + match + direct bias + rules
+bptt/row-local/diagonal + alignment off); --feedback and --learning-signal global
+are legacy spellings translated into the unified mode. Explicitly conflicting
+flags are rejected rather than resolved by argument order. --local-bias-mode exact
+retains exact bias traces (needed for the row-local rule's top-layer bias exactness).
 
 Use --learning-signal local_readout for per-layer LOCAL READOUT heads (dmpn,
 multi-MP-layer): every non-top MP layer gets an auxiliary linear head trained on
 the task loss, and that head's error — not a signal descending from the layers
 above — credits the layer's eligibility; the top layer keeps W_output and the
-embedding shares module 0's head. It needs exact_spatial feedback and
-cross-layer-steps 0 and cannot splice a BPTT input gradient, so the two module
-defaults that would conflict (input mode 'exact', cross-layer 1) switch to
-'match' / 0 unless set explicitly. bptt ignores the setting. Pair it with --seed
-so a global and a local_readout invocation share init and data, and set those two
-flags EXPLICITLY on the global side so both runs use the same input mode and
-cross-layer setting:
-    python scripts/train_mpn.py --task seqmnist --hidden 128 128 --seed 7 \
-        --input-mode match --cross-layer-steps 0
+embedding shares module 0's head. It implies exact_spatial feedback, needs
+cross-layer-steps 0 and cannot splice a BPTT input gradient; if the module
+defaults were changed to 'exact' / 1 they switch to 'match' / 0 unless set
+explicitly. bptt ignores the setting. Pair it with --seed so an exact_spatial and
+a local_readout invocation share init and training data:
+    python scripts/train_mpn.py --task seqmnist --hidden 128 128 --seed 7
     python scripts/train_mpn.py --task seqmnist --hidden 128 128 --seed 7 \
         --learning-signal local_readout
 
@@ -103,7 +114,11 @@ RULESET = "contextdelaydm1"           # single task to train on
 # RNN-comparable); 'mpn1' = MultiPlasticNet (single MP layer, no embedding).
 # Overridable with --net on the command line (see main()).
 NET_TYPE = "dmpn"
-RULES_TO_RUN = ["bptt", "local_exact_rowlocal", "local_diag_rflo", "local_direct"]   # rules to compare
+# Rules to compare (--rules). Default changed 2026-10 from
+# [bptt, local_exact_rowlocal, local_diag_rflo, local_direct] to the three rules the
+# project's comparisons use; add local_exact_rowlocal explicitly (with
+# --local-bias-mode exact for its bias exactness) when you want it.
+RULES_TO_RUN = ["bptt", "local_direct", "local_diag_rflo"]
 # Hidden learning-signal feedback. 'exact_spatial' = exact same-time spatial
 # gradient (weight transport; top plastic layer exact vs BPTT under
 # local_exact_rowlocal); 'layerwise_fa' = recursive per-boundary feedback
@@ -126,10 +141,15 @@ DFA_PRESET = False             # records whether the CLI --dfa preset was select
 #                    sensitivity trace; BPTT stays exact. Needs exact_spatial.
 #   'paired'       — bptt: exact; local_direct: three_factor; local_diag_rflo:
 #                    diag_mtrace. Requires dmpn/exact_spatial; excludes row-local.
-INPUT_MODE = "exact"
-# --dfa selects 'direct' for both local variants to isolate weight traces.
-# Use --local-bias-mode exact for the manuscript's row-local bias variant.
-LOCAL_BIAS_MODE = "exact"
+# Default changed 2026-10 from 'exact' (a HYBRID: local runs spliced a full-BPTT
+# embedding gradient) to 'match', so bptt is full BPTT and local runs are fully local.
+INPUT_MODE = "match"
+# MP bias eligibility for the row-local / diagonal rules ('direct' = phi' only, no
+# bias trace; 'exact' = the row-local bias trace). local_direct always uses direct.
+# Default changed 2026-10 from 'exact' to 'direct' (the controlled comparison the
+# --dfa preset already used); pass --local-bias-mode exact for the row-local rule's
+# top-layer bias exactness or the manuscript's row-local bias variant.
+LOCAL_BIAS_MODE = "direct"
 RFLO_TRACE_RHO = None  # optional cap on the MP-weight diagonal trace recurrence gain
 LAM = None  # optional fixed modulation decay; None retains dt / m_time_scale setup
 LOG_GRAD_ALIGN = True  # --dfa disables the optional BPTT diagnostic by default
@@ -165,8 +185,9 @@ MP_RESIDUAL = True
 # tests/validate_local_learning tier17). It costs one extra downward adjoint sweep +
 # a step of stored state per training step, and applies to every non-bptt rule
 # (bptt is already exact). 0 selects the pure same-time rule. Only 0 and 1 are
-# implemented; the default below is 1, while --dfa selects 0.
-CROSS_LAYER_STEPS = 1
+# implemented. Default changed 2026-10 from 1 to 0 (the pure same-time local rules);
+# it is rejected with the random-feedback and local signal modes (see validate_config).
+CROSS_LAYER_STEPS = 0
 # Learning-signal SOURCE for the local rules (dmpn, multi-MP-layer; see
 # mpn._LEARNING_SIGNALS). 'global' (default) = the main readout's error reaches
 # every layer through the inter-layer pathway — byte-identical to before.
@@ -182,6 +203,42 @@ CROSS_LAYER_STEPS = 1
 # no head, so local_readout then coincides with global. --learning-signal on CLI.
 LEARNING_SIGNAL = "global"
 LOCAL_SIGNAL_ALPHA = 1.0       # weight of the local signal under 'mixed' (--local-signal-alpha)
+
+# ─── Unified signal modes: the CLI's single axis for "which signal each MP layer
+# learns from". The model keeps TWO orthogonal fields (feedback_mode = how a global
+# signal is transported; learning_signal = where the signal comes from), but the
+# local modes pin feedback_mode to exact_spatial, so exactly these five combinations
+# exist and --learning-signal names them directly. Everything else (eligibility
+# rule, input mode, bias mode, cross-layer correction) is chosen independently.
+#   mode            learning_signal   feedback_mode   signal each MP layer learns from
+#   exact_spatial   global            exact_spatial   main error through the true weights
+#   layerwise_fa    global            layerwise_fa    main error through a fixed random
+#                                                     matrix at every boundary
+#   dfa             global            direct_fa       main error projected directly to
+#                                                     every layer
+#   local_readout   local_readout     exact_spatial   each module's own auxiliary head
+#   mixed           mixed             exact_spatial   exact_spatial + alpha * local head
+# 'exact_spatial' qualifies the SPATIAL pathway only — temporal credit is still what
+# the eligibility rule provides; none of these is full BPTT.
+SIGNAL_MODES = {
+    "exact_spatial": ("global", "exact_spatial"),
+    "layerwise_fa": ("global", "layerwise_fa"),
+    "dfa": ("global", "direct_fa"),
+    "local_readout": ("local_readout", "exact_spatial"),
+    "mixed": ("mixed", "exact_spatial"),
+}
+
+
+def signal_mode_from(learning_signal, feedback_mode):
+    """Name of the unified signal mode for a (learning_signal, feedback_mode) pair,
+    i.e. the inverse of SIGNAL_MODES. A pair the CLI cannot express (e.g.
+    local_readout with random feedback, which the model also rejects) is returned
+    as 'learning_signal+feedback_mode' so metadata never misreports it."""
+    feedback_mode = mpn.canonical_feedback_mode(feedback_mode)
+    for name, pair in SIGNAL_MODES.items():
+        if pair == (learning_signal, feedback_mode):
+            return name
+    return f"{learning_signal}+{feedback_mode}"
 N_RUNS = 1                    # independent seeds per rule
 # Hidden width(s) of the MP-layer stack. A single int → one MP layer (the classic
 # in→hidden→out net). A list of ints → one MP layer per width, i.e. a DEEP MP
@@ -442,7 +499,8 @@ def _cfg():
         title=f"{RULESET} ({desc}): BPTT vs local", header_note=f" ({desc})",
         rule_label=({**RULE_LABEL,
                      "local_exact_rowlocal": "exact row-local + DFA",
-                     "local_diag_rflo": "diagonal + DFA"}
+                     "local_diag_rflo": "diagonal + DFA",
+                     "local_direct": "direct + DFA"}
                     if FEEDBACK_MODE == "direct_fa" else RULE_LABEL),
         rule_color=RULE_COLOR,
         seed=SEED, ruleset=RULESET, rules_to_run=RULES_TO_RUN,
@@ -451,6 +509,7 @@ def _cfg():
         mp_residual=_mp_residual(), cross_layer_steps=CROSS_LAYER_STEPS,
         input_mode=INPUT_MODE, learning_signal=LEARNING_SIGNAL,
         local_signal_alpha=LOCAL_SIGNAL_ALPHA,
+        signal_mode=signal_mode_from(LEARNING_SIGNAL, FEEDBACK_MODE),
         n_runs=N_RUNS, n_hidden=_hidden_widths()[0],
         batch=BATCH, n_datasets=N_DATASETS, lr=LR, grad_clip=GRAD_CLIP,
         log_every=LOG_EVERY, log_grad_align=LOG_GRAD_ALIGN, device=DEVICE, dtype=DTYPE,
@@ -493,161 +552,238 @@ def load_net(path, device=None, dtype=DTYPE):
     return net
 
 
-def _parse_args():
+def parse_arguments(argv=None):
+    """Stage 1 of 3: pure argparse, grouped by what a flag acts on; no cross-flag
+    logic. Returns (parser, args) so the later stages can report conflicts through
+    parser.error (with the usage line)."""
     p = argparse.ArgumentParser(
-        description="Compare BPTT vs local learning on an MPN (deep or single-layer).")
-    p.add_argument("--net", choices=["dmpn", "mpn1"], default=NET_TYPE,
+        description="Compare BPTT vs local learning on an MPN (deep or single-layer). "
+                    "A local update is LEARNING SIGNAL (--learning-signal) x ELIGIBILITY "
+                    "(--rules); the input embedding's update is a third, independent "
+                    "choice (--input-mode). Defaults are signal-independent, so changing "
+                    "only --learning-signal changes only the signal.")
+
+    g = p.add_argument_group("network and task")
+    g.add_argument("--task", default=RULESET, help="ruleset / task (default: %(default)s)")
+    g.add_argument("--net", choices=["dmpn", "mpn1"], default=NET_TYPE,
                    help="dmpn: DeepMultiPlasticNet (trainable input embedding + MP "
                         "layer, RNN-comparable). mpn1: MultiPlasticNet (single MP "
                         "layer, no embedding). Default: %(default)s.")
-    p.add_argument("--dfa", action="store_true",
-                   help="compare BPTT, row-local+DFA and diagonal+DFA with fixed "
-                        "direct feedback, local input updates, no temporal correction, "
-                        "and direct bias updates by default")
-    p.add_argument("--rules", nargs="+", choices=list(RULE_LABEL), default=None,
-                   help="learning rules to run; --dfa defaults to BPTT plus both DFA variants")
-    p.add_argument("--grad-align", action=argparse.BooleanOptionalAction, default=None,
-                   help="optional BPTT gradient-alignment diagnostic; disabled by "
-                        "default with --dfa because it adds autograd passes")
-    p.add_argument("--local-bias-mode", choices=["exact", "direct"], default=None,
-                   help="MP bias eligibility: exact row trace or direct phi'; "
-                        "--dfa defaults to direct for a controlled comparison")
-    p.add_argument("--rflo-trace-rho", type=float, default=RFLO_TRACE_RHO,
-                   help="optional diagonal RFLO trace-gain cap: 0 < rho < 1; "
-                        "only MP-weight A traces are capped (default: disabled)")
-    p.add_argument("--lam", type=float, default=LAM,
-                   help="fixed modulation decay, 0 <= lambda < 1; "
-                        "default uses m_time_scale=4000 (lambda=0.99 at dt=40)")
-    p.add_argument("--modulation-mode", choices=["none", "hard", "scaled_tanh"],
-                   default=MODULATION_MODE if MODULATION_BOUNDS or MODULATION_MODE == "scaled_tanh" else "none",
-                   help="modulation write: unbounded, hard clipping, or B*tanh(S/B)")
-    p.add_argument("--modulation-bound", type=float, default=MODULATION_BOUND,
-                   help="positive bound/scale B for hard or scaled_tanh (default: %(default)s)")
-    p.add_argument("--task", default=RULESET, help="ruleset / task (default: %(default)s)")
-    p.add_argument("--runs", type=int, default=N_RUNS, help="independent seeds")
-    p.add_argument("--seed", type=int, default=None,
-                   help="starting seed (subsequent runs increment it). Default: a "
-                        "random draw per invocation. Fix it to make two invocations "
-                        "(e.g. --learning-signal global vs local_readout) a PAIRED "
-                        "comparison with identical init and training data.")
-    p.add_argument("--learning-signal", choices=["global", "local_readout", "mixed"],
-                   default=None,
-                   help="where each MP layer's learning signal comes from (dmpn): "
-                        "'global' = the main readout error via the inter-layer pathway "
-                        "(default, unchanged); 'local_readout' = per-layer auxiliary "
-                        "heads trained on the task loss, nothing descends from upper "
-                        "layers; 'mixed' = global + alpha*local. Local modes need "
-                        "exact_spatial feedback and cross-layer-steps 0 and cannot use "
-                        "input-mode exact; those two defaults switch to match / 0 unless "
-                        f"set explicitly. Default: {LEARNING_SIGNAL}.")
-    p.add_argument("--local-signal-alpha", type=float, default=LOCAL_SIGNAL_ALPHA,
-                   help="weight of the local head signal under --learning-signal mixed "
-                        "(default: %(default)s).")
-    p.add_argument("--hidden", type=int, nargs="+", default=None,
+    g.add_argument("--hidden", type=int, nargs="+", default=None,
                    help="hidden width(s): one int → a single MP layer (classic); "
                         "several ints → a deep MP stack, one MP layer per width "
                         "(dmpn only), e.g. --hidden 150 100. Default: the N_HIDDEN "
                         "global.")
-    p.add_argument("--steps", type=int, default=N_DATASETS, help="training batches")
-    p.add_argument("--batch-size", type=int, default=BATCH,
-                   help="training trials per update; validation uses 3 times this "
-                        "many trials, evaluated in chunks (default: %(default)s)")
-    p.add_argument("--feedback",
-                   choices=["exact_spatial", "layerwise_fa", "direct_fa", "exact_readout"],
-                   default=None,
-                   help="hidden learning-signal feedback. exact_spatial differs from "
-                        "the random modes at any depth; layerwise_fa vs direct_fa "
-                        "differ only with >1 trainable boundary (dmpn's embedding "
-                        "counts). 'exact_readout' is the legacy name for 'exact_spatial'.")
-    p.add_argument("--input-mode", choices=["match", "exact", "three_factor", "diag_mtrace", "paired"],
-                   default=None,
-                   help="input-embedding learning rule (dmpn), decoupled from the "
-                        "MP-layer rule: 'match' = per-rule native, 'exact' "
-                        "= always BPTT gradient, 'three_factor' = always the direct "
-                        "local rule; 'diag_mtrace' = first-MP-layer modulation-column "
-                        "traces for local runs, BPTT unchanged (requires dmpn and "
-                        "exact_spatial); 'paired' = BPTT exact, direct three-factor, "
-                        "diagonal RFLO diag_mtrace (dmpn/exact_spatial only; defaults "
-                        "to these three rules, rejects local_exact_rowlocal). "
-                        f"Default: {INPUT_MODE}; --dfa selects match.")
-    p.add_argument("--input-normalize", action=argparse.BooleanOptionalAction,
-                   default=INPUT_NORMALIZE,
-                   help="fixed per-feature standardization of the raw input u_t "
-                        "(statistics estimated once from a task sample, then frozen "
-                        "and applied identically to every rule + validation). "
-                        "Conditions all rules equally by removing a scale artifact. "
-                        "Use --no-input-normalize to force off. Default: %(default)s.")
-    p.add_argument("--residual", action=argparse.BooleanOptionalAction,
+    g.add_argument("--residual", action=argparse.BooleanOptionalAction,
                    default=MP_RESIDUAL,
                    help="identity skip connections around each equal-width MP block "
                         "(dmpn only): h_{n+1}=act(z_n)+h_n. Parameter-free, stays fully "
                         "local (adds the residual's identity Jacobian term to the "
                         "inter-layer signal), BPTT stays exact. Needs equal stacked "
                         "widths (e.g. --hidden 128 128); unequal layers skip it with a "
-                        "warning. Default: %(default)s.")
-    p.add_argument("--cross-layer-steps", type=int, choices=[0, 1],
+                        "warning. Changes the forward net, so every rule is affected. "
+                        "Default: %(default)s.")
+    g.add_argument("--input-normalize", action=argparse.BooleanOptionalAction,
+                   default=INPUT_NORMALIZE,
+                   help="fixed per-feature standardization of the raw input u_t "
+                        "(statistics estimated once from a task sample, then frozen "
+                        "and applied identically to every rule + validation). "
+                        "Conditions all rules equally by removing a scale artifact. "
+                        "Use --no-input-normalize to force off. Default: %(default)s.")
+
+    g = p.add_argument_group(
+        "learning algorithm",
+        "local update = learning signal x eligibility; the input embedding is a third, "
+        "independent choice. bptt is full BPTT of the main loss whatever the signal.")
+    g.add_argument("--rules", nargs="+", choices=list(RULE_LABEL), default=None,
+                   help="ELIGIBILITY axis — how MP parameters are updated: local_direct "
+                        "(current activity and modulation, no history), local_diag_rflo "
+                        "(diagonal / same-synapse eligibility), local_exact_rowlocal "
+                        "(full intra-layer row-local eligibility), bptt (full BPTT of the "
+                        f"main loss). Default: {RULES_TO_RUN}; --dfa defaults to bptt + "
+                        "row-local + diagonal; --input-mode paired to bptt + diagonal + "
+                        "direct.")
+    g.add_argument("--learning-signal",
+                   choices=[*SIGNAL_MODES, "global"], default=None,
+                   help="SIGNAL axis — where each MP layer's learning signal comes from "
+                        "(dmpn; see SIGNAL_MODES): exact_spatial = the main readout error "
+                        "through the TRUE weights at every boundary (weight transport); "
+                        "layerwise_fa = the main error through a FIXED RANDOM matrix at "
+                        "every boundary; dfa = the main error projected DIRECTLY to every "
+                        "layer through its own random matrix; local_readout = every "
+                        "non-top MP layer learns from its OWN auxiliary head trained on "
+                        "the task loss (nothing descends from upper layers; the top layer "
+                        "keeps W_output; module 0 = embedding + first MP layer); mixed = "
+                        "exact_spatial + alpha * local head. The local modes need "
+                        "--cross-layer-steps 0 and cannot use --input-mode exact; a "
+                        "single MP layer has no head, so local_readout then equals "
+                        "exact_spatial. 'global' is the legacy spelling that defers to "
+                        "--feedback. Default: the module's FEEDBACK_MODE/LEARNING_SIGNAL "
+                        f"({signal_mode_from(LEARNING_SIGNAL, FEEDBACK_MODE)}).")
+    g.add_argument("--input-mode",
+                   choices=["match", "exact", "three_factor", "diag_mtrace", "paired"],
                    default=None,
-                   help="depth of the cross-layer TEMPORAL correction to the local "
-                        "rules (dmpn, multi-MP-layer): 0 = pure same-time surrogate; "
-                        "1 = add the exact one-temporal-hop term (exact vs "
-                        "BPTT for MP layers at T=2 only with exact feedback and "
-                        "eligibility; no general improvement guarantee). Applies to "
-                        "every non-bptt rule. Costs one extra adjoint sweep/step. "
-                        f"Default: {CROSS_LAYER_STEPS}; --dfa selects 0.")
-    p.add_argument("--wandb", dest="use_wandb", action="store_true", default=USE_WANDB,
+                   help="EMBEDDING axis — how the trainable input embedding is updated "
+                        "(dmpn), per rule: match = BPTT under bptt, direct three-factor "
+                        "under every local rule (default: bptt stays full BPTT, local runs "
+                        "stay local); exact = always the BPTT gradient (a HYBRID for local "
+                        "runs: one extra BPTT pass; not allowed with local signals); "
+                        "three_factor = always the direct three-factor rule (a HYBRID "
+                        "bptt baseline); diag_mtrace = first-MP-layer modulation-column "
+                        "traces for local rules, BPTT unchanged; paired = bptt exact, "
+                        "local_direct three_factor, local_diag_rflo diag_mtrace (rejects "
+                        "local_exact_rowlocal). diag_mtrace/paired need dmpn and the "
+                        f"exact_spatial pathway. Default: {INPUT_MODE} (an 'exact' module "
+                        "default switches to match under a local signal); --dfa selects "
+                        "match.")
+    g.add_argument("--local-bias-mode", choices=["exact", "direct"], default=None,
+                   help="MP bias eligibility for the row-local / diagonal rules: direct = "
+                        "phi' only (no bias trace), exact = the row-local bias trace "
+                        "(needed for local_exact_rowlocal's top-layer bias exactness). "
+                        "local_direct always uses direct. Default: "
+                        f"{LOCAL_BIAS_MODE}; --dfa selects direct.")
+    g.add_argument("--cross-layer-steps", type=int, choices=[0, 1], default=None,
+                   help="depth of the cross-layer TEMPORAL correction to the local rules "
+                        "(dmpn, multi-MP-layer): 0 = pure same-time surrogate; 1 = add "
+                        "the exact one-temporal-hop term (exact vs BPTT for MP layers at "
+                        "T=2 only with exact_spatial and exact eligibility; no general "
+                        "improvement guarantee). Uses the TRUE forward weights, so it is "
+                        "rejected with layerwise_fa / dfa and with the local signals. "
+                        f"Applies to every non-bptt rule. Default: {CROSS_LAYER_STEPS}.")
+
+    g = p.add_argument_group("approximation knobs (each acts on ONE rule or mode)")
+    g.add_argument("--rflo-trace-rho", type=float, default=RFLO_TRACE_RHO,
+                   help="optional diagonal-RFLO trace-gain cap, 0 < rho < 1. Acts ONLY on "
+                        "local_diag_rflo's MP-WEIGHT A traces (not the drive term, bias "
+                        "traces, input traces, or any other rule). Default: disabled.")
+    g.add_argument("--local-signal-alpha", type=float, default=LOCAL_SIGNAL_ALPHA,
+                   help="weight of the local head signal under --learning-signal mixed "
+                        "ONLY (ignored otherwise). Default: %(default)s.")
+
+    g = p.add_argument_group(
+        "forward dynamics (change the network itself, so EVERY rule including bptt is affected)")
+    g.add_argument("--lam", type=float, default=LAM,
+                   help="fixed modulation decay, 0 <= lambda < 1, in every MP layer; "
+                        "default uses m_time_scale=4000 (lambda=0.99 at dt=40)")
+    g.add_argument("--modulation-mode", choices=["none", "hard", "scaled_tanh"],
+                   default=MODULATION_MODE if MODULATION_BOUNDS or MODULATION_MODE == "scaled_tanh" else "none",
+                   help="modulation write: unbounded, hard clipping, or B*tanh(S/B)")
+    g.add_argument("--modulation-bound", type=float, default=MODULATION_BOUND,
+                   help="positive bound/scale B for hard or scaled_tanh (default: %(default)s)")
+
+    g = p.add_argument_group("training and logging")
+    g.add_argument("--steps", type=int, default=N_DATASETS, help="training batches")
+    g.add_argument("--batch-size", type=int, default=BATCH,
+                   help="training trials per update; validation uses 3 times this "
+                        "many trials, evaluated in chunks (default: %(default)s)")
+    g.add_argument("--runs", type=int, default=N_RUNS, help="independent seeds")
+    g.add_argument("--seed", type=int, default=None,
+                   help="starting seed (subsequent runs increment it). Default: a "
+                        "random draw per invocation. Fix it to make two invocations "
+                        "(e.g. --learning-signal exact_spatial vs local_readout) a PAIRED "
+                        "comparison with identical init and training data.")
+    g.add_argument("--grad-align", action=argparse.BooleanOptionalAction, default=None,
+                   help="BPTT gradient-alignment diagnostic at record steps (one extra "
+                        "autograd pass per local rule per record step). Default: "
+                        f"{LOG_GRAD_ALIGN}; --dfa selects off.")
+    g.add_argument("--wandb", dest="use_wandb", action="store_true", default=USE_WANDB,
                    help="log to Weights & Biases (https://wandb.ai): one run per "
                         "(rule × seed), all grouped under this run's output save-stem "
                         "as the experiment name. Group/color by 'rule' in the UI for "
                         "K=len(RULES_TO_RUN) colors, each seed a separate curve. "
                         "Off by default.")
-    p.add_argument("--wandb-project", default=WANDB_PROJECT,
+    g.add_argument("--wandb-project", default=WANDB_PROJECT,
                    help="W&B project name (default: %(default)s).")
-    p.add_argument("--wandb-entity", default=WANDB_ENTITY,
+    g.add_argument("--wandb-entity", default=WANDB_ENTITY,
                    help="W&B entity (user/team); default: your W&B default.")
-    p.add_argument("--wandb-mode", choices=["online", "offline", "disabled"],
+    g.add_argument("--wandb-mode", choices=["online", "offline", "disabled"],
                    default=WANDB_MODE,
                    help="W&B mode; default: online. Use 'offline' to log locally and "
                         "`wandb sync` later (no login needed).")
-    args = p.parse_args()
+
+    g = p.add_argument_group(
+        "legacy options (still accepted; translated into the unified settings above)")
+    g.add_argument("--dfa", action="store_true",
+                   help="LEGACY PRESET for the manuscript's DFA comparison: "
+                        "--learning-signal dfa plus input mode match, direct bias, rules "
+                        "bptt + row-local + diagonal, cross-layer 0 and alignment off. "
+                        "Prefer --learning-signal dfa, which changes only the signal.")
+    g.add_argument("--feedback",
+                   choices=["exact_spatial", "layerwise_fa", "direct_fa", "exact_readout"],
+                   default=None,
+                   help="LEGACY spelling of the signal pathway (exact_spatial / "
+                        "layerwise_fa / direct_fa = --learning-signal exact_spatial / "
+                        "layerwise_fa / dfa; 'exact_readout' is the old name for "
+                        "exact_spatial). Must agree with --learning-signal when both are "
+                        "given.")
+    return p, p.parse_args(argv)
+
+
+def resolve_defaults_and_legacy_options(p, args):
+    """Stage 2 of 3: translate the legacy options (--dfa preset, --feedback,
+    --learning-signal global) into the unified signal mode and fill every unset
+    flag from the module defaults. Explicit flags always win; a flag that
+    contradicts another is reported here or in validate_config, never resolved by
+    argument order. Sets args.signal_mode and the model-facing pair
+    (args.learning_signal, args.feedback)."""
+    requested = args.learning_signal
+    if args.dfa:
+        if requested not in (None, "global", "dfa"):
+            p.error(f"--dfa is the legacy DFA preset and conflicts with "
+                    f"--learning-signal {requested}; drop one of them")
+        if args.feedback is not None and mpn.canonical_feedback_mode(args.feedback) != "direct_fa":
+            p.error("--dfa requires --feedback direct_fa, --input-mode match, "
+                    "and --cross-layer-steps 0; match keeps BPTT exact and local runs local")
+        requested = "dfa"
+    elif requested is None or requested == "global":
+        # Legacy spelling: the (legacy) --feedback flag, or the module defaults,
+        # decide which unified mode is meant.
+        feedback = mpn.canonical_feedback_mode(args.feedback or FEEDBACK_MODE)
+        learning_signal = "global" if requested == "global" else LEARNING_SIGNAL
+        requested = signal_mode_from(learning_signal, feedback)
+        if requested not in SIGNAL_MODES:
+            p.error(f"learning_signal={learning_signal} with feedback {feedback} is not a "
+                    f"supported signal mode; choose --learning-signal from {list(SIGNAL_MODES)}")
+    elif args.feedback is not None and \
+            mpn.canonical_feedback_mode(args.feedback) != SIGNAL_MODES[requested][1]:
+        p.error(f"--learning-signal {requested} implies feedback "
+                f"{SIGNAL_MODES[requested][1]}; drop the legacy --feedback {args.feedback} "
+                "or make them agree")
+    args.signal_mode = requested
+    args.learning_signal, args.feedback = SIGNAL_MODES[requested]
+    local_signal = args.learning_signal != "global"
+
     if args.grad_align is None:
         args.grad_align = False if args.dfa else LOG_GRAD_ALIGN
-    args.learning_signal = args.learning_signal or LEARNING_SIGNAL
-    local_signal = args.learning_signal != "global"
-    # Explicit flags always win. Otherwise a local signal swaps only the two module
-    # defaults that would conflict with it: an 'exact' input mode (a BPTT splice is
-    # not local) and a non-zero cross-layer correction (inter-module by construction).
+    # A local signal swaps only the two module defaults that would conflict with it:
+    # an 'exact' input mode (a BPTT splice is not local) and a non-zero cross-layer
+    # correction (inter-module by construction). Explicit flags are left alone.
     default_input_mode = INPUT_MODE
     if local_signal and default_input_mode == "exact":
         default_input_mode = "match"
     default_cross = CROSS_LAYER_STEPS
     if local_signal and default_cross != 0:
         default_cross = 0
-    args.feedback = args.feedback or ("direct_fa" if args.dfa else FEEDBACK_MODE)
     args.input_mode = args.input_mode or ("match" if args.dfa else default_input_mode)
     if args.cross_layer_steps is None:
         args.cross_layer_steps = 0 if args.dfa else default_cross
     args.local_bias_mode = args.local_bias_mode or ("direct" if args.dfa else LOCAL_BIAS_MODE)
-    if local_signal:
-        if args.net != "dmpn":
-            p.error(f"--learning-signal {args.learning_signal} requires --net dmpn")
-        if mpn.canonical_feedback_mode(args.feedback) != "exact_spatial":
-            p.error(f"--learning-signal {args.learning_signal} requires --feedback exact_spatial "
-                    "(the local heads define the inter-layer signal)")
-        if args.cross_layer_steps != 0:
-            p.error(f"--learning-signal {args.learning_signal} requires --cross-layer-steps 0")
-        if args.input_mode == "exact":
-            p.error(f"--learning-signal {args.learning_signal} cannot use --input-mode exact "
-                    "(a BPTT input splice is not local); use match, three_factor, "
-                    "diag_mtrace or paired")
-        if not np.isfinite(args.local_signal_alpha):
-            p.error("--local-signal-alpha must be finite")
     if args.rules is None:
         args.rules = (["bptt", "local_exact_rowlocal", "local_diag_rflo"] if args.dfa
                       else ["bptt", "local_diag_rflo", "local_direct"]
-                      if args.input_mode == 'paired' else RULES_TO_RUN)
-    if args.input_mode in ('diag_mtrace', 'paired') and (args.net != 'dmpn' or
-            mpn.canonical_feedback_mode(args.feedback) != 'exact_spatial'):
-        p.error(f"--input-mode {args.input_mode} requires --net dmpn and --feedback exact_spatial")
+                      if args.input_mode == 'paired' else list(RULES_TO_RUN))
+    return args
+
+
+def validate_config(p, args):
+    """Stage 3 of 3: reject every unsupported combination with one clear message.
+    Mirrors the model-level guards (so the error arrives before any net is built)
+    and adds the CLI-only rules."""
+    local_signal = args.learning_signal != "global"
+    if args.input_mode in ('diag_mtrace', 'paired') and (
+            args.net != 'dmpn' or args.feedback != 'exact_spatial'):
+        p.error(f"--input-mode {args.input_mode} requires --net dmpn and the exact_spatial "
+                "signal pathway (--learning-signal exact_spatial, local_readout or mixed)")
     if args.input_mode == 'paired' and 'local_exact_rowlocal' in args.rules:
         p.error("--input-mode paired does not support local_exact_rowlocal; "
                 "use match or an explicit input mode")
@@ -657,6 +793,22 @@ def _parse_args():
                 "and --cross-layer-steps 0; match keeps BPTT exact and local runs local")
     if args.feedback == "direct_fa" and args.cross_layer_steps != 0:
         p.error("direct_fa requires --cross-layer-steps 0 (or use --dfa)")
+    if args.feedback == "layerwise_fa" and args.cross_layer_steps != 0:
+        p.error("--learning-signal layerwise_fa requires --cross-layer-steps 0: the depth-1 "
+                "correction backprojects through the TRUE forward weights, which would make "
+                "the run a hybrid of random feedback and weight transport; use "
+                "exact_spatial if you want the correction")
+    if local_signal:
+        if args.net != "dmpn":
+            p.error(f"--learning-signal {args.signal_mode} requires --net dmpn")
+        if args.cross_layer_steps != 0:
+            p.error(f"--learning-signal {args.signal_mode} requires --cross-layer-steps 0")
+        if args.input_mode == "exact":
+            p.error(f"--learning-signal {args.signal_mode} cannot use --input-mode exact "
+                    "(a BPTT input splice is not local); use match, three_factor, "
+                    "diag_mtrace or paired")
+        if not np.isfinite(args.local_signal_alpha):
+            p.error("--local-signal-alpha must be finite")
     if not np.isfinite(args.modulation_bound) or args.modulation_bound <= 0:
         p.error("--modulation-bound must be finite and positive")
     if args.rflo_trace_rho is not None and (
@@ -667,6 +819,13 @@ def _parse_args():
     if args.batch_size <= 0:
         p.error("--batch-size must be a positive integer")
     return args
+
+
+def _parse_args(argv=None):
+    """parse → resolve defaults/legacy → validate. argv=None reads sys.argv."""
+    p, args = parse_arguments(argv)
+    args = resolve_defaults_and_legacy_options(p, args)
+    return validate_config(p, args)
 
 
 def main():

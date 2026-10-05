@@ -42,6 +42,12 @@ RULES_TO_RUN = ["bptt", "local_diag_rflo"]   # rules to compare
 # both coincide with ordinary feedback alignment for this single-hidden-layer RNN.
 # See mpn._FEEDBACK_MODES. (Legacy 'exact_readout' still aliases to 'exact_spatial'.)
 FEEDBACK_MODE = "exact_spatial"
+# The RNN has no local readout heads, so only the three GLOBAL signal modes of
+# train_mpn.SIGNAL_MODES apply; --learning-signal uses the same names as train_mpn.
+RNN_SIGNAL_MODES = {"exact_spatial": "exact_spatial", "layerwise_fa": "layerwise_fa",
+                    "dfa": "direct_fa"}
+_FEEDBACK_TO_SIGNAL = {"exact_spatial": "exact_spatial", "exact_readout": "exact_spatial",
+                       "layerwise_fa": "layerwise_fa", "direct_fa": "dfa"}
 N_RUNS = 3                    # independent seeds per rule
 N_HIDDEN = 180                # one_task.py: n_hidden = 200
 N_DATASETS = 5000             # one_task.py: n_datasets = 3000 (heavy on CPU)
@@ -139,6 +145,7 @@ def _cfg():
         rule_label=RULE_LABEL, rule_color=RULE_COLOR,
         seed=SEED, ruleset=RULESET, rules_to_run=RULES_TO_RUN,
         feedback_mode=FEEDBACK_MODE, n_runs=N_RUNS, n_hidden=N_HIDDEN,
+        signal_mode=_FEEDBACK_TO_SIGNAL.get(FEEDBACK_MODE, FEEDBACK_MODE),
         batch=BATCH, n_datasets=N_DATASETS, lr=LR, grad_clip=GRAD_CLIP,
         log_every=LOG_EVERY, device=DEVICE, dtype=DTYPE,
         fig_dir=FIG_DIR, ckpt_dir=CKPT_DIR, data_dir=DATA_DIR, save_nets=SAVE_NETS,
@@ -167,13 +174,27 @@ def _parse_args():
     p.add_argument("--runs", type=int, default=N_RUNS, help="independent seeds")
     p.add_argument("--hidden", type=int, default=N_HIDDEN, help="hidden units")
     p.add_argument("--steps", type=int, default=N_DATASETS, help="training batches")
+    p.add_argument("--learning-signal", choices=list(RNN_SIGNAL_MODES), default=None,
+                   help="hidden learning signal, same names as train_mpn: exact_spatial "
+                        "(true readout weights), layerwise_fa / dfa (fixed random "
+                        "feedback; the two coincide for this single-hidden RNN). "
+                        f"Default: {_FEEDBACK_TO_SIGNAL.get(FEEDBACK_MODE, FEEDBACK_MODE)}.")
     p.add_argument("--feedback",
                    choices=["exact_spatial", "layerwise_fa", "direct_fa", "exact_readout"],
-                   default=FEEDBACK_MODE,
-                   help="hidden learning-signal feedback (both random modes "
-                        "coincide for this single-hidden RNN). 'exact_readout' is "
-                        "the legacy name for 'exact_spatial'.")
-    return p.parse_args()
+                   default=None,
+                   help="LEGACY spelling of --learning-signal (direct_fa = dfa; "
+                        "'exact_readout' is the old name for exact_spatial). Must agree "
+                        "with --learning-signal when both are given.")
+    args = p.parse_args()
+    if args.learning_signal is not None:
+        implied = RNN_SIGNAL_MODES[args.learning_signal]
+        if args.feedback is not None and _FEEDBACK_TO_SIGNAL[args.feedback] != args.learning_signal:
+            p.error(f"--learning-signal {args.learning_signal} implies feedback {implied}; "
+                    f"drop the legacy --feedback {args.feedback} or make them agree")
+        args.feedback = implied
+    else:
+        args.feedback = args.feedback or FEEDBACK_MODE
+    return args
 
 
 def main():

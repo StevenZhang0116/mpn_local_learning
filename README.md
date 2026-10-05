@@ -15,8 +15,12 @@ The `learning_rule` governs the **whole** network (input embedding included):
   terms); for the RNN this is RFLO (Murray & Escola 2019).
 - `local_direct` — direct/instantaneous 3-factor rule, no trace.
 
-`feedback_mode` ∈ {`exact_readout`, `random_fixed`} selects exact vs. fixed-random
-feedback for the hidden learning signal. Readout gradients are always exact.
+A local update is **learning signal × eligibility**, and `train_mpn.py` keeps the
+two choices (plus the input embedding's update) on separate flags: `--learning-signal`
+picks where each MP layer's signal comes from (`exact_spatial`, `layerwise_fa`, `dfa`,
+`local_readout`, `mixed`), `--rules` picks the eligibility above, and `--input-mode`
+picks how the embedding is trained. See "Choosing the learning signal" below.
+Readout gradients are always exact.
 
 ## Layout
 
@@ -78,7 +82,7 @@ For example, a smaller-batch pixel-MNIST comparison with three MP layers:
 ```bash
 python scripts/train_mpn.py --task seqmnist_pixel --hidden 128 128 128 \
   --residual --rflo-trace-rho 0.99 --lam 0.99 \
-  --feedback exact_spatial --input-mode match --local-bias-mode direct \
+  --learning-signal exact_spatial --input-mode match --local-bias-mode direct \
   --cross-layer-steps 0 --modulation-mode hard --modulation-bound 1 \
   --rules local_direct local_diag_rflo bptt \
   --batch-size 16 --no-grad-align --steps 5000 --runs 3
@@ -128,7 +132,7 @@ refer to the current process's experiment. Explore results with the analysis
 scripts in `notebooks/`.
 
 For temporal input-layer credit without an extra BPTT pass, select
-`--input-mode diag_mtrace --feedback exact_spatial` on a `dmpn` run. Local rules
+`--input-mode diag_mtrace` (exact_spatial pathway) on a `dmpn` run. Local rules
 then track the first MP layer's modulation-column sensitivities to the matching
 embedding weights and bias; BPTT remains a full-gradient reference. This is a
 diagonal-column approximation: other modulation columns and deeper-layer temporal
@@ -147,7 +151,7 @@ learning comparison. Keep `--cross-layer-steps 0` for the original MP update rul
 For a comparison of complete algorithm pairings, use:
 
 ```bash
-python scripts/train_mpn.py --input-mode paired --feedback exact_spatial --cross-layer-steps 0 --local-bias-mode direct
+python scripts/train_mpn.py --input-mode paired --learning-signal exact_spatial --cross-layer-steps 0 --local-bias-mode direct
 ```
 
 `paired` defaults to BPTT, diagonal RFLO, and direct when `--rules` is omitted:
@@ -172,10 +176,76 @@ model's `resolved_input_mode`; the config JSON records `resolved_input_modes`
 for all selected rules. The requested `input_mode` remains `paired`, and the
 effective mapping is recomputed whenever the model's learning rule changes.
 
-### Local readout heads (`--learning-signal`)
+### Choosing the learning signal (`--learning-signal`)
+
+`train_mpn.py` separates three independent choices so that changing one flag changes
+one thing:
+
+| Axis | Flag | Choices |
+|---|---|---|
+| Learning signal (where each MP layer's error comes from) | `--learning-signal` | `exact_spatial` (default), `layerwise_fa`, `dfa`, `local_readout`, `mixed` |
+| Eligibility (how MP parameters consume it) | `--rules` | `local_direct`, `local_diag_rflo`, `local_exact_rowlocal`, `bptt` |
+| Input embedding update | `--input-mode` | `match` (default), `exact`, `three_factor`, `diag_mtrace`, `paired` |
+
+The five signal modes map onto the model's two fields (`learning_signal`, `feedback_mode`):
+
+| `--learning-signal` | Signal each MP layer learns from | internal `learning_signal` | internal `feedback_mode` |
+|---|---|---|---|
+| `exact_spatial` | main readout error through the true weights at every boundary (same-time spatial path; weight transport) | `global` | `exact_spatial` |
+| `layerwise_fa` | main readout error through a fixed random matrix at every boundary | `global` | `layerwise_fa` |
+| `dfa` | main readout error projected directly to every layer through its own random matrix | `global` | `direct_fa` |
+| `local_readout` | each module's own auxiliary head error (see the next section) | `local_readout` | `exact_spatial` |
+| `mixed` | `exact_spatial` plus `--local-signal-alpha` × the local head error | `mixed` | `exact_spatial` |
+
+`exact_spatial` qualifies the spatial pathway only; temporal credit is whatever the
+eligibility rule provides, so none of these is full BPTT. `bptt` is full BPTT of the
+main loss under every signal mode (its auxiliary heads, if any, receive no gradient).
+
+Defaults are signal-independent, so switching `--learning-signal` alone changes only the
+signal. They changed in October 2026; old runs used the previous column:
+
+| Setting | Previous default | Current default |
+|---|---|---|
+| `--rules` | `bptt local_exact_rowlocal local_diag_rflo local_direct` | `bptt local_direct local_diag_rflo` |
+| `--input-mode` | `exact` (local runs spliced a BPTT embedding gradient: a hybrid) | `match` (bptt = full BPTT, local runs fully local) |
+| `--local-bias-mode` | `exact` | `direct` (pass `exact` for the row-local rule's top-layer bias exactness) |
+| `--cross-layer-steps` | `1` | `0` |
+| `--grad-align` | on | on (unchanged) |
+
+Supported combinations for `dmpn` runs with local rules:
+
+| Signal | Allowed `--input-mode` | `--cross-layer-steps` |
+|---|---|---|
+| `exact_spatial` | all five | `0` or `1` |
+| `layerwise_fa` | `match`, `exact`, `three_factor` | `0` only (the correction uses the true forward weights) |
+| `dfa` | `match`, `exact`, `three_factor` | `0` only |
+| `local_readout`, `mixed` | `match`, `three_factor`, `diag_mtrace`, `paired` | `0` only |
+
+`--input-mode exact` under a global signal and `--input-mode three_factor` under `bptt`
+are hybrids (a BPTT embedding gradient in a local run, or a local embedding rule in the
+BPTT baseline); the console's per-rule line records what each rule actually runs, e.g.
+
+```text
+  bptt: input_mode=match, resolved_input_mode=exact, mp_update=full BPTT (feedback/bias/heads unused)
+  local_direct: input_mode=match, resolved_input_mode=three_factor, signal=dfa, feedback=direct_fa, bias=direct (rule-fixed), heads=none
+  local_diag_rflo: input_mode=match, resolved_input_mode=three_factor, signal=dfa, feedback=direct_fa, bias=direct, rho=0.99, heads=none
+```
+
+The same summary is stored per checkpoint as `effective_config`, and `signal_mode` is
+recorded next to `feedback_mode`/`learning_signal` in checkpoints, `config.json`, the
+`.npz` metadata and W&B. Legacy spellings still work and are translated: `--feedback
+exact_spatial|layerwise_fa|direct_fa` (= `--learning-signal exact_spatial|layerwise_fa|dfa`),
+`--learning-signal global` (defers to `--feedback`), and the `--dfa` preset, which keeps
+its historical bundle (`dfa` + `match` + direct bias + rules `bptt local_exact_rowlocal
+local_diag_rflo` + alignment off). A flag that contradicts another is rejected whatever
+the argument order. `train_rnn.py` accepts the same three global names. The parser runs
+in three stages (`parse_arguments`, `resolve_defaults_and_legacy_options`,
+`validate_config`), and `--help` groups flags by what they act on.
+
+### Local readout heads (`--learning-signal local_readout`)
 
 By default every MP layer's learning signal is the main readout's error delivered
-through the inter-layer pathway (`--learning-signal global`). With
+through the inter-layer pathway (`--learning-signal exact_spatial`). With
 `--learning-signal local_readout`, every non-top MP layer of a `dmpn` stack owns an
 auxiliary linear head trained on the same task loss, labels and mask as the main
 readout; the head's error projected through its weights is that layer's learning
@@ -195,16 +265,17 @@ rule with each head's train loss and accuracy (also logged to W&B as
 `train/aux{n}_*`). Head gradients are norm-clipped as a separate group so they never
 change the main network's clipped step. `bptt` ignores the setting (its heads get no
 gradient), so the BPTT baseline is unchanged; the gradient-alignment columns exclude
-the heads. The local modes require `--feedback exact_spatial` and
+the heads. The local modes imply exact_spatial feedback, require
 `--cross-layer-steps 0`, and cannot use `--input-mode exact` (a BPTT input splice is
-not local): when those two module defaults would conflict they switch to `match` and
-`0` unless you set them explicitly. A single MP layer has no head, so
+not local); should the module defaults be set to `exact` / `1`, they switch to `match`
+and `0` unless you pass them explicitly. A single MP layer has no head, so
 `local_readout` then coincides with `global`. Heads are initialized from a private RNG
-stream, so a `global` and a `local_readout` invocation with the same `--seed` share
-init and training data:
+stream, so an `exact_spatial` and a `local_readout` invocation with the same `--seed`
+share init and training data (the defaults are signal-independent, so nothing else
+differs between the two commands):
 
 ```bash
-python scripts/train_mpn.py --task seqmnist --hidden 128 128 --seed 7 --input-mode match --cross-layer-steps 0
+python scripts/train_mpn.py --task seqmnist --hidden 128 128 --seed 7
 python scripts/train_mpn.py --task seqmnist --hidden 128 128 --seed 7 --learning-signal local_readout
 ```
 

@@ -65,6 +65,8 @@ def _base_config(cfg, experiment):
         "arch_tag": getattr(cfg, "arch_tag", ""),
         "arch_desc": getattr(cfg, "arch_desc", ""),
         "feedback_mode": cfg.feedback_mode,
+        "signal_mode": getattr(cfg, "signal_mode", ""),
+        "learning_signal": getattr(cfg, "learning_signal", "global"),
         "input_mode": getattr(cfg, "input_mode", "match"),
         "input_normalize": getattr(cfg, "input_normalize", False),
         "mp_residual": getattr(cfg, "mp_residual", False),

@@ -108,6 +108,11 @@ class RunConfig:
     # plotted/scheduled metrics). Legacy names include "_ls-{signal}".
     learning_signal: str = "global"
     local_signal_alpha: float = 1.0
+    # Unified name of the (learning_signal, feedback_mode) pair the run uses — the
+    # CLI's --learning-signal value (train_mpn.SIGNAL_MODES: exact_spatial /
+    # layerwise_fa / dfa / local_readout / mixed). Recorded next to the two model
+    # fields in every metadata sink; empty when the caller does not set it.
+    signal_mode: str = ""
     # Optional extra string appended to the legacy filename tag (e.g. eta/lambda);
     # keep it filename-safe. Empty by default.
     tag_extra: str = ""
@@ -316,6 +321,30 @@ def aux_param_split(net, trainable):
     return main, aux
 
 
+def effective_rule_summary(cfg, net, rule):
+    """One line describing what `rule` ACTUALLY runs on `net`, for the console and
+    the per-rule provenance: MP update, signal mode + feedback pathway, bias
+    eligibility, the RFLO trace cap, and whether local readout heads are active.
+    Separates 'which signal was selected' from 'is this run fully local'."""
+    if rule == "bptt":
+        return "mp_update=full BPTT (feedback/bias/heads unused)"
+    layers = getattr(net, "mp_layers", [])
+    signal = getattr(cfg, "signal_mode", "") or getattr(net, "learning_signal", "global")
+    parts = [f"signal={signal}", f"feedback={getattr(net, 'feedback_mode', 'n/a')}"]
+    if rule == "local_direct":
+        parts.append("bias=direct (rule-fixed)")
+    else:
+        bias = sorted({mp.local_bias_mode for mp in layers})
+        parts.append(f"bias={'/'.join(bias) if bias else 'n/a'}")
+    if rule == "local_diag_rflo":
+        rho = sorted({mp.rflo_trace_rho for mp in layers
+                      if getattr(mp, "rflo_trace_rho", None) is not None})
+        parts.append(f"rho={rho[0]:g}" if rho else "rho=none")
+    n_heads = len(getattr(net, "_head_names", []))
+    parts.append(f"heads={n_heads} active" if n_heads else "heads=none")
+    return ", ".join(parts)
+
+
 def make_optim(net, lr, weight_decay=0.0):
     """Adam with coupled L2: (weight_decay / 2) * sum(W**2), excluding biases.
     Weight matrices = every _trainable_params key starting with 'W' plus the local
@@ -404,7 +433,9 @@ def run_seed(cfg, seed, record_steps, run_idx=0, wandb_logger=None):
         net.learning_rule = rule
         resolved_input = getattr(net, 'resolved_input_mode', None)
         if resolved_input is not None:
-            print(f"  {rule}: input_mode={net.input_mode}, resolved_input_mode={resolved_input}")
+            # Effective per-rule configuration (what this rule actually runs).
+            print(f"  {rule}: input_mode={net.input_mode}, resolved_input_mode={resolved_input}, "
+                  + effective_rule_summary(cfg, net, rule))
         nets[rule] = net
         optims[rule] = make_optim(net, cfg.lr, weight_decay=weight_decay)
         # Main parameters and local readout heads are norm-clipped as SEPARATE
@@ -667,6 +698,8 @@ def run_seed(cfg, seed, record_steps, run_idx=0, wandb_logger=None):
                 "input_mode": cfg.input_mode,
                 "resolved_input_mode": getattr(nets[rule], 'resolved_input_mode', None),
                 "learning_signal": getattr(nets[rule], 'learning_signal', cfg.learning_signal),
+                "signal_mode": getattr(cfg, "signal_mode", ""),
+                "effective_config": effective_rule_summary(cfg, nets[rule], rule),
                 "seed": seed,
             }, path)
             print(f"  saved network: {path}")
@@ -778,6 +811,7 @@ def save_plot_data(cfg, record_steps, runs, agg, path=None,
         "input_mode": cfg.input_mode, "title": cfg.title,
         "learning_signal": getattr(cfg, "learning_signal", "global"),
         "local_signal_alpha": getattr(cfg, "local_signal_alpha", 1.0),
+        "signal_mode": getattr(cfg, "signal_mode", ""),
         # full architecture (multi-layer stacks) for provenance + replot suffix
         "arch_tag": getattr(cfg, "arch_tag", ""),
         "arch_desc": getattr(cfg, "arch_desc", ""),
@@ -876,6 +910,7 @@ def save_config(cfg, path=None):
             "input_mode": cfg.input_mode,
             "learning_signal": getattr(cfg, "learning_signal", "global"),
             "local_signal_alpha": getattr(cfg, "local_signal_alpha", 1.0),
+            "signal_mode": getattr(cfg, "signal_mode", ""),
             "resolved_input_modes": {
                 rule: resolve_input_mode(cfg.input_mode, rule) for rule in cfg.rules_to_run
             } if net_params.get("net_type") == "dmpn" else {},
@@ -930,7 +965,9 @@ def run_experiment(cfg):
     print(f"Task: {cfg.ruleset}{cfg.header_note}  |  rules: {cfg.rules_to_run}  |  "
           f"runs: {cfg.n_runs}  |  {arch_suffix(cfg)} batch={cfg.batch} "
           f"steps={cfg.n_datasets} lr={cfg.lr} clip={cfg.grad_clip}")
-    print(f"Device: {cfg.device}  dtype: {cfg.dtype}  feedback: {cfg.feedback_mode}"
+    print(f"Device: {cfg.device}  dtype: {cfg.dtype}"
+          f"{f'  signal: {cfg.signal_mode}' if getattr(cfg, 'signal_mode', '') else ''}"
+          f"  feedback: {cfg.feedback_mode}"
           f"{'  (input norm ON)' if getattr(cfg, 'input_normalize', False) else ''}"
           f"{'  (residual ON)' if getattr(cfg, 'mp_residual', False) else ''}"
           f"{f'  (cross-layer x{cfg.cross_layer_steps})' if getattr(cfg, 'cross_layer_steps', 0) else ''}"

@@ -331,6 +331,10 @@ def tier4_real_task():
     # globals: exact_spatial, and input_mode='match' so no cross-rule splice runs.
     tm.FEEDBACK_MODE = "exact_spatial"
     tm.INPUT_MODE = "match"
+    # The bias half of the exact-local == BPTT invariant needs the row-local bias
+    # TRACE; the training script's default became 'direct' (phi' only) in Oct 2026,
+    # so pin the exact mode here too.
+    tm.LOCAL_BIAS_MODE = "exact"
     task_params, train_params, net_params = tm.build_params()
     # Correctness is size-independent; shrink hidden/embedding so long-sequence
     # tasks (e.g. contextdelaydm1) fit under a tight memory ceiling. This still
