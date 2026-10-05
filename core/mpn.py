@@ -2492,7 +2492,7 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
 
     @torch.no_grad()
     def _prepass_output_grad(self, inputs, labels, masks, loss_and_grad, eta_lam,
-                             update_masks):
+                             update_masks, with_heads=True):
         """Forward-only pre-pass for a CUSTOM loss (deep net). Runs the embedding +
         full MP stack with the same clean-config fast M update the accumulation
         loop uses (for EVERY layer), builds the full output sequence, and returns
@@ -2508,7 +2508,7 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
         self.reset_state(B=B)
         outputs = torch.empty(B, T, self.n_output, dtype=dt, device=dev)
         aux_outputs = [torch.empty(B, T, self.n_output, dtype=dt, device=dev)
-                       for _ in self._head_names]
+                       for _ in (self._head_names if with_heads else [])]
         for t in range(T):
             u_t = inputs[:, t, :]
             output, h, z, phi_p, embed_pre = self._forward_local_stack(u_t)
@@ -2532,8 +2532,14 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
     def _local_sequence_gradients(self, inputs, labels, masks, mode,
                                   loss_and_grad=masked_mse_loss_and_output_grad,
                                   update_masks=None,
-                                  return_outputs=True):
+                                  return_outputs=True,
+                                  use_local_heads=True):
         """Forward-mode local learning for the deep net — ANY number of MP layers.
+
+        use_local_heads=False runs the pass with the GLOBAL signal even on a net
+        that owns local readout heads (no head errors, no head gradients, no
+        aux_* keys). _apply_input_mode uses it for the three_factor embedding
+        splice of a bptt run, so bptt ignores learning_signal in every input mode.
 
         Per time step (see the class docstring and the module derivation) the
         ordering is strict:
@@ -2591,14 +2597,15 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
         need_outputs = return_outputs or (not default_loss)
         # Local readout heads (learning_signal != 'global'; none on a single MP
         # layer, in which case this pass is byte-identical to the global one).
-        heads = self._head_names
+        heads = self._head_names if use_local_heads else []
         n_heads = len(heads)
         prepass_loss, grad_output_seq = (None, None)
         aux_prepass_loss, aux_grad_seq = ([], [])
         if not default_loss:
             prepass_loss, grad_output_seq, aux_prepass_loss, aux_grad_seq = \
                 self._prepass_output_grad(inputs, labels, masks, loss_and_grad,
-                                          eta_lam, update_masks)
+                                          eta_lam, update_masks,
+                                          with_heads=use_local_heads)
 
         self.reset_state(B=B)
         for mp in layers:
@@ -2857,8 +2864,9 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
 
         params = self._trainable_params()
         result = {k: all_grads[k] for k in params}
-        for k in self._aux_params():
-            result[k] = all_grads[k]
+        if n_heads:                     # heads active in THIS pass (not under use_local_heads=False)
+            for k in self._aux_params():
+                result[k] = all_grads[k]
         result['loss'] = loss.detach()
         result['outputs'] = outputs.detach() if return_outputs and outputs is not None else None
         if n_heads:
@@ -2947,6 +2955,11 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
                 "input_mode='exact' splices a full-BPTT embedding gradient into a local "
                 f"run, which is not local; under learning_signal='{self.learning_signal}' "
                 "use match, three_factor, diag_mtrace or paired.")
+        if other_rule == 'local_direct':
+            # bptt ignores learning_signal: its three_factor embedding splice is the
+            # direct 3-factor rule under the GLOBAL (main readout) signal, never a
+            # local head's error (the heads are untrained under bptt anyway).
+            kwargs = dict(kwargs, use_local_heads=False)
         other = self._grads_for_rule(other_rule, inputs, labels, masks, **kwargs)
         for k in ('W_in', 'b_in'):
             if k in grads and k in other:
@@ -2963,8 +2976,8 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
         for name, p in self._trainable_params().items():
             p.grad = grads[name].clone()
         # Local readout heads are trained only by the local passes: bptt produces no
-        # head gradient, so its heads keep .grad=None and the optimizer skips them.
+        # head gradient, so its heads get .grad=None (also CLEARING any gradient left
+        # by an earlier local pass on the same model) and the optimizer skips them.
         for name, p in self._aux_params().items():
-            if name in grads:
-                p.grad = grads[name].clone()
+            p.grad = grads[name].clone() if name in grads else None
         return grads

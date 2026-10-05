@@ -335,6 +335,48 @@ class TestLocalReadoutGradients(unittest.TestCase):
         self.assertTrue(all(np.isfinite(v) for v in cos.values()))
         self.assertEqual(net.learning_rule, 'local_direct')   # restored by the helper
 
+    def test_bptt_three_factor_splice_uses_the_global_signal(self):
+        """bptt ignores learning_signal in EVERY input mode: its three_factor embedding
+        splice (an extra local_direct pass) must use the main readout's signal, not an
+        untrained head's error. Regression for the b552af1 review (W_in differed by ~0.32)."""
+        x, y, mask, _ = data()
+        for input_mode in ('three_factor', 'match', 'paired'):
+            with self.subTest(input_mode=input_mode):
+                g = make_net(make_cfg(signal='global', rule='bptt', input_mode=input_mode))
+                l = make_net(make_cfg(signal='local_readout', rule='bptt', input_mode=input_mode))
+                gg, gl = g.sequence_gradients(x, y, mask), l.sequence_gradients(x, y, mask)
+                self.assertEqual(set(gg), set(gl))
+                for k in gg:
+                    if gg[k] is not None:
+                        self.assertTrue(torch.equal(gg[k], gl[k]), k)
+                self.assertTrue(all(p.grad is None for p in l._aux_params().values()))
+        # The flag itself: a local rule run with use_local_heads=False reproduces the
+        # global pass bitwise (no aux keys), with the heads left untouched.
+        g = make_net(make_cfg(signal='global', rule='local_direct'))
+        l = make_net(make_cfg(signal='local_readout', rule='local_direct'))
+        gg = g.local_direct_gradients(x, y, mask)
+        gl = l.local_direct_gradients(x, y, mask, use_local_heads=False)
+        self.assertEqual(set(gg), set(gl))
+        self.assertNotIn('aux_loss', gl)
+        for k in gg:
+            if gg[k] is not None:
+                self.assertTrue(torch.equal(gg[k], gl[k]), k)
+
+    def test_switching_a_model_to_bptt_clears_stale_head_grads(self):
+        """Regression for the b552af1 review: a head .grad written by a local pass must
+        not survive a later bptt pass on the SAME model (else Adam keeps moving the heads)."""
+        x, y, mask, _ = data()
+        net = make_net(make_cfg(signal='local_readout', rule='local_direct'))
+        net.sequence_gradients(x, y, mask)
+        self.assertTrue(all(p.grad is not None for p in net._aux_params().values()))
+        net.learning_rule = 'bptt'
+        net.sequence_gradients(x, y, mask)
+        self.assertTrue(all(p.grad is None for p in net._aux_params().values()))
+        # And back: the local pass writes them again.
+        net.learning_rule = 'local_diag_rflo'
+        net.sequence_gradients(x, y, mask)
+        self.assertTrue(all(p.grad is not None for p in net._aux_params().values()))
+
     def test_mixed_is_linear_in_alpha(self):
         """Traces never depend on ell, so grad(mixed) = grad(global) + alpha*grad(local)
         for every MP/embedding parameter; top layer, readout and heads are shared."""

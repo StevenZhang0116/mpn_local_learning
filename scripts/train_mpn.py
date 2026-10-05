@@ -51,8 +51,11 @@ embedding shares module 0's head. It needs exact_spatial feedback and
 cross-layer-steps 0 and cannot splice a BPTT input gradient, so the two module
 defaults that would conflict (input mode 'exact', cross-layer 1) switch to
 'match' / 0 unless set explicitly. bptt ignores the setting. Pair it with --seed
-so a global and a local_readout invocation share init and data:
-    python scripts/train_mpn.py --task seqmnist --hidden 128 128 --seed 7
+so a global and a local_readout invocation share init and data, and set those two
+flags EXPLICITLY on the global side so both runs use the same input mode and
+cross-layer setting:
+    python scripts/train_mpn.py --task seqmnist --hidden 128 128 --seed 7 \
+        --input-mode match --cross-layer-steps 0
     python scripts/train_mpn.py --task seqmnist --hidden 128 128 --seed 7 \
         --learning-signal local_readout
 
