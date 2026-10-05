@@ -3,6 +3,7 @@ import contextlib
 import io
 import json
 from pathlib import Path
+import re
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -33,6 +34,30 @@ class TestOutputLayout(unittest.TestCase):
         rnn_cfg = train_rnn._cfg()
         self.assertEqual(tc.run_stem(rnn_cfg),
                          f'{rnn_cfg.file_prefix}_{tc.param_tag(rnn_cfg)}_runs{rnn_cfg.n_runs}')
+
+    def test_run_id_carries_timestamp_and_names_every_output(self):
+        import datetime
+        import run_logging
+        fixed = datetime.datetime(2026, 10, 5, 13, 51, 3)
+        rid = train_mpn.new_run_id('dmpn', 'contextdelaydm1', now=fixed)
+        self.assertRegex(rid, r'^dmpn_contextdelaydm1_20261005_135103_[0-9a-f]{12}$')
+        self.assertNotEqual(rid, train_mpn.new_run_id('dmpn', 'contextdelaydm1', now=fixed))
+        with patch.multiple(train_mpn, SEED=288, _RUN_IDS={}):
+            cfg = train_mpn._cfg()
+            self.assertRegex(cfg.run_id, r'^dmpn_contextdelaydm1_\d{8}_\d{6}_[0-9a-f]{12}$')
+            # checkpoints/<id>/seed<N>/<rule>.pt, figure/<id>.png, figure_data/<id>.npz
+            # and log/<id>.log all use the SAME stem.
+            self.assertEqual(Path(tc.ckpt_path(cfg, 'bptt', 288)).parent.parent.name, cfg.run_id)
+            self.assertEqual(Path(tc.fig_path(cfg)).stem, cfg.run_id)
+            self.assertEqual(Path(tc.data_path(cfg)).stem, cfg.run_id)
+            self.assertEqual(Path(tc.config_path(cfg)).parent.name, cfg.run_id)
+            self.assertEqual(tc.run_stem(cfg), cfg.run_id)
+            with tempfile.TemporaryDirectory() as directory:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    with run_logging.tee_output('train_mpn', directory):
+                        log_path = run_logging.rename_active_log(tc.run_stem(cfg))
+                self.assertEqual(log_path.name, f'{cfg.run_id}.log')
+            self.assertLess(len(Path(tc.data_path(cfg)).name), 65)
 
     def test_full_configuration_is_saved_in_run_folder(self):
         with tempfile.TemporaryDirectory() as directory, patch.multiple(

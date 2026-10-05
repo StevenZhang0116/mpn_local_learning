@@ -47,6 +47,33 @@ class TestRunLogging(unittest.TestCase):
                         self.assertRegex(log_path.name, rf"^train_mpn_\d{{8}}_\d{{6}}_{os.getpid()}\.log$")
                 self.assertTrue(log_path.is_file())
 
+    def test_rename_active_log_keeps_writing_to_the_renamed_file(self):
+        self.assertIsNone(run_logging.rename_active_log("outside"))
+        self.assertIsNone(run_logging.active_log_path())
+        stdout = io.StringIO()
+        with tempfile.TemporaryDirectory() as directory:
+            with contextlib.redirect_stdout(stdout):
+                with run_logging.tee_output("train_mpn", directory) as initial:
+                    print("before rename")
+                    renamed = run_logging.rename_active_log("dmpn_task_abc123def456")
+                    self.assertEqual(renamed, Path(directory) / "dmpn_task_abc123def456.log")
+                    self.assertEqual(run_logging.active_log_path(), renamed)
+                    self.assertFalse(initial.exists())
+                    print("after rename")
+                    sys.stdout.flush()
+                    contents = renamed.read_text(encoding="utf-8")
+                    self.assertIn("before rename\n", contents)
+                    self.assertIn("Log renamed to:", contents)
+                    self.assertIn("after rename\n", contents)
+                    # Same stem again is a no-op; a clash with another file gets a pid suffix.
+                    self.assertEqual(run_logging.rename_active_log("dmpn_task_abc123def456"), renamed)
+                    (Path(directory) / "taken.log").write_text("x")
+                    clashed = run_logging.rename_active_log("taken")
+                    self.assertEqual(clashed.name, f"taken_{os.getpid()}.log")
+                    self.assertTrue(clashed.exists())
+                self.assertIsNone(run_logging.active_log_path())
+            self.assertIn("Log renamed to:", stdout.getvalue())
+
     def test_restores_streams_and_closes_log_on_exception(self):
         stdout = io.StringIO()
         stderr = io.StringIO()
@@ -65,10 +92,13 @@ class TestRunLogging(unittest.TestCase):
     def test_train_mpn_cli_captures_experiment_output(self):
         import train_common
 
+        seen = {}
+
         def fake_experiment(config):
             self.assertTrue(config.dfa_preset)
             self.assertEqual(config.feedback_mode, "direct_fa")
             self.assertEqual(config.n_datasets, 1)
+            seen["run_id"] = config.run_id
             print("experiment stdout")
             print("experiment stderr", file=sys.stderr)
 
@@ -85,9 +115,13 @@ class TestRunLogging(unittest.TestCase):
                         with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
                             runpy.run_path(str(script), run_name="__main__")
             runner.assert_called_once()
-            logs = list((root / "log").glob("train_mpn_*.log"))
-            self.assertEqual(len(logs), 1)
+            # The log carries the run ID shared by figure/.npz/checkpoints, not a
+            # timestamp; the temporary timestamped file was renamed, not duplicated.
+            logs = list((root / "log").glob("*.log"))
+            self.assertEqual([p.name for p in logs], [f"{seen['run_id']}.log"])
             contents = logs[0].read_text(encoding="utf-8")
+            self.assertIn("Logging stdout/stderr to:", contents)
+            self.assertIn(f"Log renamed to: {logs[0]}", contents)
             self.assertIn("experiment stdout", contents)
             self.assertIn("experiment stderr", contents)
             self.assertIn("experiment stdout", stdout.getvalue())

@@ -95,11 +95,13 @@ the BPTT gradient definition. At batch 16, 5000 steps sample 80,000 images per
 rule/seed, versus 640,000 at batch 128 (sampling is with replacement).
 
 Each run writes a two-panel (train / test accuracy) figure to `figure/`, the arrays
-behind it to `figure_data/`, and (MPN) trained nets to `checkpoints/`. MPN outputs
-use a short `<model>_<task>_<unique-id>` run ID, for example:
+behind it to `figure_data/`, (MPN) trained nets to `checkpoints/`, and the console
+output to `log/`. All four share one run ID, `<model>_<task>_<YYYYMMDD_HHMMSS>_<hash>`
+(the timestamp is when the ID was created, so listings sort chronologically; the
+12-hex-digit hash keeps invocations distinct even within the same second), for example:
 
 ```text
-checkpoints/dmpn_contextdelaydm1_a1b2c3d4e5f6/
+checkpoints/dmpn_contextdelaydm1_20261005_135103_a1b2c3d4e5f6/
   config.json
   seed288/
     bptt.pt
@@ -107,8 +109,9 @@ checkpoints/dmpn_contextdelaydm1_a1b2c3d4e5f6/
     local_direct.pt
   seed289/
     ...
-figure/dmpn_contextdelaydm1_a1b2c3d4e5f6.png
-figure_data/dmpn_contextdelaydm1_a1b2c3d4e5f6.npz
+figure/dmpn_contextdelaydm1_20261005_135103_a1b2c3d4e5f6.png
+figure_data/dmpn_contextdelaydm1_20261005_135103_a1b2c3d4e5f6.npz
+log/dmpn_contextdelaydm1_20261005_135103_a1b2c3d4e5f6.log
 ```
 
 One CLI invocation gets one folder, with a subfolder for each seed. Separate
@@ -332,11 +335,13 @@ candidate gains outside `[-rho,rho]` before update masks/write gates (zero when
 the cap is disabled).
 
 Every `train_mpn.py` CLI invocation also mirrors stdout and stderr to
-`log/train_mpn_YYYYMMDD_HHMMSS_PID.log`, following the `MultiTaskMPN` logging
-pattern. The log directory is anchored to the project root regardless of the
-working directory. The log path is printed at startup, and output remains
-visible in the terminal. No extra flag is needed; importing `train_mpn` and
-running `train_rnn.py` do not enable this logging.
+`log/<run-id>.log`, the same `<model>_<task>_<YYYYMMDD_HHMMSS>_<hash>` name as the
+run's figure, `.npz` and checkpoint folder. The file opens under a temporary timestamped name
+(`train_mpn_YYYYMMDD_HHMMSS_PID.log`, so even argument errors are captured) and is
+renamed as soon as the run ID exists; both paths are printed at startup. The log
+directory is anchored to the project root regardless of the working directory, and
+output remains visible in the terminal. No extra flag is needed; importing
+`train_mpn` and running `train_rnn.py` do not enable this logging.
 
 ## Analysis figures
 
@@ -363,7 +368,7 @@ needed. These plots support deep MPN (`dmpn`) checkpoints.
 Optional overrides and separate analyses:
 
 ```bash
-python notebooks/visualize_trained_networks.py --run-dir checkpoints/dmpn_contextdelaydm1_a1b2c3d4e5f6 --trials 2000
+python notebooks/visualize_trained_networks.py --run-dir checkpoints/dmpn_contextdelaydm1_20261005_135103_a1b2c3d4e5f6 --trials 2000
 python notebooks/visualize_trained_networks.py --analysis weights --seed 37
 python notebooks/visualize_trained_networks.py --analysis performance --ckpt-stem "$CKPT_STEM"
 python notebooks/compare_mpn_rnn_performance.py --mpn-file "$MPN_NPZ" --rnn-file "$RNN_NPZ"

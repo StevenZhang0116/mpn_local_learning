@@ -86,13 +86,16 @@ Run from this directory:
     python train_mpn.py --net dmpn --hidden 150 100   # deep MP stack (two MP layers)
 
 The MP-layer stack depth follows --hidden: one width → one MP layer; several
-widths → one MP layer per width (a deep stack, dmpn only). Outputs use a short
-<model>_<task>_<unique-id> name. Checkpoints live under
-checkpoints/<run-id>/seed<N>/<rule>.pt, with the full setup in config.json in
-the run folder and in each checkpoint. Architecture is also in figure titles
-and plot-data metadata. Separate CLI invocations get different IDs.
+widths → one MP layer per width (a deep stack, dmpn only). Every output of one
+invocation shares ONE run ID, <model>_<task>_<YYYYMMDD_HHMMSS>_<hash12>:
+checkpoints/<run-id>/seed<N>/<rule>.pt (plus config.json in the run folder),
+figure/<run-id>.png, figure_data/<run-id>.npz and log/<run-id>.log. The
+timestamp is the ID's creation time (so names sort chronologically) and the hash
+keeps invocations distinct even within the same second. Architecture is also in
+figure titles and plot-data metadata.
 """
 import argparse
+from datetime import datetime
 import json
 import uuid
 import torch
@@ -102,7 +105,7 @@ import _bootstrap  # prepends ../core + ../scripts to sys.path; exposes ROOT
 import mpn         # core/mpn.py — the efficiency-optimized implementation
 import tasks
 import train_common as tc
-from run_logging import tee_output
+from run_logging import tee_output, rename_active_log
 
 # ─── Configuration (aligned with MultiTaskMPN/one_task/one_task.py) ───────────
 SEED = np.random.randint(0, 1000)  # starting seed; subsequent runs increment it
@@ -478,6 +481,16 @@ def _arch_desc():
     return f"arch={arch}"
 
 
+def new_run_id(net_type, ruleset, now=None):
+    """The run ID every output of an invocation shares — checkpoints/<id>/,
+    figure/<id>.png, figure_data/<id>.npz, log/<id>.log (see train_common.run_stem
+    and run_logging.rename_active_log): <model>_<task>_<YYYYMMDD_HHMMSS>_<hash12>.
+    The timestamp (creation time of the ID) makes listings sort chronologically;
+    the random hash keeps simultaneous or repeated invocations distinct."""
+    stamp = (now or datetime.now()).strftime("%Y%m%d_%H%M%S")
+    return f"{net_type}_{ruleset}_{stamp}_{uuid.uuid4().hex[:12]}"
+
+
 def _cfg():
     """Package the current module globals + MPN-specific hooks into a RunConfig.
     Built fresh on each call so notebooks/validate/--net can override globals
@@ -491,7 +504,7 @@ def _cfg():
         INPUT_NORM_SAMPLE, str(DEVICE), str(DTYPE), DFA_PRESET,
     ]), sort_keys=True)
     if signature not in _RUN_IDS:
-        _RUN_IDS[signature] = f"{NET_TYPE}_{RULESET}_{uuid.uuid4().hex[:12]}"
+        _RUN_IDS[signature] = new_run_id(NET_TYPE, RULESET)
     return tc.RunConfig(
         run_id=_RUN_IDS[signature],
         dfa_preset=DFA_PRESET,
@@ -868,7 +881,11 @@ def main():
     WANDB_PROJECT = args.wandb_project
     WANDB_ENTITY = args.wandb_entity
     WANDB_MODE = args.wandb_mode
-    tc.run_experiment(_cfg())
+    cfg = _cfg()
+    # Give the console log the run ID shared by the figure / .npz / checkpoint
+    # folder (log/<run-id>.log); a no-op when no tee is active (tests, imports).
+    rename_active_log(tc.run_stem(cfg))
+    tc.run_experiment(cfg)
 
 
 if __name__ == "__main__":
