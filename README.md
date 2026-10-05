@@ -219,7 +219,28 @@ signal. They changed in October 2026; old runs used the previous column:
 | `--cross-layer-steps` | `1` | `0` |
 | `--grad-align` | on | on (unchanged) |
 
-Supported combinations for `dmpn` runs with local rules:
+`--local-bias-mode match` selects the MP bias update separately for each rule:
+
+| Rule | Effective bias update under `match` |
+|---|---|
+| `local_direct` | direct, instantaneous |
+| `local_diag_rflo` | direct, no bias trace |
+| `local_exact_rowlocal` | exact row-local bias trace |
+| `bptt` | full autograd gradient (no local bias trace) |
+
+The default remains `direct`. Explicit `exact` or `direct` still applies to both
+trace-based local rules; `local_direct` and BPTT always keep their native bias
+updates. `match` only changes MP bias eligibility, independently of the learning
+signal and input mode. In particular, `--input-mode match` still uses three-factor
+embedding updates for every local rule: matching the bias does not make a local
+network a full-BPTT baseline. For the four-rule comparison, use
+`--rules local_direct local_diag_rflo local_exact_rowlocal bptt --local-bias-mode match`.
+The requested policy stays in checkpoint/config `net_params`, while checkpoints
+also record `resolved_local_bias_modes` (one value per MP layer); the console's
+per-rule summary prints the effective bias mode. Resolution happens again when
+switching rules or directly calling another rule's gradient method.
+
+Supported signal/input combinations for `dmpn` runs with local rules:
 
 | Signal | Allowed `--input-mode` | `--cross-layer-steps` |
 |---|---|---|
