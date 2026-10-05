@@ -49,11 +49,11 @@ class TestSignalModeCLI(unittest.TestCase):
                          ('exact_spatial', 'global', 'exact_spatial'))
         self.assertEqual(base.rules, ['bptt', 'local_direct', 'local_diag_rflo'])
         self.assertEqual((base.input_mode, base.local_bias_mode, base.cross_layer_steps,
-                          base.grad_align), ('match', 'direct', 0, True))
+                          base.grad_align), ('match', 'match', 0, True))
         # The module globals the tests/notebooks patch agree with the parsed defaults.
         self.assertEqual((train_mpn.INPUT_MODE, train_mpn.LOCAL_BIAS_MODE,
                           train_mpn.CROSS_LAYER_STEPS, train_mpn.LOG_GRAD_ALIGN),
-                         ('match', 'direct', 0, True))
+                         ('match', 'match', 0, True))
         self.assertEqual(train_mpn.RULES_TO_RUN, ['bptt', 'local_direct', 'local_diag_rflo'])
         self.assertEqual((train_mpn.LEARNING_SIGNAL, train_mpn.FEEDBACK_MODE),
                          ('global', 'exact_spatial'))

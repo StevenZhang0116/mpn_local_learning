@@ -59,14 +59,15 @@ from net_helpers import rand_weight_init, get_activation_function
 def resolve_local_bias_mode(local_bias_mode, learning_rule):
     """Resolve MP bias eligibility for a rule without changing the requested policy.
 
-    BPTT always differentiates biases with autograd; local_direct always uses the
-    instantaneous factor. match selects direct for diagonal RFLO and exact for
+    BPTT always differentiates biases with autograd and is reported as 'autograd'
+    (never 'exact', which names the row-local Q TRACE); local_direct always uses
+    the instantaneous factor. match selects direct for diagonal RFLO and exact for
     row-local. Explicit exact/direct retain their historical local-rule behavior.
     """
     if local_bias_mode not in ('exact', 'direct', 'match'):
         raise ValueError("local_bias_mode must be 'exact', 'direct', or 'match'")
     if learning_rule == 'bptt':
-        return 'exact'
+        return 'autograd'
     if learning_rule == 'local_direct':
         return 'direct'
     if learning_rule not in ('local_diag_rflo', 'local_exact_rowlocal'):
@@ -1143,10 +1144,8 @@ class MultiPlasticNetBase(BaseNetwork):
 
     @property
     def resolved_local_bias_modes(self):
-        """Effective bias rule per MP layer, recomputed after cloning/rule changes.
-
-        'exact' under BPTT means autograd, not a row-local Q trace.
-        """
+        """Effective bias rule per MP layer, recomputed after cloning/rule changes:
+        'direct' (phi' only), 'exact' (row-local Q trace) or 'autograd' (bptt)."""
         return [resolve_local_bias_mode(layer.local_bias_mode, self.learning_rule)
                 for layer in self.mp_layers]
 

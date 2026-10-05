@@ -148,13 +148,14 @@ DFA_PRESET = False             # records whether the CLI --dfa preset was select
 # embedding gradient) to 'match', so bptt is full BPTT and local runs are fully local.
 INPUT_MODE = "match"
 # MP bias eligibility for the row-local / diagonal rules ('direct' = phi' only, no
-# bias trace; 'exact' = the row-local bias trace). local_direct always uses direct.
-# Default changed 2026-10 from 'exact' to 'direct' (the controlled comparison the
-# --dfa preset already used); pass --local-bias-mode exact for the row-local rule's
-# top-layer bias exactness or the manuscript's row-local bias variant.
-# 'match' selects direct for diagonal RFLO and exact for row-local; local_direct
-# always stays direct and bptt always uses autograd. Default remains unchanged.
-LOCAL_BIAS_MODE = "direct"
+# bias trace; 'exact' = the row-local bias trace; 'match' = each rule's own level of
+# locality: direct for diagonal RFLO, exact for row-local). local_direct always
+# uses direct and bptt always uses autograd. Default 'match' (changed 2026-10 from
+# 'exact' via 'direct'): identical to 'direct' for the default rule set, and the
+# row-local rule keeps its bias trace whenever it is added. Pass an explicit
+# 'direct' or 'exact' when every trace-based rule must share ONE bias policy (the
+# --dfa preset selects direct).
+LOCAL_BIAS_MODE = "match"
 RFLO_TRACE_RHO = None  # optional cap on the MP-weight diagonal trace recurrence gain
 LAM = None  # optional fixed modulation decay; None retains dt / m_time_scale setup
 LOG_GRAD_ALIGN = True  # --dfa disables the optional BPTT diagnostic by default

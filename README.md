@@ -215,7 +215,7 @@ signal. They changed in October 2026; old runs used the previous column:
 |---|---|---|
 | `--rules` | `bptt local_exact_rowlocal local_diag_rflo local_direct` | `bptt local_direct local_diag_rflo` |
 | `--input-mode` | `exact` (local runs spliced a BPTT embedding gradient: a hybrid) | `match` (bptt = full BPTT, local runs fully local) |
-| `--local-bias-mode` | `exact` | `direct` (pass `exact` for the row-local rule's top-layer bias exactness) |
+| `--local-bias-mode` | `exact` | `match` (each rule's own bias update: direct for diagonal RFLO, exact for row-local; pass `direct` or `exact` to force one shared policy) |
 | `--cross-layer-steps` | `1` | `0` |
 | `--grad-align` | on | on (unchanged) |
 
@@ -228,16 +228,19 @@ signal. They changed in October 2026; old runs used the previous column:
 | `local_exact_rowlocal` | exact row-local bias trace |
 | `bptt` | full autograd gradient (no local bias trace) |
 
-The default remains `direct`. Explicit `exact` or `direct` still applies to both
-trace-based local rules; `local_direct` and BPTT always keep their native bias
-updates. `match` only changes MP bias eligibility, independently of the learning
+`match` is the default: for the default rule set it is identical to `direct`
+(diagonal RFLO resolves to direct), and the row-local rule keeps its bias trace
+whenever it is added. Explicit `exact` or `direct` applies one shared policy to both
+trace-based local rules (the `--dfa` preset selects `direct`); `local_direct` and BPTT
+always keep their native bias updates. `match` only changes MP bias eligibility, independently of the learning
 signal and input mode. In particular, `--input-mode match` still uses three-factor
 embedding updates for every local rule: matching the bias does not make a local
 network a full-BPTT baseline. For the four-rule comparison, use
 `--rules local_direct local_diag_rflo local_exact_rowlocal bptt --local-bias-mode match`.
 The requested policy stays in checkpoint/config `net_params`, while checkpoints
-also record `resolved_local_bias_modes` (one value per MP layer); the console's
-per-rule summary prints the effective bias mode. Resolution happens again when
+also record `resolved_local_bias_modes` (one value per MP layer: `direct`, `exact`,
+or `autograd` for BPTT); the console's per-rule summary prints the effective bias
+mode. Resolution happens again when
 switching rules or directly calling another rule's gradient method.
 
 Supported signal/input combinations for `dmpn` runs with local rules:

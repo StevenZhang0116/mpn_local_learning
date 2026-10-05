@@ -24,8 +24,12 @@ from test_local_readouts import (
 )
 
 
+# Resolved label per rule under 'match' ('autograd' is a resolved label for bptt,
+# never a requestable policy) and the explicit REQUESTED policy that reproduces
+# each rule's match behavior (bptt ignores the bias policy, so any valid one).
 MODES = {'local_direct': 'direct', 'local_diag_rflo': 'direct',
-         'local_exact_rowlocal': 'exact', 'bptt': 'exact'}
+         'local_exact_rowlocal': 'exact', 'bptt': 'autograd'}
+REQUESTED = {rule: ('direct' if mode == 'autograd' else mode) for rule, mode in MODES.items()}
 
 
 class TestLocalBiasMatch(unittest.TestCase):
@@ -42,8 +46,9 @@ class TestLocalBiasMatch(unittest.TestCase):
         self.assertEqual(args.local_bias_mode, 'match')
         self.assertEqual(args.input_mode, 'match')
         self.assertFalse(args.residual)
-        self.assertEqual(tm._parse_args([]).local_bias_mode, 'direct')
+        self.assertEqual(tm._parse_args([]).local_bias_mode, 'match')
         self.assertEqual(tm._parse_args(['--dfa']).local_bias_mode, 'direct')
+        self.assertEqual(tm._parse_args(['--local-bias-mode', 'direct']).local_bias_mode, 'direct')
         self.assertEqual(tm._parse_args(['--dfa', '--local-bias-mode', 'match']).local_bias_mode,
                          'match')
         for rule, mode in MODES.items():
@@ -60,7 +65,8 @@ class TestLocalBiasMatch(unittest.TestCase):
             for rule, explicit in MODES.items():
                 with self.subTest(signal=signal, feedback=feedback, rule=rule):
                     net = make_net(make_cfg(signal=signal, feedback=feedback, rule=rule, bias='match'))
-                    ref = make_net(make_cfg(signal=signal, feedback=feedback, rule=rule, bias=explicit))
+                    ref = make_net(make_cfg(signal=signal, feedback=feedback, rule=rule,
+                                            bias=REQUESTED[rule]))
                     kw = {} if rule == 'bptt' else {'update_masks': um}
                     actual = net.sequence_gradients(x, y, mask, **kw)
                     expected = ref.sequence_gradients(x, y, mask, **kw)
@@ -81,7 +87,7 @@ class TestLocalBiasMatch(unittest.TestCase):
         # particular, diag must not accidentally allocate the row-local bias Q.
         for rule in ('local_exact_rowlocal', 'local_diag_rflo', 'local_direct',
                      'local_exact_rowlocal', 'local_diag_rflo'):
-            ref = make_net(make_cfg(rule=rule, signal='local_readout', bias=MODES[rule]))
+            ref = make_net(make_cfg(rule=rule, signal='local_readout', bias=REQUESTED[rule]))
             self.assert_grads_equal(getattr(net, methods[rule])(x, y, mask),
                                     getattr(ref, methods[rule])(x, y, mask))
             self.assertEqual(net.learning_rule, 'bptt')
@@ -90,7 +96,7 @@ class TestLocalBiasMatch(unittest.TestCase):
         for rule in (*MODES, 'local_exact_rowlocal', 'local_diag_rflo'):
             net.learning_rule = rule
             clone = copy.deepcopy(net)
-            ref = make_net(make_cfg(rule=rule, signal='local_readout', bias=MODES[rule]))
+            ref = make_net(make_cfg(rule=rule, signal='local_readout', bias=REQUESTED[rule]))
             self.assert_grads_equal(clone.sequence_gradients(x, y, mask),
                                     ref.sequence_gradients(x, y, mask))
             self.assertEqual(clone.resolved_local_bias_modes, [MODES[rule]] * 3)
@@ -126,7 +132,7 @@ class TestLocalBiasMatch(unittest.TestCase):
             net = copy.deepcopy(initial)
             net.learning_rule = rule
             ref = copy.deepcopy(net)
-            ref.mp_layer.local_bias_mode = mode
+            ref.mp_layer.local_bias_mode = REQUESTED[rule]
             actual = net.sequence_gradients(x, y, mask)
             self.assert_grads_equal(actual, ref.sequence_gradients(x, y, mask))
             self.assertEqual(net.resolved_local_bias_modes, [mode])
