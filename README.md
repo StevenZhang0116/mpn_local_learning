@@ -94,6 +94,23 @@ Reducing batch size changes samples per optimizer step, not sequence length or
 the BPTT gradient definition. At batch 16, 5000 steps sample 80,000 images per
 rule/seed, versus 640,000 at batch 128 (sampling is with replacement).
 
+To scale residual MP branches, add `--residual --residual-scale 0.5`.
+Each equal-width block then computes `h_out = h_in + 0.5 * a`, where `a = tanh(z)`.
+The fixed, nonnegative scale defaults to `1.0`; the identity path has unit gain.
+Unequal-width blocks keep `h_out = a` and the existing disabled-skip warning.
+Non-default scales require residuals to be enabled. Scale `0` is supported as an
+identity-limit diagnostic, not a suggested training setting.
+
+The Hebbian write uses raw `a`, not the scaled residual increment. Local MP weight
+and bias gradients receive the branch-scaled learning signal, while the raw
+eligibility-trace recurrences stay unchanged. Spatial Jacobians, input traces,
+and the optional one-hop cross-layer correction include the corresponding branch
+gain. BPTT differentiates the same forward dynamics exactly. Heads still read
+`h_out`; their gradients are not separately scaled. This forward hyperparameter
+applies to every learning rule and is distinct from `--local-signal-alpha`
+(mixed learning signals). Checkpoints, JSON/NPZ metadata, W&B and plot labels
+record it; old checkpoints without the field use `1.0`.
+
 Each run writes a two-panel (train / test accuracy) figure to `figure/`, the arrays
 behind it to `figure_data/`, (MPN) trained nets to `checkpoints/`, and the console
 output to `log/`. All four share one run ID, `<model>_<task>_<YYYYMMDD_HHMMSS>_<hash>`

@@ -20,14 +20,14 @@ import mpn
 
 
 def make_net(rule='local_exact_rowlocal', bias='exact', residual=False, kinds=None,
-             bounded=False, smooth_scale=None):
+             bounded=False, smooth_scale=None, residual_scale=1.0):
     np.random.seed(37)
     torch.manual_seed(37)
     cfg = dict(n_neurons=[2, 3, 3, 4, 2], dt=1, activation='tanh',
                output_matrix='', output_bias=True, input_layer_add=True,
                input_layer_add_trainable=True, input_layer_bias=True, linear_embed=3,
                learning_rule=rule, feedback_mode='direct_fa', input_mode='match',
-               cross_layer_steps=0, mp_residual=residual,
+               cross_layer_steps=0, mp_residual=residual, residual_scale=residual_scale,
                ml_params=dict(bias=True, mp_type='mult', m_update_type='hebb_assoc',
                               m_activation='linear' if smooth_scale is None else 'scaled_tanh',
                               m_scale=1.0 if smooth_scale is None else smooth_scale,
@@ -84,7 +84,7 @@ def independent_forward(net, x, um):
             olds[n].append(M[n].clone())
             a = torch.tanh((layer.W * (1 + M[n]) * h[:, None]).sum(-1) + layer.b)
             M[n] = write(layer, M[n], h, a, um[:, t])
-            h = a + h if net._residual_at[n] else a
+            h = net.residual_scale * a + h if net._residual_at[n] else a
         top.append(h)
         out.append(torch.nn.functional.linear(h, net.W_output, net.b_output))
     return torch.stack(out, 1), inputs, olds, torch.stack(top, 1)
@@ -101,6 +101,8 @@ def oracle(net, x, y, mask, um, diag):
               'b_output': go.sum((0, 1))}
     for n, layer in enumerate(net.mp_layers):
         ell = go @ getattr(net, net._B_direct_names[n+1])
+        if net._residual_at[n]:
+            ell = net.residual_scale * ell
         suffix = '' if n == 0 else str(n)
         if not diag:
             W = layer.W.detach().clone().requires_grad_()

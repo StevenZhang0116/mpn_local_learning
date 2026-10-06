@@ -28,12 +28,13 @@ from test_dfa import write   # the defining masked plastic-state recurrence
 # ─── Fixtures ─────────────────────────────────────────────────────────────────
 def make_cfg(widths=(4, 4, 4), signal='global', rule='local_direct', residual=True,
              input_mode='match', cross=0, feedback='exact_spatial', output_bias=True,
-             bias='exact', alpha=1.0, head_seed=None, include_signal_key=True):
+             bias='exact', alpha=1.0, head_seed=None, include_signal_key=True,
+             residual_scale=1.0):
     cfg = dict(net_type='dmpn', n_neurons=[3, *widths, 2], dt=1, activation='tanh', output_matrix='',
                output_bias=output_bias, input_layer_add=True, input_layer_add_trainable=True,
                input_layer_bias=True, linear_embed=widths[0], learning_rule=rule,
                feedback_mode=feedback, input_mode=input_mode, cross_layer_steps=cross,
-               mp_residual=residual, local_signal_alpha=alpha,
+               mp_residual=residual, residual_scale=residual_scale, local_signal_alpha=alpha,
                ml_params=dict(bias=True, mp_type='mult', m_update_type='hebb_assoc',
                               m_activation='linear', m_scale=1.0, modulation_bounds=True,
                               m_bounds=(-1.0, 1.0), eta_type='scalar', eta_train=False,
@@ -96,7 +97,7 @@ def independent_forward(net, x, um=None):
             a = torch.tanh((layer.W * (1 + M[n]) * h[-1][:, None]).sum(-1) + layer.b)
             active = torch.ones(B, dtype=x.dtype) if um is None else um[:, t]
             M[n] = write(layer, M[n], h[-1], a, active)
-            h.append(a + h[-1] if net._residual_at[n] else a)
+            h.append(net.residual_scale * a + h[-1] if net._residual_at[n] else a)
         streams.append(h)
         outs.append(F.linear(h[-1], net.W_output, net.b_output))
         for k, (w_name, b_name) in enumerate(net._head_names):
@@ -126,10 +127,10 @@ def head_oracle(net, streams, y, mask, loss_and_grad):
 
 
 def layer_oracle(net, n, ell_seq, streams, um):
-    """Exact gradient of sum_t <ell_t, a_t> for the ISOLATED layer-n trajectory
+    """Exact gradient of sum_t <ell_t, h_out_t> for the ISOLATED layer-n trajectory
     (inputs h[n]_t fixed), differentiating through the layer's own plastic state.
     ell_seq is the signal at the layer's OUTPUT boundary h[n+1] (its residual input
-    h[n] does not depend on W_n, so the objective is on the block activation a)."""
+    h[n] does not depend on W_n; only the scaled branch contributes to its gradient)."""
     layer = net.mp_layers[n]
     B, T = ell_seq.shape[:2]
     W = layer.W.detach().clone().requires_grad_()
@@ -139,7 +140,8 @@ def layer_oracle(net, n, ell_seq, streams, um):
     for t in range(T):
         x_t = streams[t][n]
         a = torch.tanh((W * (1 + M) * x_t[:, None]).sum(-1) + b)
-        objective = objective + (ell_seq[:, t] * a).sum()
+        h_out = x_t + net.residual_scale * a if net._residual_at[n] else a
+        objective = objective + (ell_seq[:, t] * h_out).sum()
         active = torch.ones(B, dtype=x_t.dtype) if um is None else um[:, t]
         M = write(layer, M, x_t, a, active)
     return torch.autograd.grad(objective, (W, b))
@@ -156,7 +158,7 @@ def embed_oracle(net, ell1_seq, x, streams, M_prev):
     for t in range(x.shape[1]):
         emb = torch.tanh(F.linear(x[:, t], U, b_in))
         a = torch.tanh((layer.W * (1 + M_prev[t][0]) * emb[:, None]).sum(-1) + layer.b)
-        h1 = a + emb if net._residual_at[0] else a
+        h1 = net.residual_scale * a + emb if net._residual_at[0] else a
         objective = objective + (ell1_seq[:, t] * h1).sum()
     return torch.autograd.grad(objective, (U, b_in))
 

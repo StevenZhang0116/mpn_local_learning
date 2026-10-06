@@ -1958,12 +1958,11 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
         # When mp_residual is on, each MP layer whose input/output widths MATCH runs
         # a parameter-free IDENTITY residual on the stream:
         #     a_n     = act_fn(z_n)     # BLOCK activation → drives the M-update + phi'
-        #     h_{n+1} = a_n + h_n       # residual STREAM → input to next layer/readout
-        # This is a same-time, memoryless, parameter-free op, so it leaves the
-        # eligibility machinery and BPTT untouched and stays fully local: the Hebbian
-        # write still uses the block activation a_n (recovered as h_{n+1}-h_n wherever a
-        # skip is active), and the inter-layer learning signal gains the residual's
-        # identity Jacobian term (+ell_h[n+1]) in _same_time_boundary_signals. A skip
+        #     h_{n+1} = h_n + residual_scale * a_n  # stream → next layer/readout
+        # The fixed branch gain multiplies parameter sensitivities and the branch
+        # part of spatial Jacobians, never the identity path or the raw Hebbian post.
+        # P/A/Q track raw block sensitivities, so their recurrences are unchanged.
+        # Raw a_n is retained explicitly (also valid at scale=0). A skip
         # is inserted ONLY where d_in==d_out (an identity map needs equal widths);
         # unequal-width layers are skipped WITH A WARNING (a projection skip would need
         # its own gradient rule — an extension). No state is registered (identity adds
@@ -1971,6 +1970,11 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
         # by default → _residual_at is all-False and every path is byte-for-byte the
         # non-residual net.
         self.mp_residual = cfg.get('mp_residual', False)
+        self.residual_scale = float(cfg.get('residual_scale', 1.0))
+        if not math.isfinite(self.residual_scale) or self.residual_scale < 0:
+            raise ValueError('residual_scale must be finite and nonnegative')
+        if not self.mp_residual and self.residual_scale != 1.0:
+            raise ValueError('non-default residual_scale requires mp_residual=True')
         self._residual_at = []
         for n, mp in enumerate(self.mp_layers):
             ok = self.mp_residual and (mp.n_input == mp.n_output)
@@ -1978,6 +1982,9 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
                 print(f'  [mp_residual] skip DISABLED at MP layer {n}: width '
                       f'{mp.n_input}->{mp.n_output} (identity residual needs equal widths).')
             self._residual_at.append(ok)
+        # Non-residual blocks keep their ordinary, unscaled activation.
+        self._branch_scales = tuple(self.residual_scale if active else 1.0
+                                    for active in self._residual_at)
 
         # ── Local readout heads (opt-in; learning_signal != 'global') ────────
         # One auxiliary linear readout per NON-TOP MP layer n = 0..L-2, reading that
@@ -2024,9 +2031,19 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
                 np.random.set_state(np_state)
 
 
+    def _combine_mp_branch(self, n, inputs, activation):
+        """Keep the identity path at unit gain; scale only enabled MP branches."""
+        if self._residual_at[n]:
+            return inputs + self._branch_scales[n] * activation
+        return activation
+
     def forward(self, inputs, run_mode='minimal', verbose=False):
-        """
-        """
+        """Public forward API; raw block activities are internal to the M write."""
+        output, activities, db, _ = self._forward_stack(inputs, run_mode, verbose)
+        return output, activities, db
+
+    def _forward_stack(self, inputs, run_mode='minimal', verbose=False):
+        """Forward with raw block activities, retaining their autograd graph."""
         # 2025-11-19: the x_t in the MPN paper is the "input to MPN layer"
         # namely after the MLP 
         if self.input_layer_active:
@@ -2038,6 +2055,7 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
         layer_input = x  # read-only downstream (never mutated in-place) → no clone
 
         mpl_activities = [x,] # Used for updating the M matrices
+        block_activities = []
 
         db = {} if run_mode in ('track_states',) else None
 
@@ -2047,11 +2065,10 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
             layer_input_old = layer_input
             hidden_pre, db_mp = mp_layer(layer_input, run_mode=run_mode)
 
-            # Block activation a_n; the residual STREAM h[n+1] = a_n + h[n] where the
-            # skip is active (identity, equal widths). mpl_activities stores the STREAM
-            # (network_step recovers a_n = h[n+1]-h[n] for the Hebbian write).
+            # Keep raw a_n for the Hebbian write; mpl_activities stores the stream.
             a_n = self.act_fn(hidden_pre)
-            layer_input = a_n + layer_input_old if self._residual_at[mpl_idx] else a_n
+            block_activities.append(a_n)
+            layer_input = self._combine_mp_branch(mpl_idx, layer_input_old, a_n)
 
             if run_mode in ('debug',):
                 print(f'  MP Layer {mpl_idx} forward.')
@@ -2072,7 +2089,7 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
 
         output = F.linear(layer_input, self.W_output, self.b_output)
         
-        return output, mpl_activities, db
+        return output, mpl_activities, db, block_activities
 
     def network_step(self, current_input, run_mode='minimal', verbose=False, seq_idx=None):
         """
@@ -2087,7 +2104,8 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
             print(f' Network step:')
 
         # current_input is per-time input, so has shape (batch_size, input_size)
-        output, mpl_activities, db = self.forward(current_input, run_mode=run_mode, verbose=verbose)
+        output, mpl_activities, db, block_activities = self._forward_stack(
+            current_input, run_mode=run_mode, verbose=verbose)
 
         # M updated internally when this is called
         for mpl_idx, mp_layer in enumerate(self.mp_layers):
@@ -2100,14 +2118,10 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
                     torch.mean(torch.abs(mp_layer.M.detach())), torch.max(torch.abs(mp_layer.M.detach()))
                 ))
 
-            # mpl_activities holds the residual STREAM; the Hebbian write uses the
-            # BLOCK activation a_n = stream_{n+1} - stream_n wherever a skip is active
-            # (identity residual → a_n is exactly that difference). pre is the stream
-            # h[n] the layer consumed.
+            # The write uses raw a_n, not the scaled residual increment. Retaining
+            # it explicitly avoids cancellation and division by a possibly zero gain.
             pre = mpl_activities[mpl_idx]
-            post = mpl_activities[mpl_idx + 1]
-            if self._residual_at[mpl_idx]:
-                post = post - pre
+            post = block_activities[mpl_idx]
             _ = mp_layer.update_M_matrix(pre, post)
 
         return output, mpl_activities, db
@@ -2161,8 +2175,9 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
         C[i,j,k] = phi0'[i] W0[i,j] ((1+M0[i,j]) D[j,k] + x[j] trace[i,j,k])
         raw_trace = lam*trace + eta*(post[i]*D[j,k] + x[j]*C[i,j,k])
 
-        C is the first MP block activation's sensitivity; its residual identity
-        path contributes D only to the gradient, not the Hebbian post write.
+        C is the raw first MP block activation's sensitivity. Its branch scale
+        multiplies C only in the gradient; the identity adds D there. Neither
+        scaling nor the identity path enters the Hebbian post sensitivity C.
         For hebb_pre, replace post by its constant and omit the x*C term.
         The caller finalizes raw_trace AFTER M0's write using its actual gate.
         Storage is O(batch * first_MP_width * embed_width * feature_count).
@@ -2172,7 +2187,7 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
         eligibility = (phi_prime[:, :, None, None] * layer.W[None, :, :, None]
                        * ((1.0 + layer.M).unsqueeze(-1) * direct.unsqueeze(1)
                           + x[:, None, :, None] * trace))
-        gradient = torch.einsum('bi,bijk->jk', signal, eligibility)
+        gradient = torch.einsum('bi,bijk->jk', self._branch_scales[0] * signal, eligibility)
         if self._residual_at[0]:
             gradient = gradient + torch.einsum('bj,bjk->jk', signal, direct)
         raw_trace = lam[None, :, :, None] * trace
@@ -2207,7 +2222,7 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
     # every layer's MODULATED weights W_eff = W ⊙ (1 + M_{t-1}). Both read the
     # frozen M_{t-1}, so they must run before any layer advances its M.
 
-    def _forward_local_stack(self, u_t):
+    def _forward_local_stack(self, u_t, *, return_blocks=False):
         """Forward one time step through the whole stack WITHOUT updating any M.
 
         Returns (output, h, z, phi_p, embed_pre) with the zero-based indexing the
@@ -2218,6 +2233,7 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
             h[n+1]    output of MP layer n                  (B, d_{n+1})
             output    readout(h[L])
         embed_pre is the embedding PRE-activation (for the embedding grad) or None.
+        With return_blocks=True, append the raw block activations for M writes.
         Every mp(...) call consumes that layer's own M_{t-1}; nothing is advanced.
         """
         if self.input_layer_active:
@@ -2230,19 +2246,20 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
         h = [h0]
         z = []
         phi_p = []
+        blocks = []
         for n, mp in enumerate(self.mp_layers):
             z_n, _ = mp(h[-1])              # uses this layer's M_{t-1}
             phi_p.append(self.act_fn_p(z_n))
             z.append(z_n)
-            # Block activation a_n; residual STREAM h[n+1] = a_n + h[n] where the skip
-            # is active. h[n] (the layer input) is W^{(n)}-independent, so the extra
-            # term leaves the eligibility recursion unchanged; the M-update recovers
-            # a_n as h[n+1]-h[n]. phi_p[n]=phi'(z_n) is untouched by the skip.
+            # phi_p and blocks refer to raw a_n; only the output stream is scaled.
+            # Own-layer eligibility recurrences continue to describe raw a_n.
             a_n = self.act_fn(z_n)
-            h.append(a_n + h[-1] if self._residual_at[n] else a_n)
+            blocks.append(a_n)
+            h.append(self._combine_mp_branch(n, h[-1], a_n))
 
         output = F.linear(h[-1], self.W_output, self.b_output)
-        return output, h, z, phi_p, embed_pre
+        result = (output, h, z, phi_p, embed_pre)
+        return (*result, blocks) if return_blocks else result
 
     def _same_time_boundary_signals(self, grad_output, phi_p, need_input_signal,
                                     head_errors=None):
@@ -2261,7 +2278,9 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
         embedding belongs to module 0 and follows module 0's signal.
 
         ell_h[n] is the surrogate dL/dh[n] (the signal at the INPUT boundary of MP
-        layer n). How it is formed depends on self.feedback_mode (see _FEEDBACK_MODES):
+        layer n). The equations below show non-residual blocks; enabled skips
+        scale the branch term and add the identity term as described below.
+        The feedback pathway is selected by self.feedback_mode (see _FEEDBACK_MODES):
 
           exact_spatial — exact same-time spatial gradient:
             ell_h[L] = grad_output @ W_output
@@ -2277,12 +2296,13 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
 
         For exact_spatial / layerwise_fa the recursion drops temporal paths through
         the plastic state of upper layers but keeps the same-time spatial structure.
-        Layer n's eligibility routine is fed ell_h[n+1] (its OUTPUT-boundary signal)
-        — NOT premultiplied by phi'.
+        Layer n's eligibility routine is fed branch_scale[n] * ell_h[n+1]
+        (the signal to raw a_n), never premultiplied by phi'. The P/A/Q recurrences
+        still use raw phi' and raw block sensitivities.
 
-        IDENTITY SKIP: where _residual_at[n] is set, the forward is h[n+1]=a_n+h[n],
-        so the same-time Jacobian dh[n+1]/dh[n] = I + phi'(z[n])·W_eff^{(n)}. The
-        weight-path term is the usual backprojection; the identity term ADDS ell_h[n+1]
+        IDENTITY SKIP: h[n+1]=h[n]+alpha*a_n gives the same-time Jacobian
+        dh[n+1]/dh[n] = I + alpha*phi'(z[n])·W_eff^{(n)}. Only the
+        weight-path term is scaled; the identity term ADDS ell_h[n+1]
         straight through (dimensionally safe because a skip requires equal widths). So
         ell_h[n] becomes (weight-path backprojection) + ell_h[n+1]. This makes ell_h[n]
         the exact same-time spatial gradient of the RESIDUAL net actually being run.
@@ -2317,12 +2337,12 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
         pure_local = head_errors is not None and self.learning_signal == 'local_readout'
         if not pure_local:
             for n in range(L - 1, 0, -1):
-                delta_n = ell_h[n + 1] * phi_p[n]
+                delta_n = self._branch_scales[n] * ell_h[n + 1] * phi_p[n]
                 if layerwise:
                     ell_h[n] = delta_n @ getattr(self, self._B_inter_names[n])
                 else:
                     ell_h[n] = self.mp_layers[n].backproject_through_modulated_weights_fast(delta_n)
-                # Identity-skip Jacobian term: h[n+1]=a_n+h[n] adds ell_h[n+1] straight
+                # Identity-skip Jacobian term adds ell_h[n+1] straight
                 # through (equal widths guaranteed by _residual_at[n]).
                 if self._residual_at[n]:
                     ell_h[n] = ell_h[n] + ell_h[n + 1]
@@ -2334,12 +2354,12 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
                 local_n = head_errors[n] @ getattr(self, w_name)
                 ell_h[n + 1] = local_n if pure_local else ell_h[n + 1] + self.local_signal_alpha * local_n
         if need_input_signal:
-            delta_0 = ell_h[1] * phi_p[0]
+            delta_0 = self._branch_scales[0] * ell_h[1] * phi_p[0]
             if layerwise:
                 ell_h[0] = delta_0 @ getattr(self, self._B_inter_names[0])
             else:
                 ell_h[0] = self.mp_layers[0].backproject_through_modulated_weights_fast(delta_0)
-            # Embedding→layer-0 identity skip (h[1]=a_0+h[0]) → add ell_h[1] through.
+            # Embedding→layer-0 identity skip → add ell_h[1] through unscaled.
             if self._residual_at[0]:
                 ell_h[0] = ell_h[0] + ell_h[1]
 
@@ -2359,20 +2379,22 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
 
         Derivation (verified to machine precision by the T=2 oracle). Layer q-1's
         weight/bias reaches L_t one temporal hop earlier through the M-write of EVERY
-        upper layer m≥q at step t-1: {W,b}[q-1] → h_stream[q]_{t-1} (= prev_E[q-1] for
-        the weight, prev_R[q-1] for the bias) → M[m]_{t-1} → z[m]_t → … → L_t. The
+        upper layer m≥q at step t-1: {W,b}[q-1] → h_stream[q]_{t-1} (sensitivity
+        branch_scale[q-1] * prev_E/prev_R[q-1]) → M[m]_{t-1} → z[m]_t → … → L_t. The
         write M[m]_{ki}=η a[m]_k h[m]_i depends on {W,b}[q-1] through BOTH factors:
           PRE  (∂/∂ the pre h[m]_i):  a[m]_{k,t-1} carried as prev_ablock[m];
           POST (∂/∂ the post a[m]_k): a[m]_{k,t-1} itself depends on h_stream[m]_{t-1},
                backprojected through W_eff[m]_{t-1} (= prev_Weff[m] = W(1+M_{t-2})).
         The loss-sensitivity covector to that write is S_ki = δ[m]_k W[m]_{ki} h[m]_{i,t}
-        with δ[m]_t = ell_h[m+1]_t·φ'(z[m]_t). Both brackets share the SAME downward
-        route from h[m]_{t-1} to h_stream[q]_{t-1} through the intervening frozen
+        with δ[m]_t = branch_scale[m]*ell_h[m+1]_t·φ'(z[m]_t). The earlier POST
+        derivative uses raw a[m], without another branch gain. Both brackets share
+        the same downward route from h[m]_{t-1} to h_stream[q]_{t-1} through frozen
         same-time Jacobians, so the whole thing regroups into ONE O(L·width²) adjoint
         sweep: build a source covector v[m] at each upper layer, then descend, folding
         each source in and backprojecting through the t-1 layer Jacobians (weight path +
-        residual identity). At each boundary the SAME accumulated adjoint `acc` is
-        contracted with prev_E[q-1] for the weight AND with prev_R[q-1] for the bias
+        residual identity). At each boundary the SAME accumulated adjoint `acc`,
+        multiplied by branch_scale[q-1], contracts with prev_E[q-1] for the weight
+        AND prev_R[q-1] for the bias
         (b[q-1] feeds h_stream[q]_{t-1} exactly as W[q-1] does, so it shares the whole
         downstream path — only the intra-layer eligibility differs). NOTE the two weight
         operators differ: the PRE bracket uses the RAW W[m] (current-step pre h[m]_t),
@@ -2388,7 +2410,7 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
         # non-plastic so no adjoint descends from h[L]).
         v = [None] * L
         for m in range(1, L):
-            delta = ell_h[m + 1] * phi_p[m]                       # (B, out_m)
+            delta = self._branch_scales[m] * ell_h[m + 1] * phi_p[m]
             We = layers[m].W * eta_lam[m][0]                      # W[m]·η[m]  (out_m, in_m)
             # PRE bracket uses the actual postsynaptic factor in the earlier write.
             associative = layers[m].m_update_type == 'hebb_assoc'
@@ -2420,22 +2442,23 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
                 v[m] = v[m] * prev_update_mask.to(v[m]).reshape(-1, 1)
 
         # Downward adjoint sweep (t-1 Jacobians). acc holds dL_t/dh_stream[q]_{t-1}
-        # along the one-hop path; at each boundary credit W[q-1] via prev_E[q-1] and
-        # b[q-1] via prev_R[q-1] (the SAME acc — weight & bias share the downstream path).
+        # along the one-hop path; convert it to a raw-block signal before crediting
+        # W/b via prev_E/prev_R (weight & bias share the same downstream path).
         acc = None
         for q in range(L - 1, 0, -1):
             if acc is None:
                 acc = v[q]
             else:
                 # backproject the adjoint at h[q+1] down through layer q (t-1 forward):
-                # weight path r·φ'(z[q])_{t-1}·W_eff[q]_{t-1}, plus identity if a skip.
-                r = acc * prev_phi[q]
+                # Scale the weight path only; the identity adds the unscaled acc.
+                r = self._branch_scales[q] * acc * prev_phi[q]
                 down = torch.einsum('Ba,Bai->Bi', r, prev_Weff[q])
                 if self._residual_at[q]:
                     down = down + acc
                 acc = v[q] + down
-            grad_W[q - 1] = grad_W[q - 1] + torch.einsum('Bc,Bcd->cd', acc, prev_E[q - 1])
-            grad_b[q - 1] = grad_b[q - 1] + torch.einsum('Bc,Bc->c', acc, prev_R[q - 1])
+            branch_acc = self._branch_scales[q - 1] * acc
+            grad_W[q - 1] = grad_W[q - 1] + torch.einsum('Bc,Bcd->cd', branch_acc, prev_E[q - 1])
+            grad_b[q - 1] = grad_b[q - 1] + torch.einsum('Bc,Bc->c', branch_acc, prev_R[q - 1])
 
     def _trainable_params(self):
         """Trainable tensors this net computes gradients for, keyed by name.
@@ -2544,7 +2567,8 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
                        for _ in (self._head_names if with_heads else [])]
         for t in range(T):
             u_t = inputs[:, t, :]
-            output, h, z, phi_p, embed_pre = self._forward_local_stack(u_t)
+            output, h, z, phi_p, embed_pre, blocks = self._forward_local_stack(
+                u_t, return_blocks=True)
             outputs[:, t, :] = output
             if aux_outputs:
                 for k, q_k in enumerate(self._head_outputs(h)):
@@ -2552,9 +2576,8 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
             um = None if update_masks is None else update_masks[:, t]
             for n, mp in enumerate(layers):
                 eta_n, lam_n = eta_lam[n]
-                # h is the residual stream; the Hebbian write uses the block activation
-                # a_n = h[n+1]-h[n] wherever a skip is active (identity residual).
-                post = h[n + 1] - h[n] if self._residual_at[n] else h[n + 1]
+                # The Hebbian write uses the retained raw activation, at any scale.
+                post = blocks[n]
                 mp.update_M_matrix_local_fast(h[n], post, eta=eta_n, lam=lam_n,
                                               update_mask=um)
         loss, grad_output_seq = loss_and_grad(outputs, labels, masks)
@@ -2734,7 +2757,8 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
             u_t = inputs_T[t]
 
             # 1. Forward the whole stack with M_{t-1} (no M advance yet).
-            output, h, z, phi_p, embed_pre = self._forward_local_stack(u_t)
+            output, h, z, phi_p, embed_pre, blocks = self._forward_local_stack(
+                u_t, return_blocks=True)
             if need_outputs:
                 outputs[:, t, :] = output
 
@@ -2785,7 +2809,7 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
                 features = u_t if need_W_in else u_t[:, :0]
                 if need_b_in:
                     features = torch.cat((features, torch.ones(B, 1, dtype=dt, device=dev)), dim=1)
-                post0 = h[1] - h[0] if self._residual_at[0] else h[1]
+                post0 = blocks[0]
                 grad_t, proposed_input_trace = self._input_mtrace_step(
                     input_trace, features, self.act_fn_p(embed_pre), h[0], post0,
                     phi_p[0], ell_h[1], *eta_lam[0])
@@ -2798,11 +2822,12 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
             # 5. Per-layer local gradient + trace advance.
             if not do_cross:
                 # Fast path (default): the fused per-mode step (no E materialized for
-                # diag/direct). Byte-identical to before.
+                # diag/direct). Traces describe raw blocks; only ell is scaled.
                 for n, mp in enumerate(layers):
                     eta_n, lam_n = eta_lam[n]
                     grad_W_t, grad_b_t = step_fns[n](
-                        h[n], phi_p[n], ell_h[n + 1], eta_n, lam_n, um)
+                        h[n], phi_p[n], self._branch_scales[n] * ell_h[n + 1],
+                        eta_n, lam_n, um)
                     grad_W[n] += grad_W_t
                     grad_b[n] += grad_b_t
             else:
@@ -2816,8 +2841,9 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
                 cur_Weff = [mp.W * (1.0 + mp.M) for mp in layers]   # W(1+M_{t-1})
                 for n, mp in enumerate(layers):
                     E_n, R_n = compute_elig[n](h[n], phi_p[n])
-                    grad_W[n] += torch.einsum('Bi,BiI->iI', ell_h[n + 1], E_n)
-                    grad_b[n] += torch.einsum('Bi,Bi->i', ell_h[n + 1], R_n)
+                    branch_signal = self._branch_scales[n] * ell_h[n + 1]
+                    grad_W[n] += torch.einsum('Bi,BiI->iI', branch_signal, E_n)
+                    grad_b[n] += torch.einsum('Bi,Bi->i', branch_signal, R_n)
                     cur_E[n] = E_n
                     cur_R[n] = R_n
                 # Depth-1 temporal correction from the PREVIOUS step's writes (t>0).
@@ -2833,12 +2859,11 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
                     if update_trace[n] is not None:
                         update_trace[n](h[n], cur_E[n], cur_R[n],
                                         update_mask=um, eta_lam=eta_lam[n])
-            # 6. Only now advance every layer's M from M_{t-1} to M_t. h is the
-            #    residual stream; the Hebbian write uses the block activation
-            #    a_n = h[n+1]-h[n] wherever a skip is active (identity residual).
+            # 6. Advance M with input stream h[n] and raw block activation blocks[n].
+            #    The branch scale changes output sensitivities, not this write rule.
             for n, mp in enumerate(layers):
                 eta_n, lam_n = eta_lam[n]
-                post = h[n + 1] - h[n] if self._residual_at[n] else h[n + 1]
+                post = blocks[n]
                 mp.update_M_matrix_local_fast(
                     h[n], post, eta=eta_n, lam=lam_n, update_mask=um)
                 if input_mtrace and n == 0:
@@ -2851,7 +2876,7 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
                 for n in range(L):
                     prev_E[n] = cur_E[n]
                     prev_R[n] = cur_R[n]
-                    prev_ablock[n] = (h[n + 1] - h[n]) if self._residual_at[n] else h[n + 1]
+                    prev_ablock[n] = blocks[n]
                     prev_phi[n] = phi_p[n]
                     prev_Weff[n] = cur_Weff[n]
                 for n in range(L + 1):

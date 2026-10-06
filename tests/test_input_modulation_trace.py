@@ -19,14 +19,15 @@ import train_mpn
 
 
 def make_net(embed=3, widths=(3, 2), write_mode='linear', kind='hebb_assoc',
-             residual=False, rule='local_diag_rflo', input_mode='diag_mtrace'):
+             residual=False, rule='local_diag_rflo', input_mode='diag_mtrace',
+             residual_scale=1.0):
     torch.manual_seed(13)
     cfg = dict(net_type='dmpn', n_neurons=[2, *widths, 2], dt=1,
                activation='tanh', output_matrix='', output_bias=True,
                input_layer_add=True, input_layer_add_trainable=True,
                input_layer_bias=True, linear_embed=embed, input_init_type='xavier',
                learning_rule=rule, feedback_mode='exact_spatial', input_mode=input_mode,
-               cross_layer_steps=0, mp_residual=residual,
+               cross_layer_steps=0, mp_residual=residual, residual_scale=residual_scale,
                ml_params=dict(bias=True, mp_type='mult', m_update_type=kind,
                               m_activation='scaled_tanh' if write_mode == 'smooth' else 'linear',
                               m_scale=.4, modulation_bounds=write_mode == 'hard',
@@ -100,7 +101,7 @@ def oracle(net, inputs, labels, mask, active=None, column=None, custom=False):
                     keep[:, :, column] = 1
                 updated = updated.detach() + keep * (updated - updated.detach())
             states[n] = updated
-            h = a + h if net._residual_at[n] else a
+            h = net.residual_scale * a + h if net._residual_at[n] else a
         outputs.append(F.linear(h, net.W_output, net.b_output))
     outputs = torch.stack(outputs, 1)
     loss = fourth_power_loss(outputs, labels, mask)[0] if custom else ((outputs-labels)*mask).square().mean()

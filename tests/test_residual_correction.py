@@ -33,7 +33,7 @@ def full_sequence_oracle(net, x, y, mask, update_mask):
             frozen = getattr(layer, '_plasticity_freeze_mask', None)
             if frozen is not None:
                 states[n][:, frozen[0], frozen[1]] = layer.M_init[frozen[0], frozen[1]]
-            h = a + h if net._residual_at[n] else a
+            h = net.residual_scale * a + h if net._residual_at[n] else a
         outputs.append(F.linear(h, net.W_output, net.b_output))
     outputs = torch.stack(outputs, 1)
     loss = ((outputs - y) * mask).square().mean()

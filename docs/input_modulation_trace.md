@@ -45,11 +45,14 @@ P_raw[i,j,k] = lambda[i,j] * P_(t-1)[i,j,k]
                + eta[i,j] * (a_t[i] * D[j,k] + x_t[j] * C[i,j,k])
 ```
 
-For an active first-layer identity residual, add
-`sum_batch ell_first[j] * D[j,k]` to the gradient. The residual is excluded from
-the Hebbian postsynaptic factor: the modulation update writes the block
-activation `a_t`, not the residual stream. Downstream residual contributions
-are already included in `ell_first`.
+For an active first-layer identity residual with `--residual-scale alpha`,
+multiply the `ell_first * C` gradient contribution by `alpha`, then add
+`sum_batch ell_first[j] * D[j,k]` for the unscaled identity path. Keep `C` and
+`P_raw` unchanged: the modulation update writes raw block activation `a_t`,
+not the scaled residual increment or the residual stream. Downstream scaled
+branch and identity contributions are already included in `ell_first`.
+The default `alpha=1` recovers the original residual rule; without a residual,
+use the gradient above with no branch gain or identity term.
 
 For `hebb_pre`, the postsynaptic factor is the constant `1/sqrt(first_MP_width)`.
 Use that constant in place of `a_t` and omit `x_t[j] * C[i,j,k]` from the trace

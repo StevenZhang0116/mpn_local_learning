@@ -172,7 +172,7 @@ REG_LAMBDA = 0.0
 # --input-normalize on CLI. The sample size used to estimate the stats:
 INPUT_NORMALIZE = False
 INPUT_NORM_SAMPLE = 2048      # #trials sampled to estimate the fixed input stats
-# Identity skip (residual) connections around each MP block: h_{n+1} = act(z_n) + h_n
+# Identity skip around each MP block: h_{n+1} = h_n + RESIDUAL_SCALE * act(z_n)
 # (dmpn only). A same-time, parameter-free, memoryless op — it stays fully local (the
 # local rules gain the residual's identity Jacobian term in the inter-layer signal;
 # the Hebbian write still uses the block activation) and leaves BPTT exact. A skip is
@@ -182,6 +182,7 @@ INPUT_NORM_SAMPLE = 2048      # #trials sampled to estimate the fixed input stat
 # Single-MP-layer networks also honor this setting: their skip connects the
 # embedding to the MP output. Use --no-residual to reproduce old single-layer runs.
 MP_RESIDUAL = True
+RESIDUAL_SCALE = 1.0           # fixed MP-branch gain on enabled identity skips
 # Cross-layer TEMPORAL correction depth for the local rules (dmpn, multi-MP-layer).
 # The base local rules credit each hidden layer with a same-time inter-layer signal
 # only, DROPPING the temporal paths through the plastic state of the layers above it.
@@ -368,6 +369,10 @@ def build_params():
         raise ValueError(
             "--residual (identity skip connections) is implemented for dmpn only; "
             "use --net dmpn.")
+    if not np.isfinite(RESIDUAL_SCALE) or RESIDUAL_SCALE < 0:
+        raise ValueError("residual_scale must be finite and nonnegative")
+    if not MP_RESIDUAL and RESIDUAL_SCALE != 1.0:
+        raise ValueError("non-default residual_scale requires --residual")
     if LEARNING_SIGNAL != "global" and NET_TYPE != "dmpn":
         raise ValueError(
             f"--learning-signal {LEARNING_SIGNAL} (local readout heads) needs the deep "
@@ -390,6 +395,7 @@ def build_params():
         "feedback_mode": FEEDBACK_MODE,
         "input_normalize": INPUT_NORMALIZE,  # fixed per-feature input standardization
         "mp_residual": _mp_residual(),   # identity skip around each equal-width MP block
+        "residual_scale": RESIDUAL_SCALE,
         "cross_layer_steps": CROSS_LAYER_STEPS,  # depth-1 cross-layer temporal correction
         "input_mode": INPUT_MODE,        # requested input-embedding policy
         "learning_signal": LEARNING_SIGNAL,      # global | local_readout | mixed
@@ -526,7 +532,8 @@ def _cfg():
         seed=SEED, ruleset=RULESET, rules_to_run=RULES_TO_RUN,
         feedback_mode=FEEDBACK_MODE,
         input_normalize=INPUT_NORMALIZE, input_norm_sample=INPUT_NORM_SAMPLE,
-        mp_residual=_mp_residual(), cross_layer_steps=CROSS_LAYER_STEPS,
+        mp_residual=_mp_residual(), residual_scale=RESIDUAL_SCALE,
+        cross_layer_steps=CROSS_LAYER_STEPS,
         input_mode=INPUT_MODE, learning_signal=LEARNING_SIGNAL,
         local_signal_alpha=LOCAL_SIGNAL_ALPHA,
         signal_mode=signal_mode_from(LEARNING_SIGNAL, FEEDBACK_MODE),
@@ -598,12 +605,17 @@ def parse_arguments(argv=None):
     g.add_argument("--residual", action=argparse.BooleanOptionalAction,
                    default=MP_RESIDUAL,
                    help="identity skip connections around each equal-width MP block "
-                        "(dmpn only): h_{n+1}=act(z_n)+h_n. Parameter-free, stays fully "
+                        "(dmpn only): h_{n+1}=h_n+residual_scale*act(z_n). "
+                        "Parameter-free, stays fully "
                         "local (adds the residual's identity Jacobian term to the "
                         "inter-layer signal), BPTT stays exact. Needs equal stacked "
                         "widths (e.g. --hidden 128 128); unequal layers skip it with a "
                         "warning. Changes the forward net, so every rule is affected. "
                         "Default: %(default)s.")
+    g.add_argument("--residual-scale", type=float, default=RESIDUAL_SCALE,
+                   help="fixed nonnegative gain of each enabled residual MP branch; "
+                        "identity and raw Hebbian post activity stay unscaled. "
+                        "Non-default values require --residual. Default: %(default)s.")
     g.add_argument("--input-normalize", action=argparse.BooleanOptionalAction,
                    default=INPUT_NORMALIZE,
                    help="fixed per-feature standardization of the raw input u_t "
@@ -850,6 +862,10 @@ def validate_config(p, args):
                     "diag_mtrace or paired")
         if not np.isfinite(args.local_signal_alpha):
             p.error("--local-signal-alpha must be finite")
+    if not np.isfinite(args.residual_scale) or args.residual_scale < 0:
+        p.error("--residual-scale must be finite and nonnegative")
+    if not args.residual and args.residual_scale != 1.0:
+        p.error("non-default --residual-scale requires --residual")
     if not np.isfinite(args.modulation_bound) or args.modulation_bound <= 0:
         p.error("--modulation-bound must be finite and positive")
     if args.rflo_trace_rho is not None and (
@@ -878,6 +894,7 @@ def main():
     global RFLO_TRACE_RHO, LAM
     global SEED, LEARNING_SIGNAL, LOCAL_SIGNAL_ALPHA
     global LR, HEAD_LR_MULT, LR_SCHEDULE
+    global RESIDUAL_SCALE
     args = _parse_args()
     DFA_PRESET = args.dfa
     NET_TYPE = args.net
@@ -907,6 +924,7 @@ def main():
     LOG_GRAD_ALIGN = args.grad_align
     INPUT_NORMALIZE = args.input_normalize
     MP_RESIDUAL = args.residual
+    RESIDUAL_SCALE = args.residual_scale
     CROSS_LAYER_STEPS = args.cross_layer_steps
     USE_WANDB = args.use_wandb
     WANDB_PROJECT = args.wandb_project
