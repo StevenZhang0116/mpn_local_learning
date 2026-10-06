@@ -7,6 +7,7 @@ etc. import cleanly. Run from this directory.
 
 | File | What it checks |
 |---|---|
+| `test_residual_scale.py` | Scaled residuals against independent full-unroll, isolated-layer and scalar-synapse autograd oracles; identity/legacy limits, raw Hebbian writes, spatial signals, input traces, cross-layer correction, CLI and saved configuration. |
 | `test_local_head_optimization.py` | Auxiliary head LR isolation (weights and biases), legacy Adam/plateau equivalence, BPTT/no-head invariance, constant and plateau scheduling, decay groups, CLI validation/wiring, per-layer logs and saved metadata. |
 | `test_train_mpn_batch_size.py` | Training-batch CLI validation, pixel-MNIST train/validation shapes, final-step masks, and saved batch/alignment settings. |
 | `test_train_mpn_lambda.py` | Lambda CLI validation, unchanged default time constant, scalar decay dynamics in single/deep MPNs, config metadata, and checkpoint reload. |

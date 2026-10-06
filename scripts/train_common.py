@@ -95,6 +95,7 @@ class RunConfig:
     # see mpn.DeepMultiPlasticNet mp_residual). Recorded in metadata and console/
     # figure notes; the net reads it from net_params. Legacy names include "_res".
     mp_residual: bool = False
+    residual_scale: float = 1.0
     # Cross-layer temporal correction depth for the local rules (dmpn; see
     # mpn.DeepMultiPlasticNet cross_layer_steps). Recorded in metadata and figure
     # notes; the net reads it from net_params. Legacy names include "_xl{k}".
@@ -170,6 +171,8 @@ def param_tag(cfg):
         tag += "_inorm"
     if getattr(cfg, "mp_residual", False):
         tag += "_res"
+        if getattr(cfg, "residual_scale", 1.0) != 1.0:
+            tag += f"-scale{cfg.residual_scale:g}"
     if getattr(cfg, "cross_layer_steps", 0):
         tag += f"_xl{cfg.cross_layer_steps}"
     # Legacy filenames record the input-embedding rule, including default 'match'.
@@ -776,6 +779,7 @@ def run_seed(cfg, seed, record_steps, run_idx=0, wandb_logger=None):
                     getattr(nets[rule], "_has_trainable_embed", lambda: False)()),
                 "input_normalize": cfg.input_normalize,
                 "mp_residual": cfg.mp_residual,
+                "residual_scale": getattr(cfg, "residual_scale", 1.0),
                 "input_mode": cfg.input_mode,
                 "resolved_input_mode": getattr(nets[rule], 'resolved_input_mode', None),
                 "resolved_local_bias_modes": getattr(nets[rule], 'resolved_local_bias_modes', None),
@@ -893,6 +897,7 @@ def save_plot_data(cfg, record_steps, runs, agg, path=None,
         "head_lr_mult": cfg.head_lr_mult, "lr_schedule": cfg.lr_schedule,
         "feedback_mode": cfg.feedback_mode, "input_normalize": cfg.input_normalize,
         "mp_residual": cfg.mp_residual,
+        "residual_scale": getattr(cfg, "residual_scale", 1.0),
         "cross_layer_steps": getattr(cfg, "cross_layer_steps", 0),
         "input_mode": cfg.input_mode, "title": cfg.title,
         "learning_signal": getattr(cfg, "learning_signal", "global"),
@@ -993,6 +998,7 @@ def save_config(cfg, path=None):
             "input_norm_sample": cfg.input_norm_sample,
             "log_grad_align": cfg.log_grad_align,
             "mp_residual": cfg.mp_residual,
+            "residual_scale": getattr(cfg, "residual_scale", 1.0),
             "cross_layer_steps": getattr(cfg, "cross_layer_steps", 0),
             "input_mode": cfg.input_mode,
             "learning_signal": getattr(cfg, "learning_signal", "global"),
@@ -1028,7 +1034,11 @@ def replot_from_npz(cfg, npz_path, save_to=None):
     # for older .npz files that predate arch_desc.
     arch_note = (str(d["arch_desc"]) if "arch_desc" in d.files and str(d["arch_desc"])
                  else f"hidden={int(d['n_hidden'])}")
-    suffix = f"(mean ± std over {int(d['n_runs'])} runs, {arch_note})"
+    residual_note = ""
+    if "mp_residual" in d.files and bool(d["mp_residual"]):
+        scale = float(d["residual_scale"]) if "residual_scale" in d.files else 1.0
+        residual_note = f", residual scale={scale:g}"
+    suffix = f"(mean ± std over {int(d['n_runs'])} runs, {arch_note}{residual_note})"
     # Prefer the title / metric / label saved with the data; fall back to cfg.
     cfg_for_plot = copy.copy(cfg)
     if "title" in d.files:
@@ -1057,7 +1067,7 @@ def run_experiment(cfg):
           f"{f'  signal: {cfg.signal_mode}' if getattr(cfg, 'signal_mode', '') else ''}"
           f"  feedback: {cfg.feedback_mode}"
           f"{'  (input norm ON)' if getattr(cfg, 'input_normalize', False) else ''}"
-          f"{'  (residual ON)' if getattr(cfg, 'mp_residual', False) else ''}"
+          f"{f'  (residual scale={cfg.residual_scale:g})' if getattr(cfg, 'mp_residual', False) else ''}"
           f"{f'  (cross-layer x{cfg.cross_layer_steps})' if getattr(cfg, 'cross_layer_steps', 0) else ''}"
           f"  input_mode: {getattr(cfg, 'input_mode', 'match')}"
           f"{f'  learning_signal: {cfg.learning_signal}' if getattr(cfg, 'learning_signal', 'global') != 'global' else ''}"
@@ -1133,7 +1143,8 @@ def run_experiment(cfg):
     # Append notes to the figure title only when the feature is on / non-default, so
     # existing (norm-off, match) figure titles are unchanged.
     inorm_note = ", input norm" if getattr(cfg, "input_normalize", False) else ""
-    resid_note = ", residual" if getattr(cfg, "mp_residual", False) else ""
+    resid_note = (f", residual scale={cfg.residual_scale:g}"
+                  if getattr(cfg, "mp_residual", False) else "")
     xl_note = (f", cross-layer x{cfg.cross_layer_steps}"
                if getattr(cfg, "cross_layer_steps", 0) else "")
     inmode_note = ("" if getattr(cfg, "input_mode", "match") == "match"
