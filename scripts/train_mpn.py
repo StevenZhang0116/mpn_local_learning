@@ -256,6 +256,8 @@ N_HIDDEN = 200                # one_task.py: n_hidden = 200
 N_DATASETS = 5000             # one_task.py: n_datasets = 3000 (heavy on CPU)
 BATCH = 128                   # --batch-size; validation uses 3*BATCH samples
 LR = 1e-3                     # one_task.py: lr = 1e-3
+HEAD_LR_MULT = 1.0            # auxiliary readouts only; BPTT heads are unused
+LR_SCHEDULE = "plateau"       # legacy main-loss scheduling; "constant" disables it
 GRAD_CLIP = 10                # one_task.py: gradient_clip = 10
 LOG_EVERY = 100               # record/print accuracy every this many steps
 # Output dirs anchored to the project root so they land at <root>/figure etc.
@@ -335,6 +337,8 @@ def build_params():
 
     train_params = {
         "lr": LR,
+        "head_lr_mult": HEAD_LR_MULT,
+        "lr_schedule": LR_SCHEDULE,
         "n_batches": BATCH,
         "batch_size": BATCH,
         "gradient_clip": GRAD_CLIP,
@@ -352,7 +356,7 @@ def build_params():
             "factor": 0.95,
             "patience": 30,
             "min_lr": 1e-8,
-        },
+        } if LR_SCHEDULE == "plateau" else None,
     }
 
     widths = _hidden_widths()            # one entry per MP layer
@@ -528,6 +532,7 @@ def _cfg():
         signal_mode=signal_mode_from(LEARNING_SIGNAL, FEEDBACK_MODE),
         n_runs=N_RUNS, n_hidden=_hidden_widths()[0],
         batch=BATCH, n_datasets=N_DATASETS, lr=LR, grad_clip=GRAD_CLIP,
+        head_lr_mult=HEAD_LR_MULT, lr_schedule=LR_SCHEDULE,
         log_every=LOG_EVERY, log_grad_align=LOG_GRAD_ALIGN, device=DEVICE, dtype=DTYPE,
         fig_dir=FIG_DIR, ckpt_dir=CKPT_DIR, data_dir=DATA_DIR, save_nets=SAVE_NETS,
         arch_tag=_arch_tag(), arch_desc=_arch_desc(),
@@ -691,6 +696,19 @@ def parse_arguments(argv=None):
                    help="positive bound/scale B for hard or scaled_tanh (default: %(default)s)")
 
     g = p.add_argument_group("training and logging")
+    g.add_argument("--lr", type=float, default=LR,
+                   help="base Adam learning rate, including the main readout "
+                        "(default: %(default)s)")
+    g.add_argument("--head-lr-mult", type=float, default=HEAD_LR_MULT,
+                   help="auxiliary readout learning rate = --lr times this multiplier. "
+                        "Applies to local_readout/mixed heads under local rules only; "
+                        "ignored by bptt and models without auxiliary heads. Does not "
+                        "scale the local loss or learning signal. Default: %(default)s.")
+    g.add_argument("--lr-schedule", choices=["plateau", "constant"], default=LR_SCHEDULE,
+                   help="plateau: ReduceLROnPlateau on main validation loss (legacy); "
+                        "constant: keep initial main/head rates throughout training, "
+                        "independent of validation loss. Applies to every rule, "
+                        "including bptt. Default: %(default)s.")
     g.add_argument("--steps", type=int, default=N_DATASETS, help="training batches")
     g.add_argument("--batch-size", type=int, default=BATCH,
                    help="training trials per update; validation uses 3 times this "
@@ -799,6 +817,10 @@ def validate_config(p, args):
     Mirrors the model-level guards (so the error arrives before any net is built)
     and adds the CLI-only rules."""
     local_signal = args.learning_signal != "global"
+    try:
+        tc.validate_optim_options(args.lr, args.head_lr_mult, args.lr_schedule)
+    except ValueError as exc:
+        p.error(str(exc))
     if args.input_mode in ('diag_mtrace', 'paired') and (
             args.net != 'dmpn' or args.feedback != 'exact_spatial'):
         p.error(f"--input-mode {args.input_mode} requires --net dmpn and the exact_spatial "
@@ -855,6 +877,7 @@ def main():
     global DFA_PRESET
     global RFLO_TRACE_RHO, LAM
     global SEED, LEARNING_SIGNAL, LOCAL_SIGNAL_ALPHA
+    global LR, HEAD_LR_MULT, LR_SCHEDULE
     args = _parse_args()
     DFA_PRESET = args.dfa
     NET_TYPE = args.net
@@ -869,6 +892,9 @@ def main():
         N_HIDDEN = args.hidden[0] if len(args.hidden) == 1 else args.hidden
     N_DATASETS = args.steps
     BATCH = args.batch_size
+    LR = args.lr
+    HEAD_LR_MULT = args.head_lr_mult
+    LR_SCHEDULE = args.lr_schedule
     FEEDBACK_MODE = args.feedback
     INPUT_MODE = args.input_mode
     LOCAL_BIAS_MODE = args.local_bias_mode

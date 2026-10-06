@@ -105,9 +105,14 @@ class RunConfig:
     # console/figure notes; the net reads it from net_params. Under the local modes
     # run_seed clips the head gradients SEPARATELY from the main parameters and logs
     # each head's train loss/accuracy next to the main readout's (which stay the
-    # plotted/scheduled metrics). Legacy names include "_ls-{signal}".
+    # plotted metrics and the plateau monitor). Legacy names include "_ls-{signal}".
     learning_signal: str = "global"
     local_signal_alpha: float = 1.0
+    # Auxiliary heads only; the main readout remains at lr. BPTT ignores this
+    # multiplier because its auxiliary heads never participate in the loss.
+    head_lr_mult: float = 1.0
+    # plateau: legacy main-validation-loss scheduling; constant: no scheduler.
+    lr_schedule: str = "plateau"
     # Unified name of the (learning_signal, feedback_mode) pair the run uses — the
     # CLI's --learning-signal value (train_mpn.SIGNAL_MODES: exact_spatial /
     # layerwise_fa / dfa / local_readout / mixed). Recorded next to the two model
@@ -171,6 +176,10 @@ def param_tag(cfg):
     tag += f"_in-{getattr(cfg, 'input_mode', 'match')}"
     if getattr(cfg, "learning_signal", "global") != "global":
         tag += f"_ls-{cfg.learning_signal}"
+    if cfg.head_lr_mult != 1.0:
+        tag += f"_headlr{cfg.head_lr_mult:g}"
+    if cfg.lr_schedule != "plateau":
+        tag += f"_sched-{cfg.lr_schedule}"
     if cfg.tag_extra:
         tag += f"_{cfg.tag_extra}"
     return tag
@@ -356,10 +365,28 @@ def effective_rule_summary(cfg, net, rule):
     return ", ".join(parts)
 
 
-def make_optim(net, lr, weight_decay=0.0):
+def validate_optim_options(lr, head_lr_mult, lr_schedule):
+    """Shared CLI/programmatic validation, before constructing an optimizer."""
+    if not np.isfinite(lr) or lr <= 0:
+        raise ValueError("--lr must be finite and positive")
+    if not np.isfinite(head_lr_mult) or head_lr_mult <= 0:
+        raise ValueError("--head-lr-mult must be finite and positive")
+    if not np.isfinite(lr * head_lr_mult) or lr * head_lr_mult <= 0:
+        raise ValueError("--lr * --head-lr-mult must be finite and positive")
+    if lr_schedule not in ("plateau", "constant"):
+        raise ValueError("--lr-schedule must be plateau or constant")
+
+
+def make_optim(net, lr, weight_decay=0.0, *, head_lr_mult=1.0,
+               lr_schedule="plateau"):
     """Adam with coupled L2: (weight_decay / 2) * sum(W**2), excluding biases.
     Weight matrices = every _trainable_params key starting with 'W' plus the local
-    readout heads' weights ('head_W*'), which are readouts like W_output."""
+    readout heads' weights ('head_W*'), which are readouts like W_output.
+    The default keeps the original parameter-group layout and scheduler exactly.
+    Head-only LR overrides never affect main parameters or a BPTT baseline.
+    Returns (trainable, optimizer, scheduler); constant returns scheduler=None.
+    """
+    validate_optim_options(lr, head_lr_mult, lr_schedule)
     trainable = [p for p in net.parameters() if p.requires_grad]
     if weight_decay:
         weight_ids = {id(parameter) for name, parameter in net._trainable_params().items()
@@ -376,10 +403,45 @@ def make_optim(net, lr, weight_decay=0.0):
         ]
     else:
         groups = trainable
+    aux_fn = getattr(net, "_aux_params", None)
+    active_heads = (aux_fn() if aux_fn is not None
+                    and getattr(net, "learning_rule", None) != "bptt" else {})
+    head_ids = {id(p) for p in active_heads.values() if p.requires_grad}
+    if head_ids and head_lr_mult != 1.0:
+        # Split EACH decay group by role, preserving weight-vs-bias decay policy.
+        # Main groups stay first, so param_groups[0]['lr'] keeps its old meaning.
+        old_groups = groups if weight_decay else [{'params': trainable}]
+        groups = []
+        for is_head in (False, True):
+            for group in old_groups:
+                params = [p for p in group['params'] if (id(p) in head_ids) == is_head]
+                if params:
+                    groups.append({**group, 'params': params,
+                                   'lr': lr * head_lr_mult if is_head else lr})
     opt = torch.optim.Adam(groups, lr=lr)
-    sch = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        opt, mode="min", factor=0.95, patience=30, min_lr=1e-8)
+    sch = None
+    if lr_schedule == "plateau":
+        sch = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            opt, mode="min", factor=0.95, patience=30,
+            min_lr=[1e-8 * (group['lr'] / lr) for group in opt.param_groups])
     return trainable, opt, sch
+
+
+def learning_rate_snapshot(net, opt):
+    """Effective rates by trainable weight matrix; omit unused BPTT heads.
+
+    MP names follow _trainable_params (W, W1, ...); W_in is the embedding and
+    W_output the main readout. Biases share their associated matrix's rate.
+    """
+    by_id = {id(p): group['lr'] for group in opt.param_groups for p in group['params']}
+    params = {name: p for name, p in net._trainable_params().items()
+              if name.startswith('W')}
+    if getattr(net, 'learning_rule', None) != 'bptt':
+        aux_fn = getattr(net, '_aux_params', None)
+        if aux_fn is not None:
+            params.update({name: p for name, p in aux_fn().items()
+                           if name.startswith('head_W')})
+    return {name: float(by_id[id(p)]) for name, p in params.items() if id(p) in by_id}
 
 
 @torch.no_grad()
@@ -448,7 +510,9 @@ def run_seed(cfg, seed, record_steps, run_idx=0, wandb_logger=None):
             print(f"  {rule}: input_mode={net.input_mode}, resolved_input_mode={resolved_input}, "
                   + effective_rule_summary(cfg, net, rule))
         nets[rule] = net
-        optims[rule] = make_optim(net, cfg.lr, weight_decay=weight_decay)
+        optims[rule] = make_optim(net, cfg.lr, weight_decay=weight_decay,
+                                 head_lr_mult=cfg.head_lr_mult,
+                                 lr_schedule=cfg.lr_schedule)
         # Main parameters and local readout heads are norm-clipped as SEPARATE
         # groups (same threshold), so the heads' gradients never alter the main
         # network's clipped update. Without heads the aux group is empty and the
@@ -525,6 +589,7 @@ def run_seed(cfg, seed, record_steps, run_idx=0, wandb_logger=None):
         step_log = {}    # per-rule (train_loss, valid_loss, lr) for this step's log line
         step_align = {}  # per-rule {key: cosine vs BPTT} at record steps (local rules)
         step_aux = {}    # per-rule [(head loss, head train acc)] at record steps (local heads)
+        step_rates = {}  # effective post-scheduler rates (for the NEXT update)
         for rule in cfg.rules_to_run:
             net = nets[rule]
             trainable, opt, sch = optims[rule]
@@ -577,8 +642,8 @@ def run_seed(cfg, seed, record_steps, run_idx=0, wandb_logger=None):
                 torch.cuda.synchronize()
             t_opt[rule] += time.perf_counter() - t0
 
-            # Held-out validation loss on the UPDATED net drives the scheduler
-            # (as in one_task.py) — smoother than the fresh per-batch train loss.
+            # Legacy plateau uses the UPDATED net's main validation loss.
+            # Constant mode still evaluates this loss, but it cannot affect LR.
             # The held-out set can be larger than the training batch (valid_n_batch
             # = batch*3 by default), so run the forward in chunks of cfg.batch to
             # bound peak memory (prevents CUDA OOM); validation samples don't
@@ -587,7 +652,8 @@ def run_seed(cfg, seed, record_steps, run_idx=0, wandb_logger=None):
             # over the full held-out set, exact; no per-chunk averaging).
             v_out = eval_outputs_chunked(cfg, net, v_inputs, cfg.batch)
             v_loss, _ = val_loss_fn(v_out, v_labels, v_mask)
-            sch.step(v_loss.item())
+            if sch is not None:
+                sch.step(v_loss.item())
 
             if step in record_set:
                 train_acc = try_accuracy(task, net, grads["outputs"], labels, mask,
@@ -605,6 +671,7 @@ def run_seed(cfg, seed, record_steps, run_idx=0, wandb_logger=None):
                     curves[rule]["valid"].append(valid_acc)
                 step_log[rule] = (train_acc, valid_acc, train_loss, valid_loss,
                                   opt.param_groups[0]["lr"])
+                step_rates[rule] = learning_rate_snapshot(net, opt)
                 # Local readout heads (local rules under a local learning_signal):
                 # each head's train loss + train accuracy on this batch, logged
                 # BESIDE the main readout's (never mixed into it).
@@ -649,6 +716,8 @@ def run_seed(cfg, seed, record_steps, run_idx=0, wandb_logger=None):
                       f"{tr_acc:>7.3f} {va_acc:>7.3f}   "
                       f"{tr_loss:>9.3e} {va_loss:>9.3e}   {lr:>7.1e}   "
                       f"{fwd_ms:>7.1f} {bwd_ms:>7.1f} {opt_ms:>7.1f}{align_cols}")
+                rates_txt = "  ".join(f"{name}={rate:.2e}" for name, rate in step_rates[r].items())
+                print(f"    {' ' * 6}  {'':<{label_w}}   lr(next)  {rates_txt}")
                 # Local readout heads: one indented sub-line per rule that has them
                 # (head index = the MP layer it reads; the top layer is the main readout).
                 aux = step_aux.get(r)
@@ -668,6 +737,7 @@ def run_seed(cfg, seed, record_steps, run_idx=0, wandb_logger=None):
                         "time/fwd_ms": fwd_ms, "time/bwd_ms": bwd_ms,
                         "time/opt_ms": opt_ms,
                     }
+                    metrics.update({f"lr/{name}": rate for name, rate in step_rates[r].items()})
                     for k in align_keys:
                         metrics[f"grad_align/{_short(k)}"] = al.get(k)
                     for k, (l, a) in enumerate(step_aux.get(r, [])):
@@ -712,6 +782,9 @@ def run_seed(cfg, seed, record_steps, run_idx=0, wandb_logger=None):
                 "learning_signal": getattr(nets[rule], 'learning_signal', cfg.learning_signal),
                 "signal_mode": getattr(cfg, "signal_mode", ""),
                 "effective_config": effective_rule_summary(cfg, nets[rule], rule),
+                "head_lr_mult": cfg.head_lr_mult,
+                "lr_schedule": cfg.lr_schedule,
+                "learning_rates": learning_rate_snapshot(nets[rule], optims[rule][1]),
                 "seed": seed,
             }, path)
             print(f"  saved network: {path}")
@@ -817,6 +890,7 @@ def save_plot_data(cfg, record_steps, runs, agg, path=None,
         "run_id": cfg.run_id,
         "ruleset": cfg.ruleset, "n_hidden": cfg.n_hidden, "batch": cfg.batch,
         "n_datasets": cfg.n_datasets, "lr": cfg.lr, "n_runs": cfg.n_runs,
+        "head_lr_mult": cfg.head_lr_mult, "lr_schedule": cfg.lr_schedule,
         "feedback_mode": cfg.feedback_mode, "input_normalize": cfg.input_normalize,
         "mp_residual": cfg.mp_residual,
         "cross_layer_steps": getattr(cfg, "cross_layer_steps", 0),
@@ -903,6 +977,7 @@ def save_config(cfg, path=None):
             "seeds": [cfg.seed + k for k in range(cfg.n_runs)],
             # optimization
             "batch": cfg.batch, "n_datasets": cfg.n_datasets, "lr": cfg.lr,
+            "head_lr_mult": cfg.head_lr_mult, "lr_schedule": cfg.lr_schedule,
             "grad_clip": cfg.grad_clip, "log_every": cfg.log_every,
             "device": str(cfg.device), "dtype": str(cfg.dtype),
             "metric": cfg.metric, "acc_label": cfg.acc_label,
@@ -976,7 +1051,8 @@ def run_experiment(cfg):
         save_config(cfg)
     print(f"Task: {cfg.ruleset}{cfg.header_note}  |  rules: {cfg.rules_to_run}  |  "
           f"runs: {cfg.n_runs}  |  {arch_suffix(cfg)} batch={cfg.batch} "
-          f"steps={cfg.n_datasets} lr={cfg.lr} clip={cfg.grad_clip}")
+          f"steps={cfg.n_datasets} lr={cfg.lr} head_lr_mult={cfg.head_lr_mult:g} "
+          f"lr_schedule={cfg.lr_schedule} clip={cfg.grad_clip}")
     print(f"Device: {cfg.device}  dtype: {cfg.dtype}"
           f"{f'  signal: {cfg.signal_mode}' if getattr(cfg, 'signal_mode', '') else ''}"
           f"  feedback: {cfg.feedback_mode}"
