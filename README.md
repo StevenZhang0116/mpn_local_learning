@@ -36,7 +36,11 @@ Readout gradients are always exact.
 - `notebooks/` — Python analysis scripts: `visualize_trained_networks.py`
   (checkpoint selection, loading, parameter and performance plots), and
   `compare_mpn_rnn_performance.py`.
-- `utils/` — `clean.py` (remove saved outputs, safe by default).
+- `clean.py` (project root) — deletes STALE OUTPUTS only: the contents of
+  `checkpoints/`, `figure/`, `figure_data/`, `log/` and the `notebooks/diagnose_gradients/`,
+  `notebooks/verify_rflo_scaling/`, `notebooks/visualize_trained_networks/` output folders.
+  Dry run by default; `python clean.py --run` deletes, `--keep '<glob>'` spares matching
+  entries, positional names limit it to some folders. `utils/clean.py` forwards to it.
 - Outputs (git-ignored): `figure/` (PNGs), `figure_data/` (`.npz` behind each figure),
   `checkpoints/` (`.pt` trained nets), `log/` (`train_mpn` console output).
 
