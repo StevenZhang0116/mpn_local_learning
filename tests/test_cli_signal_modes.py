@@ -174,6 +174,54 @@ class TestSignalModeCLI(unittest.TestCase):
             self.assertEqual(train_rnn._cfg().signal_mode, 'dfa')
 
 
+class TestPlateauKnobs(unittest.TestCase):
+    """--lr-patience / --lr-factor: defaults keep the historical scheduler, the
+    values reach ReduceLROnPlateau, constant ignores them, invalid values are
+    rejected, and they are recorded in the run metadata."""
+
+    def test_defaults_and_cli(self):
+        a = parse()
+        self.assertEqual((a.lr_patience, a.lr_factor, a.lr_schedule), (30, 0.95, 'plateau'))
+        b = parse('--lr-patience', '200', '--lr-factor', '0.5')
+        self.assertEqual((b.lr_patience, b.lr_factor), (200, 0.5))
+        for bad in (['--lr-patience', '-1'], ['--lr-factor', '1.0'], ['--lr-factor', '0'],
+                    ['--lr-factor', 'nan']):
+            with self.subTest(bad=bad):
+                self.assertTrue(rejects(*bad))
+        with patch.multiple(train_mpn, LR_PATIENCE=200, LR_FACTOR=0.5):
+            cfg = train_mpn._cfg()
+            self.assertEqual((cfg.lr_patience, cfg.lr_factor), (200, 0.5))
+            self.assertEqual(train_mpn.build_params()[1]['scheduler']['patience'], 200)
+            self.assertEqual(train_mpn.build_params()[1]['scheduler']['factor'], 0.5)
+            cfg.run_id = ''
+            self.assertIn('_pat200_fac0.5', train_common.param_tag(cfg))
+        cfg = train_mpn._cfg(); cfg.run_id = ''
+        self.assertNotIn('_pat', train_common.param_tag(cfg))
+
+    def test_make_optim_uses_patience_and_factor(self):
+        net = mpn.DeepMultiPlasticNet(make_cfg(signal='global', rule='local_direct'), verbose=False)
+        _, opt, sch = train_common.make_optim(net, 1e-3)
+        self.assertEqual((sch.patience, sch.factor), (30, 0.95))
+        _, opt, sch = train_common.make_optim(net, 1e-3, lr_patience=200, lr_factor=0.5)
+        self.assertEqual((sch.patience, sch.factor), (200, 0.5))
+        # ReduceLROnPlateau decays once num_bad_epochs EXCEEDS the patience: the first
+        # call sets the best, so with patience 200 the first decay is the 202nd flat
+        # step, versus six decays over the same span with the historical 30.
+        for _ in range(201):
+            sch.step(1.0)
+        self.assertAlmostEqual(opt.param_groups[0]['lr'], 1e-3)        # 200 bad steps: not yet
+        sch.step(1.0)
+        self.assertAlmostEqual(opt.param_groups[0]['lr'], 5e-4)        # 201 > 200: decay
+        _, opt30, sch30 = train_common.make_optim(net, 1e-3)
+        for _ in range(201):
+            sch30.step(1.0)
+        self.assertAlmostEqual(opt30.param_groups[0]['lr'], 1e-3 * 0.95 ** 6, places=12)
+        _, _, none = train_common.make_optim(net, 1e-3, lr_schedule='constant', lr_patience=5)
+        self.assertIsNone(none)
+        with self.assertRaises(ValueError):
+            train_common.make_optim(net, 1e-3, lr_factor=1.5)
+
+
 class TestEffectiveConfigLine(unittest.TestCase):
     def test_run_seed_prints_what_each_rule_actually_runs(self):
         x, y, mask, _ = data(B=4, T=5)

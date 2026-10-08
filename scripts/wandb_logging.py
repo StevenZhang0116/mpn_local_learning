@@ -77,6 +77,8 @@ def _base_config(cfg, experiment):
         "lr": cfg.lr,
         "head_lr_mult": cfg.head_lr_mult,
         "lr_schedule": cfg.lr_schedule,
+        "lr_patience": getattr(cfg, "lr_patience", 30),
+        "lr_factor": getattr(cfg, "lr_factor", 0.95),
         "grad_clip": cfg.grad_clip,
         "metric": cfg.metric,
         "acc_label": cfg.acc_label,

@@ -114,6 +114,11 @@ class RunConfig:
     head_lr_mult: float = 1.0
     # plateau: legacy main-validation-loss scheduling; constant: no scheduler.
     lr_schedule: str = "plateau"
+    # ReduceLROnPlateau knobs (plateau only): multiply every group's lr by lr_factor
+    # after lr_patience consecutive non-improving validation steps. The defaults are
+    # the historical values; a larger patience decays more slowly.
+    lr_patience: int = 30
+    lr_factor: float = 0.95
     # Unified name of the (learning_signal, feedback_mode) pair the run uses — the
     # CLI's --learning-signal value (train_mpn.SIGNAL_MODES: exact_spatial /
     # layerwise_fa / dfa / local_readout / mixed). Recorded next to the two model
@@ -183,6 +188,8 @@ def param_tag(cfg):
         tag += f"_headlr{cfg.head_lr_mult:g}"
     if cfg.lr_schedule != "plateau":
         tag += f"_sched-{cfg.lr_schedule}"
+    elif (getattr(cfg, "lr_patience", 30), getattr(cfg, "lr_factor", 0.95)) != (30, 0.95):
+        tag += f"_pat{cfg.lr_patience}_fac{cfg.lr_factor:g}"
     if cfg.tag_extra:
         tag += f"_{cfg.tag_extra}"
     return tag
@@ -368,7 +375,7 @@ def effective_rule_summary(cfg, net, rule):
     return ", ".join(parts)
 
 
-def validate_optim_options(lr, head_lr_mult, lr_schedule):
+def validate_optim_options(lr, head_lr_mult, lr_schedule, lr_patience=30, lr_factor=0.95):
     """Shared CLI/programmatic validation, before constructing an optimizer."""
     if not np.isfinite(lr) or lr <= 0:
         raise ValueError("--lr must be finite and positive")
@@ -378,18 +385,25 @@ def validate_optim_options(lr, head_lr_mult, lr_schedule):
         raise ValueError("--lr * --head-lr-mult must be finite and positive")
     if lr_schedule not in ("plateau", "constant"):
         raise ValueError("--lr-schedule must be plateau or constant")
+    if int(lr_patience) != lr_patience or lr_patience < 0:
+        raise ValueError("--lr-patience must be a nonnegative integer")
+    if not np.isfinite(lr_factor) or not 0 < lr_factor < 1:
+        raise ValueError("--lr-factor must satisfy 0 < factor < 1")
 
 
 def make_optim(net, lr, weight_decay=0.0, *, head_lr_mult=1.0,
-               lr_schedule="plateau"):
+               lr_schedule="plateau", lr_patience=30, lr_factor=0.95):
     """Adam with coupled L2: (weight_decay / 2) * sum(W**2), excluding biases.
     Weight matrices = every _trainable_params key starting with 'W' plus the local
     readout heads' weights ('head_W*'), which are readouts like W_output.
     The default keeps the original parameter-group layout and scheduler exactly.
     Head-only LR overrides never affect main parameters or a BPTT baseline.
     Returns (trainable, optimizer, scheduler); constant returns scheduler=None.
+    lr_patience / lr_factor are the plateau scheduler's patience (steps without a
+    new best validation loss) and decay factor; the defaults are the historical
+    30 / 0.95, and --lr-schedule constant ignores both.
     """
-    validate_optim_options(lr, head_lr_mult, lr_schedule)
+    validate_optim_options(lr, head_lr_mult, lr_schedule, lr_patience, lr_factor)
     trainable = [p for p in net.parameters() if p.requires_grad]
     if weight_decay:
         weight_ids = {id(parameter) for name, parameter in net._trainable_params().items()
@@ -425,7 +439,7 @@ def make_optim(net, lr, weight_decay=0.0, *, head_lr_mult=1.0,
     sch = None
     if lr_schedule == "plateau":
         sch = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            opt, mode="min", factor=0.95, patience=30,
+            opt, mode="min", factor=lr_factor, patience=int(lr_patience),
             min_lr=[1e-8 * (group['lr'] / lr) for group in opt.param_groups])
     return trainable, opt, sch
 
@@ -515,7 +529,9 @@ def run_seed(cfg, seed, record_steps, run_idx=0, wandb_logger=None):
         nets[rule] = net
         optims[rule] = make_optim(net, cfg.lr, weight_decay=weight_decay,
                                  head_lr_mult=cfg.head_lr_mult,
-                                 lr_schedule=cfg.lr_schedule)
+                                 lr_schedule=cfg.lr_schedule,
+                                 lr_patience=getattr(cfg, "lr_patience", 30),
+                                 lr_factor=getattr(cfg, "lr_factor", 0.95))
         # Main parameters and local readout heads are norm-clipped as SEPARATE
         # groups (same threshold), so the heads' gradients never alter the main
         # network's clipped update. Without heads the aux group is empty and the
@@ -788,6 +804,8 @@ def run_seed(cfg, seed, record_steps, run_idx=0, wandb_logger=None):
                 "effective_config": effective_rule_summary(cfg, nets[rule], rule),
                 "head_lr_mult": cfg.head_lr_mult,
                 "lr_schedule": cfg.lr_schedule,
+                "lr_patience": getattr(cfg, "lr_patience", 30),
+                "lr_factor": getattr(cfg, "lr_factor", 0.95),
                 "learning_rates": learning_rate_snapshot(nets[rule], optims[rule][1]),
                 "seed": seed,
             }, path)
@@ -895,6 +913,7 @@ def save_plot_data(cfg, record_steps, runs, agg, path=None,
         "ruleset": cfg.ruleset, "n_hidden": cfg.n_hidden, "batch": cfg.batch,
         "n_datasets": cfg.n_datasets, "lr": cfg.lr, "n_runs": cfg.n_runs,
         "head_lr_mult": cfg.head_lr_mult, "lr_schedule": cfg.lr_schedule,
+        "lr_patience": getattr(cfg, "lr_patience", 30), "lr_factor": getattr(cfg, "lr_factor", 0.95),
         "feedback_mode": cfg.feedback_mode, "input_normalize": cfg.input_normalize,
         "mp_residual": cfg.mp_residual,
         "residual_scale": getattr(cfg, "residual_scale", 1.0),
@@ -983,6 +1002,7 @@ def save_config(cfg, path=None):
             # optimization
             "batch": cfg.batch, "n_datasets": cfg.n_datasets, "lr": cfg.lr,
             "head_lr_mult": cfg.head_lr_mult, "lr_schedule": cfg.lr_schedule,
+            "lr_patience": getattr(cfg, "lr_patience", 30), "lr_factor": getattr(cfg, "lr_factor", 0.95),
             "grad_clip": cfg.grad_clip, "log_every": cfg.log_every,
             "device": str(cfg.device), "dtype": str(cfg.dtype),
             "metric": cfg.metric, "acc_label": cfg.acc_label,
@@ -1062,7 +1082,10 @@ def run_experiment(cfg):
     print(f"Task: {cfg.ruleset}{cfg.header_note}  |  rules: {cfg.rules_to_run}  |  "
           f"runs: {cfg.n_runs}  |  {arch_suffix(cfg)} batch={cfg.batch} "
           f"steps={cfg.n_datasets} lr={cfg.lr} head_lr_mult={cfg.head_lr_mult:g} "
-          f"lr_schedule={cfg.lr_schedule} clip={cfg.grad_clip}")
+          f"lr_schedule={cfg.lr_schedule}"
+          + (f" (patience={getattr(cfg, 'lr_patience', 30)}, factor={getattr(cfg, 'lr_factor', 0.95):g})"
+             if cfg.lr_schedule == "plateau" else "")
+          + f" clip={cfg.grad_clip}")
     print(f"Device: {cfg.device}  dtype: {cfg.dtype}"
           f"{f'  signal: {cfg.signal_mode}' if getattr(cfg, 'signal_mode', '') else ''}"
           f"  feedback: {cfg.feedback_mode}"

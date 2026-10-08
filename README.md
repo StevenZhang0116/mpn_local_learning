@@ -25,9 +25,10 @@ Readout gradients are always exact.
 ## Layout
 
 - `core/` — shared library: `mpn.py` (MultiPlasticNet, DeepMultiPlasticNet),
-  `rnn.py` (LeakyRNN), `mpn_tasks.py`, `net_helpers.py`, `helper.py`,
+  `rnn.py` (LeakyRNN), `gru.py` (GRU with BPTT and a GRU-specific RFLO),
+  `mpn_tasks.py`, `net_helpers.py`, `helper.py`,
   `run_logging.py` (console/file output mirroring).
-- `scripts/` — `train_mpn.py`, `train_rnn.py` (lockstep BPTT-vs-local over N seeds),
+- `scripts/` — `train_mpn.py`, `train_rnn.py`, `train_gru.py` (lockstep BPTT-vs-local over N seeds),
   `train_common.py` (shared train/plot machinery), `tasks.py` (task adapters — the
   data/metric seam; ring tasks + sequential MNIST + adding problem), `adding_tasks.py`
   (adding-problem generator + Task), `_bootstrap.py` (path setup).
@@ -54,6 +55,7 @@ python train_mpn.py --net dmpn --task seqmnist --runs 3  # deep MPN on sequentia
 python train_rnn.py --task seqmnist --runs 3             # leaky RNN on sequential MNIST
 python train_mpn.py --net dmpn --task adding --runs 3    # deep MPN on the adding problem
 python train_rnn.py --task adding --runs 3               # leaky RNN on the adding problem
+python train_gru.py --task seqmnist --runs 3             # GRU: BPTT vs GRU-RFLO, same tasks/protocol
 
 cd ../tests
 python validate_local_learning.py                        # rule correctness checks
@@ -67,7 +69,16 @@ python test_tasks.py                                     # task-adapter tests
 - `adding` → the adding problem (seq_len=200, 2 marks); `adding_L<len>_m<marks>`
   sweeps the sequence length / mark count, e.g. `adding_L500_m3`.
 
-All tasks run for both models and both BPTT and local learning. Sequential MNIST
+All tasks run for all three models and both BPTT and local learning. `train_gru.py`
+trains a GRU (`core/gru.py`, PyTorch gate layout r/z/n) with the same lockstep
+protocol: `bptt` is autograd through the unrolled recurrence; `local_diag_rflo` is a
+GRU-specific RFLO in which every parameter keeps a per-unit eligibility trace gated by
+that unit's own update gate `z` (the GRU analog of the leaky RNN's `alpha`) while the
+recurrent sensitivity entering the gates through `W_rec` is dropped. It is exact when
+`W_rec = 0` or `T = 1` and otherwise an approximation; readout gradients stay exact.
+The default hidden width is 100 (three gate blocks, so about the leaky RNN's recurrent
+parameter count at 180). `--learning-signal exact_spatial|layerwise_fa|dfa` and the
+legacy `--feedback` work as in `train_rnn.py`. Sequential MNIST
 uses cross-entropy at the final step; ring tasks use masked MSE at their scored
 times, and the adding problem uses final-step MSE. The task supplies the same
 objective to all learning rules. The adding problem is a long-range
@@ -345,9 +356,15 @@ only. The input embedding, MP layers, and main output readout retain the base ra
 It is ignored by BPTT (auxiliary heads remain untrained), global-signal models,
 and single-MP-layer models without auxiliary heads. The default multiplier is 1.
 `--lr-schedule plateau` preserves the existing `ReduceLROnPlateau` behavior driven
-by the main validation loss; it schedules both main and active head groups.
-`--lr-schedule constant` disables the scheduler, so validation loss cannot lower
-any rate. This schedule choice applies to **every** rule in the command, including
+by the main validation loss; it schedules both main and active head groups. Its two
+knobs are `--lr-patience` (training steps without a new best validation loss before a
+decay; default 30) and `--lr-factor` (multiplicative decay per plateau; default 0.95).
+The historical 30 / 0.95 decays fast on a noisy validation curve (about 1000x over
+5000 steps in the October 2026 `contextdelaydm1` runs); `--lr-patience 200` decays
+roughly seven times more slowly. Both are recorded in checkpoints, `config.json`,
+the `.npz` metadata and W&B, and appear in the legacy filename as `_pat<p>_fac<f>`
+when non-default. `--lr-schedule constant` disables the scheduler, so validation loss
+cannot lower any rate. This schedule choice applies to **every** rule in the command, including
 BPTT; it does not change their gradient definitions. Per-module loss-driven
 schedulers are not introduced here.
 

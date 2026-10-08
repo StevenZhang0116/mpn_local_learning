@@ -259,6 +259,13 @@ BATCH = 128                   # --batch-size; validation uses 3*BATCH samples
 LR = 1e-3                     # one_task.py: lr = 1e-3
 HEAD_LR_MULT = 1.0            # auxiliary readouts only; BPTT heads are unused
 LR_SCHEDULE = "plateau"       # legacy main-loss scheduling; "constant" disables it
+# ReduceLROnPlateau knobs (plateau only): after LR_PATIENCE consecutive training steps
+# without a new best MAIN validation loss, every group's lr is multiplied by LR_FACTOR.
+# Historical values 30 / 0.95 decay fast on noisy validation curves (about 1000x over
+# 5000 steps in the October 2026 runs); raise the patience to decay more slowly.
+# --lr-patience / --lr-factor on CLI.
+LR_PATIENCE = 30
+LR_FACTOR = 0.95
 GRAD_CLIP = 10                # one_task.py: gradient_clip = 10
 LOG_EVERY = 100               # record/print accuracy every this many steps
 # Output dirs anchored to the project root so they land at <root>/figure etc.
@@ -340,6 +347,8 @@ def build_params():
         "lr": LR,
         "head_lr_mult": HEAD_LR_MULT,
         "lr_schedule": LR_SCHEDULE,
+        "lr_patience": LR_PATIENCE,
+        "lr_factor": LR_FACTOR,
         "n_batches": BATCH,
         "batch_size": BATCH,
         "gradient_clip": GRAD_CLIP,
@@ -354,8 +363,8 @@ def build_params():
         "scheduler": {               # one_task.py: ReduceLROnPlateau
             "type": "ReduceLROnPlateau",
             "mode": "min",
-            "factor": 0.95,
-            "patience": 30,
+            "factor": LR_FACTOR,
+            "patience": LR_PATIENCE,
             "min_lr": 1e-8,
         } if LR_SCHEDULE == "plateau" else None,
     }
@@ -540,6 +549,7 @@ def _cfg():
         n_runs=N_RUNS, n_hidden=_hidden_widths()[0],
         batch=BATCH, n_datasets=N_DATASETS, lr=LR, grad_clip=GRAD_CLIP,
         head_lr_mult=HEAD_LR_MULT, lr_schedule=LR_SCHEDULE,
+        lr_patience=LR_PATIENCE, lr_factor=LR_FACTOR,
         log_every=LOG_EVERY, log_grad_align=LOG_GRAD_ALIGN, device=DEVICE, dtype=DTYPE,
         fig_dir=FIG_DIR, ckpt_dir=CKPT_DIR, data_dir=DATA_DIR, save_nets=SAVE_NETS,
         arch_tag=_arch_tag(), arch_desc=_arch_desc(),
@@ -721,6 +731,14 @@ def parse_arguments(argv=None):
                         "constant: keep initial main/head rates throughout training, "
                         "independent of validation loss. Applies to every rule, "
                         "including bptt. Default: %(default)s.")
+    g.add_argument("--lr-patience", type=int, default=LR_PATIENCE,
+                   help="plateau only: training steps without a new best main validation "
+                        "loss before every learning rate is multiplied by --lr-factor. "
+                        "Larger = slower decay (the historical 30 decayed about 1000x over "
+                        "5000 steps). Default: %(default)s.")
+    g.add_argument("--lr-factor", type=float, default=LR_FACTOR,
+                   help="plateau only: multiplicative learning-rate decay per plateau, "
+                        "0 < factor < 1. Default: %(default)s.")
     g.add_argument("--steps", type=int, default=N_DATASETS, help="training batches")
     g.add_argument("--batch-size", type=int, default=BATCH,
                    help="training trials per update; validation uses 3 times this "
@@ -830,7 +848,8 @@ def validate_config(p, args):
     and adds the CLI-only rules."""
     local_signal = args.learning_signal != "global"
     try:
-        tc.validate_optim_options(args.lr, args.head_lr_mult, args.lr_schedule)
+        tc.validate_optim_options(args.lr, args.head_lr_mult, args.lr_schedule,
+                                  args.lr_patience, args.lr_factor)
     except ValueError as exc:
         p.error(str(exc))
     if args.input_mode in ('diag_mtrace', 'paired') and (
@@ -893,7 +912,7 @@ def main():
     global DFA_PRESET
     global RFLO_TRACE_RHO, LAM
     global SEED, LEARNING_SIGNAL, LOCAL_SIGNAL_ALPHA
-    global LR, HEAD_LR_MULT, LR_SCHEDULE
+    global LR, HEAD_LR_MULT, LR_SCHEDULE, LR_PATIENCE, LR_FACTOR
     global RESIDUAL_SCALE
     args = _parse_args()
     DFA_PRESET = args.dfa
@@ -912,6 +931,8 @@ def main():
     LR = args.lr
     HEAD_LR_MULT = args.head_lr_mult
     LR_SCHEDULE = args.lr_schedule
+    LR_PATIENCE = args.lr_patience
+    LR_FACTOR = args.lr_factor
     FEEDBACK_MODE = args.feedback
     INPUT_MODE = args.input_mode
     LOCAL_BIAS_MODE = args.local_bias_mode
