@@ -16,6 +16,7 @@ import torch
 
 import _bootstrap  # noqa: F401
 import gru
+import mpn
 import train_common
 import train_gru
 
@@ -67,10 +68,12 @@ def grucell_oracle(net, x, y, mask):
     return out.detach(), dict(zip(['W_input', 'W_rec', 'b_input', 'b_rec', 'W_output', 'b_output'], g))
 
 
-def rflo_oracle(net, x, y, mask):
+def rflo_oracle(net, x, y, mask, loss_fn=None, update_masks=None):
     """What GRU-RFLO computes, written as autograd: h_{t-1} is DETACHED inside the
     gates (the dropped recurrent sensitivity) while the live h_{t-1} stays in the
-    update-gate leak z * h_{t-1} (the kept per-unit path)."""
+    update-gate leak z * h_{t-1} (the kept per-unit path). A frozen row (update
+    mask 0) keeps its state, h_t = h_{t-1}, BEFORE the readout. loss_fn: any
+    (loss, grad) helper; default masked MSE."""
     ps = {k: v.detach().clone().requires_grad_() for k, v in net._trainable_params().items()}
     b_in = ps.get('b_input', net.b_input)
     b_rec = ps.get('b_rec', net.b_rec)
@@ -85,10 +88,16 @@ def rflo_oracle(net, x, y, mask):
         r = torch.sigmoid(gi[:, :Hn] + gh[:, :Hn])
         z = torch.sigmoid(gi[:, Hn:2 * Hn] + gh[:, Hn:2 * Hn])
         n = torch.tanh(gi[:, 2 * Hn:] + r * gh[:, 2 * Hn:])
-        h = (1 - z) * n + z * h
+        h_new = (1 - z) * n + z * h
+        if update_masks is not None:
+            m = update_masks[:, t].view(-1, 1)
+            h = m * h_new + (1 - m) * h
+        else:
+            h = h_new
         outs.append(h @ ps['W_output'].t() + b_out)
     out = torch.stack(outs, 1)
-    return dict(zip(ps, torch.autograd.grad(mse(out, y, mask), list(ps.values()))))
+    loss = mse(out, y, mask) if loss_fn is None else loss_fn(out, y, mask)[0]
+    return dict(zip(ps, torch.autograd.grad(loss, list(ps.values()))))
 
 
 class TestGRUGradients(unittest.TestCase):
@@ -148,19 +157,61 @@ class TestGRUGradients(unittest.TestCase):
         with self.assertRaises(AssertionError):
             make_net(rule='local_direct')
 
-    def test_update_masks_freeze_rows(self):
+    def test_custom_loss_drives_rflo(self):
+        """A non-MSE loss (seq-MNIST's cross-entropy) must drive the traces: the
+        RFLO gradient equals the detached-recurrence oracle under THAT loss, its
+        readout gradient equals BPTT's under that loss, and the reported loss is it."""
         x, y, mask = data()
+        labels = torch.zeros_like(y)
+        labels[torch.arange(B), :, torch.randint(0, O, (B,))] = 1
+        ce = mpn.masked_cross_entropy_loss_and_grad
+        net = make_net(rule='local_diag_rflo')
+        got = net.local_diag_rflo_gradients(x, labels, mask, loss_and_grad=ce)
+        ref = rflo_oracle(net, x, labels, mask, loss_fn=ce)
+        for k, v in ref.items():
+            torch.testing.assert_close(got[k], v, rtol=1e-10, atol=1e-12)
+        bptt = net.bptt_gradients(x, labels, mask, loss_and_grad=ce)
+        for k in ('W_output', 'b_output'):
+            torch.testing.assert_close(got[k], bptt[k], rtol=1e-10, atol=1e-12)
+        torch.testing.assert_close(got['loss'], ce(got['outputs'], labels, mask)[0])
+        torch.testing.assert_close(got['outputs'], bptt['outputs'])
+        # ... and it is NOT the MSE gradient.
+        under_mse = net.local_diag_rflo_gradients(x, labels, mask)
+        self.assertGreater((got['W_output'] - under_mse['W_output']).abs().max().item(), 1e-3)
+        # sequence_gradients forwards the kwarg (the training loop's path).
+        net.sequence_gradients(x, labels, mask, loss_and_grad=ce)
+        torch.testing.assert_close(net.W_output.grad, got['W_output'])
+
+    def test_update_masks_freeze_state_before_readout(self):
+        x, y, mask = data()
+        labels = torch.zeros_like(y)
+        labels[torch.arange(B), :, torch.randint(0, O, (B,))] = 1
         net = make_net(rule='local_diag_rflo')
         full = net.local_diag_rflo_gradients(x, y, mask)
         um1 = torch.ones(B, T, dtype=torch.double)
         same = net.local_diag_rflo_gradients(x, y, mask, update_masks=um1)
         for k in net._trainable_params():
             torch.testing.assert_close(same[k], full[k], rtol=0, atol=0)
+        # All frozen: the zero state never advances, every output is b_output, no
+        # recurrent-block or W_output gradient (only b_output sees the error).
+        um0 = torch.zeros(B, T, dtype=torch.double)
+        got0 = net.local_diag_rflo_gradients(x, y, mask, update_masks=um0)
+        torch.testing.assert_close(got0['outputs'], net.b_output.expand(B, T, O), rtol=0, atol=0)
+        for k in ('W_input', 'W_rec', 'b_input', 'b_rec', 'W_output'):
+            self.assertEqual(got0[k].abs().max().item(), 0.0, k)
+        self.assertGreater(got0['b_output'].abs().max().item(), 0.0)
+        # Partial / graded masks: state AND traces blend before the readout — equals
+        # the oracle with the same blend (also under cross-entropy).
         um = um1.clone()
-        um[0, 2:] = 0          # row 0 frozen from t=2 on: state and traces stop advancing
-        got = net.local_diag_rflo_gradients(x, y, mask, update_masks=um)
-        for k in net._trainable_params():
-            self.assertTrue(torch.isfinite(got[k]).all())
+        um[0, 2:] = 0
+        um[1, 3] = 0.25
+        # (The CE helper's analytic gradient assumes one-hot targets, so use labels.)
+        for loss_fn, target in ((None, y), (mpn.masked_cross_entropy_loss_and_grad, labels)):
+            kw = {} if loss_fn is None else {'loss_and_grad': loss_fn}
+            got = net.local_diag_rflo_gradients(x, target, mask, update_masks=um, **kw)
+            ref = rflo_oracle(net, x, target, mask, loss_fn=loss_fn, update_masks=um)
+            for k, v in ref.items():
+                torch.testing.assert_close(got[k], v, rtol=1e-10, atol=1e-12)
         self.assertFalse(torch.allclose(got['W_rec'], full['W_rec']))
 
     def test_no_bias_variant(self):

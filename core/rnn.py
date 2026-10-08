@@ -25,6 +25,9 @@ RFLO eligibility traces (i = post/hidden unit; j = pre hidden; I = pre input):
     dL/dW_input_{iI} = sum_t ell_{i,t} q^in_{iI,t}
     dL/db_{i}        = sum_t ell_{i,t} s^b_{i,t}
 Readout grads stay EXACT (dL/dW_output, dL/db_output use the true dL_t/dy_t).
+dL_t/dy_t comes from the task's loss_and_grad (masked MSE inline; any other loss,
+e.g. seq-MNIST cross-entropy, via a forward-only pre-pass), so RFLO optimizes the
+same objective BPTT does.
 Under 'local_diag_rflo' ALL weights (input, recurrent, bias) train by RFLO; under
 'bptt' everything trains by exact autograd — the learning_rule governs the whole
 network, there is no separate per-layer control.
@@ -134,26 +137,48 @@ class LeakyRNN(BaseNetwork):
             ps['b_output'] = self.b_output
         return {k: v for k, v in ps.items() if v.requires_grad}
 
-    def _step(self, x_t, h_prev):
-        """One leaky recurrent step. Returns (u_t pre-activation, h_t, y_t)."""
+    def _recur(self, x_t, h_prev):
+        """The recurrent half of a step: (u_t pre-activation, candidate h_t)."""
         u = (torch.einsum('iI,BI->Bi', self.W_input, x_t)
              + torch.einsum('ij,Bj->Bi', self.W_rec, h_prev)
              + self.b_hidden.unsqueeze(0))
-        h = self.alpha * h_prev + (1.0 - self.alpha) * self.act_fn(u)
-        y = torch.einsum('ai,Bi->Ba', self.W_output, h) + self.b_output.unsqueeze(0)
-        return u, h, y
+        return u, self.alpha * h_prev + (1.0 - self.alpha) * self.act_fn(u)
+
+    def _readout(self, h):
+        return torch.einsum('ai,Bi->Ba', self.W_output, h) + self.b_output.unsqueeze(0)
+
+    def _step(self, x_t, h_prev):
+        """One leaky recurrent step. Returns (u_t pre-activation, h_t, y_t)."""
+        u, h = self._recur(x_t, h_prev)
+        return u, h, self._readout(h)
+
+    @staticmethod
+    def _blend(new, old, update_masks, t):
+        """update_masks semantics: a batch row whose mask is 0 at step t keeps
+        `old` (state or trace); 1 takes `new`; graded values interpolate."""
+        if update_masks is None:
+            return new
+        m = update_masks[:, t].to(new.dtype).view(-1, *([1] * (new.dim() - 1)))
+        return m * new + (1.0 - m) * old
 
     @torch.no_grad()
-    def forward_outputs(self, inputs):
-        """No-grad unrolled forward, returning outputs (B, T, n_output). Used to
-        score held-out data."""
+    def _unroll(self, inputs, update_masks=None):
+        """No-grad forward with the local pass's update_masks semantics (state mask
+        BEFORE the readout, so a frozen row's output repeats the readout of its
+        frozen state). Returns outputs (B, T, n_output)."""
         B, T, _ = inputs.shape
         h = torch.zeros(B, self.n_hidden, device=inputs.device, dtype=inputs.dtype)
         outs = []
         for t in range(T):
-            _, h, y = self._step(inputs[:, t, :], h)
-            outs.append(y)
+            _, h_new = self._recur(inputs[:, t, :], h)
+            h = self._blend(h_new, h, update_masks, t)
+            outs.append(self._readout(h))
         return torch.stack(outs, dim=1)
+
+    def forward_outputs(self, inputs):
+        """No-grad unrolled forward, returning outputs (B, T, n_output). Used to
+        score held-out data."""
+        return self._unroll(inputs)
 
     def bptt_gradients(self, inputs, labels, masks,
                        loss_and_grad=masked_mse_loss_and_output_grad):
@@ -198,10 +223,27 @@ class LeakyRNN(BaseNetwork):
         """RFLO gradients — forward-mode eligibility traces, no BPTT. Drops the
         network-mediated recurrent sensitivity term (approximation to BPTT).
         Readout gradients stay exact. Returns the same dict shape as
-        bptt_gradients()."""
+        bptt_gradients().
+
+        loss_and_grad: the task objective. Masked MSE (the default) is computed
+        inline per step; any other loss (e.g. seq-MNIST's cross-entropy) runs a
+        forward-only pre-pass for the full output sequence and feeds its per-step
+        dL/dy_t to the traces, so RFLO optimizes the loss that is reported.
+        update_masks (B, T) or None: a row with 0 at step t keeps its hidden state
+        and its traces from t-1; the state mask is applied BEFORE the readout, so
+        that row's output repeats the frozen state's readout. Whether a frozen
+        step counts in the loss is the cost mask's business."""
         B, T, _ = inputs.shape
         dev, dt = inputs.device, inputs.dtype
         a1 = 1.0 - self.alpha
+
+        default_loss = loss_and_grad is masked_mse_loss_and_output_grad
+        if default_loss:
+            outputs = torch.zeros(B, T, self.n_output, dtype=dt, device=dev)
+            N = B * T * self.n_output
+        else:
+            outputs = self._unroll(inputs, update_masks)
+            loss, grad_output_seq = loss_and_grad(outputs, labels, masks)
 
         h = torch.zeros(B, self.n_hidden, device=dev, dtype=dt)
         p_rec = torch.zeros(B, self.n_hidden, self.n_hidden, device=dev, dtype=dt)
@@ -213,38 +255,33 @@ class LeakyRNN(BaseNetwork):
         grad_b_hidden = torch.zeros_like(self.b_hidden)
         grad_W_output = torch.zeros_like(self.W_output)
         grad_b_output = torch.zeros_like(self.b_output)
-        outputs = torch.zeros(B, T, self.n_output, dtype=dt, device=dev)
 
         feedback = self.W_output if self.feedback_mode == 'exact_spatial' else self.B_feedback
-        N = B * T * self.n_output
 
         for t in range(T):
             x_t = inputs[:, t, :]
             h_prev = h
-            u, h, y = self._step(x_t, h_prev)
-            outputs[:, t, :] = y
+            u, h_new = self._recur(x_t, h_prev)
+            # State mask FIRST, then the readout of the (possibly frozen) state.
+            h = self._blend(h_new, h_prev, update_masks, t)
+            y = self._readout(h)
+            if default_loss:
+                outputs[:, t, :] = y
 
             # Advance eligibility traces to time t (RFLO: local, drops W_rec-
             # mediated cross-neuron term). Uses phi'(u_t) and h_{t-1} / x_t.
             phi_p = self.act_fn_p(u)                                # (B, i)
-            p_rec_new = self.alpha * p_rec + a1 * torch.einsum('Bi,Bj->Bij', phi_p, h_prev)
-            q_in_new = self.alpha * q_in + a1 * torch.einsum('Bi,BI->BiI', phi_p, x_t)
-            s_b_new = self.alpha * s_b + a1 * phi_p
+            p_rec = self._blend(self.alpha * p_rec + a1 * torch.einsum('Bi,Bj->Bij', phi_p, h_prev),
+                                p_rec, update_masks, t)
+            q_in = self._blend(self.alpha * q_in + a1 * torch.einsum('Bi,BI->BiI', phi_p, x_t),
+                               q_in, update_masks, t)
+            s_b = self._blend(self.alpha * s_b + a1 * phi_p, s_b, update_masks, t)
 
-            if update_masks is not None:
-                # Frozen batch rows keep the previous trace / hidden state and
-                # contribute no gradient (padding beyond sequence end).
-                m = update_masks[:, t].to(dt)
-                p_rec = m.view(-1, 1, 1) * p_rec_new + (1.0 - m).view(-1, 1, 1) * p_rec
-                q_in = m.view(-1, 1, 1) * q_in_new + (1.0 - m).view(-1, 1, 1) * q_in
-                s_b = m.view(-1, 1) * s_b_new + (1.0 - m).view(-1, 1) * s_b
-                h = m.view(-1, 1) * h + (1.0 - m).view(-1, 1) * h_prev
+            if default_loss:
+                m_t, y_t = masks[:, t, :], labels[:, t, :]
+                grad_output = (2.0 / N) * m_t * (m_t * y - m_t * y_t)   # (B, a)
             else:
-                p_rec, q_in, s_b = p_rec_new, q_in_new, s_b_new
-
-            # Per-timestep output gradient (masked MSE, global 1/N) + learning signal.
-            m_t, y_t = masks[:, t, :], labels[:, t, :]
-            grad_output = (2.0 / N) * m_t * (m_t * y - m_t * y_t)   # (B, a)
+                grad_output = grad_output_seq[:, t, :]
             ell = grad_output @ feedback                            # (B, i)
 
             grad_W_rec += torch.einsum('Bi,Bij->ij', ell, p_rec)
@@ -253,7 +290,8 @@ class LeakyRNN(BaseNetwork):
             grad_W_output += torch.einsum('Ba,Bi->ai', grad_output, h)
             grad_b_output += grad_output.sum(0)
 
-        loss, _ = loss_and_grad(outputs, labels, masks)
+        if default_loss:
+            loss, _ = loss_and_grad(outputs, labels, masks)
         all_grads = {'W_input': grad_W_input, 'W_rec': grad_W_rec,
                      'b_hidden': grad_b_hidden, 'W_output': grad_W_output,
                      'b_output': grad_b_output}

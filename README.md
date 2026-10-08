@@ -78,7 +78,12 @@ recurrent sensitivity entering the gates through `W_rec` is dropped. It is exact
 `W_rec = 0` or `T = 1` and otherwise an approximation; readout gradients stay exact.
 The default hidden width is 100 (three gate blocks, so about the leaky RNN's recurrent
 parameter count at 180). `--learning-signal exact_spatial|layerwise_fa|dfa` and the
-legacy `--feedback` work as in `train_rnn.py`. Sequential MNIST
+legacy `--feedback` work as in `train_rnn.py`. In both recurrent models the RFLO pass
+takes its per-step output error from the task's loss: masked MSE inline, any other
+loss (seq-MNIST's cross-entropy) through a forward-only pre-pass, so RFLO and BPTT
+optimize the same objective. Before October 2026 the RNN's RFLO always used the MSE
+error while reporting the task loss, so earlier `train_rnn.py` seq-MNIST RFLO curves
+optimized MSE and are not comparable with new ones. Sequential MNIST
 uses cross-entropy at the final step; ring tasks use masked MSE at their scored
 times, and the adding problem uses final-step MSE. The task supplies the same
 objective to all learning rules. The adding problem is a long-range

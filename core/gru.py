@@ -33,7 +33,10 @@ With h~ = h_{t-1} held CONSTANT inside the gates (the dropped recurrent term):
     ell_{i,t}  = (dL_t/dy_t) . F[:, i]        F = W_output (exact_spatial) or random B
     dL/dtheta  = sum_t ell_{i,t} P_t(theta)
 Readout gradients stay EXACT. Under 'local_diag_rflo' the whole recurrent block
-trains by these traces; under 'bptt' everything trains by autograd.
+trains by these traces; under 'bptt' everything trains by autograd. The per-step
+output error dL_t/dy_t comes from the task's loss_and_grad (masked MSE inline, any
+other loss through a forward-only pre-pass), so RFLO optimizes the SAME objective
+BPTT does — including seq-MNIST's cross-entropy.
 
 Trainable params: W_input (3H x I), W_rec (3H x H), W_output (O x H),
 b_input (3H), b_rec (3H) when hidden_bias, b_output when output_bias.
@@ -141,23 +144,45 @@ class GRU(BaseNetwork):
         n = torch.tanh(gi[:, 2 * H:] + r * m)
         return r, z, n, m
 
+    def _recur(self, x_t, h_prev):
+        """The recurrent half of a step: ((r, z, n, m), candidate h_t)."""
+        r, z, n, m = self._gates(x_t, h_prev)
+        return (r, z, n, m), (1.0 - z) * n + z * h_prev
+
+    def _readout(self, h):
+        return h @ self.W_output.t() + self.b_output
+
     def _step(self, x_t, h_prev):
         """One GRU step. Returns ((r, z, n, m), h_t, y_t)."""
-        r, z, n, m = self._gates(x_t, h_prev)
-        h = (1.0 - z) * n + z * h_prev
-        y = h @ self.W_output.t() + self.b_output
-        return (r, z, n, m), h, y
+        gates, h = self._recur(x_t, h_prev)
+        return gates, h, self._readout(h)
+
+    @staticmethod
+    def _blend(new, old, update_masks, t):
+        """update_masks semantics: a batch row whose mask is 0 at step t keeps
+        `old` (state or trace); 1 takes `new`; graded values interpolate."""
+        if update_masks is None:
+            return new
+        m = update_masks[:, t].to(new.dtype).view(-1, *([1] * (new.dim() - 1)))
+        return m * new + (1.0 - m) * old
 
     @torch.no_grad()
-    def forward_outputs(self, inputs):
-        """No-grad unrolled forward → outputs (B, T, n_output); scores held-out data."""
+    def _unroll(self, inputs, update_masks=None):
+        """No-grad forward with the local pass's update_masks semantics: the state
+        mask is applied BEFORE the readout, so a frozen row's output repeats the
+        readout of its frozen state. Returns outputs (B, T, n_output)."""
         B, T, _ = inputs.shape
         h = torch.zeros(B, self.n_hidden, device=inputs.device, dtype=inputs.dtype)
         outs = []
         for t in range(T):
-            _, h, y = self._step(inputs[:, t, :], h)
-            outs.append(y)
+            _, h_new = self._recur(inputs[:, t, :], h)
+            h = self._blend(h_new, h, update_masks, t)
+            outs.append(self._readout(h))
         return torch.stack(outs, dim=1)
+
+    def forward_outputs(self, inputs):
+        """No-grad unrolled forward → outputs (B, T, n_output); scores held-out data."""
+        return self._unroll(inputs)
 
     # ── learning rules ───────────────────────────────────────────────────────
     def bptt_gradients(self, inputs, labels, masks,
@@ -197,11 +222,33 @@ class GRU(BaseNetwork):
                                   update_masks=None):
         """GRU-RFLO gradients: forward-mode per-unit eligibility traces (see the
         module docstring), gated by each unit's own update gate z_i, dropping the
-        recurrent sensitivity of h_{t-1} inside the gates. Readout exact. Returns
-        the same dict shape as bptt_gradients()."""
+        recurrent sensitivity of h_{t-1} inside the gates. Readout exact.
+
+        loss_and_grad: the task objective. The default masked MSE is computed
+        inline per step; ANY other loss (e.g. seq-MNIST's cross-entropy) runs a
+        forward-only pre-pass for the full output sequence, takes dL/dy_t from
+        loss_and_grad, and feeds THAT per-step error to the traces, so the
+        gradients belong to the loss that is reported (the traces themselves do
+        not depend on the loss).
+        update_masks (B, T) or None: a row with 0 at step t keeps its hidden state
+        AND its traces from t-1; the state mask is applied before the readout, so
+        that row's output y_t repeats the frozen state's readout. Whether a frozen
+        step contributes to the loss is the cost mask's business, not this one's.
+        Returns the same dict shape as bptt_gradients()."""
         B, T, _ = inputs.shape
         dev, dt = inputs.device, inputs.dtype
         H = self.n_hidden
+
+        default_loss = loss_and_grad is masked_mse_loss_and_output_grad
+        if default_loss:
+            outputs = torch.zeros(B, T, self.n_output, dtype=dt, device=dev)
+            N = B * T * self.n_output
+        else:
+            # Custom loss: the output error is a function of the WHOLE sequence
+            # (e.g. softmax over classes per step with a shared normalizer), so get
+            # it from a forward-only pre-pass with identical mask semantics.
+            outputs = self._unroll(inputs, update_masks)
+            loss, grad_output_seq = loss_and_grad(outputs, labels, masks)
 
         h = torch.zeros(B, H, device=dev, dtype=dt)
         P_in = torch.zeros(B, 3 * H, self.n_input, device=dev, dtype=dt)
@@ -212,19 +259,20 @@ class GRU(BaseNetwork):
         grad = {k: torch.zeros_like(v) for k, v in
                 (('W_input', self.W_input), ('W_rec', self.W_rec), ('b_input', self.b_input),
                  ('b_rec', self.b_rec), ('W_output', self.W_output), ('b_output', self.b_output))}
-        outputs = torch.zeros(B, T, self.n_output, dtype=dt, device=dev)
-
         feedback = self.W_output if self.feedback_mode == 'exact_spatial' else self.B_feedback
-        N = B * T * self.n_output
 
         for t in range(T):
             x_t = inputs[:, t, :]
             h_prev = h
-            (r, z, n, m), h, y = self._step(x_t, h_prev)
-            outputs[:, t, :] = y
+            (r, z, n, m), h_new = self._recur(x_t, h_prev)
+            # State mask FIRST, then the readout of the (possibly frozen) state.
+            h = self._blend(h_new, h_prev, update_masks, t)
+            y = self._readout(h)
+            if default_loss:
+                outputs[:, t, :] = y
 
-            # Immediate sensitivities of h_i to its own gate pre-activations, with
-            # h_prev treated as constant inside the gates (the dropped RFLO term).
+            # Immediate sensitivities of the CANDIDATE h_i to its own gate
+            # pre-activations, with h_prev constant inside the gates (dropped term).
             A = (1.0 - z) * (1.0 - n * n)                 # candidate gate
             C = (h_prev - n) * z * (1.0 - z)              # update gate
             D = A * m * r * (1.0 - r)                     # reset gate (via r*m in n)
@@ -232,27 +280,20 @@ class GRU(BaseNetwork):
             coef_rec = torch.cat((D, C, A * r), dim=1)    # rows of W_rec / b_rec
             z3 = z.repeat(1, 3)                           # per-unit leak for each gate block
 
-            P_in_new = z3.unsqueeze(-1) * P_in + coef_in.unsqueeze(-1) * x_t.unsqueeze(1)
-            P_rec_new = z3.unsqueeze(-1) * P_rec + coef_rec.unsqueeze(-1) * h_prev.unsqueeze(1)
-            p_bin_new = z3 * p_bin + coef_in
-            p_brec_new = z3 * p_brec + coef_rec
+            P_in = self._blend(z3.unsqueeze(-1) * P_in + coef_in.unsqueeze(-1) * x_t.unsqueeze(1),
+                               P_in, update_masks, t)
+            P_rec = self._blend(z3.unsqueeze(-1) * P_rec + coef_rec.unsqueeze(-1) * h_prev.unsqueeze(1),
+                                P_rec, update_masks, t)
+            p_bin = self._blend(z3 * p_bin + coef_in, p_bin, update_masks, t)
+            p_brec = self._blend(z3 * p_brec + coef_rec, p_brec, update_masks, t)
 
-            if update_masks is not None:
-                # Frozen batch rows keep their traces / hidden state (padding).
-                mk = update_masks[:, t].to(dt)
-                keep = (1.0 - mk)
-                P_in = mk.view(-1, 1, 1) * P_in_new + keep.view(-1, 1, 1) * P_in
-                P_rec = mk.view(-1, 1, 1) * P_rec_new + keep.view(-1, 1, 1) * P_rec
-                p_bin = mk.view(-1, 1) * p_bin_new + keep.view(-1, 1) * p_bin
-                p_brec = mk.view(-1, 1) * p_brec_new + keep.view(-1, 1) * p_brec
-                h = mk.view(-1, 1) * h + keep.view(-1, 1) * h_prev
+            if default_loss:
+                m_t, y_t = masks[:, t, :], labels[:, t, :]
+                grad_output = (2.0 / N) * m_t * (m_t * y - m_t * y_t)   # (B, a)
             else:
-                P_in, P_rec, p_bin, p_brec = P_in_new, P_rec_new, p_bin_new, p_brec_new
-
-            m_t, y_t = masks[:, t, :], labels[:, t, :]
-            grad_output = (2.0 / N) * m_t * (m_t * y - m_t * y_t)   # (B, a)
-            ell = grad_output @ feedback                            # (B, H), per unit
-            ell3 = ell.repeat(1, 3)                                 # same signal for each gate row
+                grad_output = grad_output_seq[:, t, :]
+            ell = grad_output @ feedback                                # (B, H), per unit
+            ell3 = ell.repeat(1, 3)                                     # same signal for each gate row
 
             grad['W_input'] += torch.einsum('Bg,BgI->gI', ell3, P_in)
             grad['W_rec'] += torch.einsum('Bg,Bgj->gj', ell3, P_rec)
@@ -261,7 +302,8 @@ class GRU(BaseNetwork):
             grad['W_output'] += torch.einsum('Ba,Bi->ai', grad_output, h)
             grad['b_output'] += grad_output.sum(0)
 
-        loss, _ = loss_and_grad(outputs, labels, masks)
+        if default_loss:
+            loss, _ = loss_and_grad(outputs, labels, masks)
         params = self._trainable_params()
         result = {k: grad[k] for k in params}
         result['loss'] = loss.detach()
