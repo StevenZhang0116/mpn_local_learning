@@ -348,6 +348,37 @@ class TestFeedbackModesAndHeads(unittest.TestCase):
         build_deep([5, 6, 3], input_mode='diag_mtrace', norm='none')
 
 
+class TestTrainingScriptEval(unittest.TestCase):
+    """train_mpn.forward_outputs (the held-out validation forward) must run the SAME
+    network the gradient paths trained: with the norm on, both net types consume
+    x_hat there too. Regression: the single-layer branch drove mp_layer on the raw
+    standardized input, so validation evaluated a different network than training."""
+
+    def test_single_layer_eval_matches_training_forward(self):
+        inp, lab, msk = make_data(4, 5, 5, 3)
+        b = build_single(5, 6, 3, rule='bptt', seed=6)
+        torch.testing.assert_close(train_mpn.forward_outputs(b, inp),
+                                   b.bptt_gradients(inp, lab, msk)['outputs'],
+                                   rtol=1e-12, atol=1e-12)
+        loc = build_single(5, 6, 3, rule='local_exact_rowlocal', seed=6)
+        loc.load_state_dict(b.state_dict())
+        torch.testing.assert_close(train_mpn.forward_outputs(loc, inp),
+                                   loc.sequence_gradients(inp, lab, msk)['outputs'],
+                                   rtol=1e-12, atol=1e-12)
+        # Sanity: the un-normalized forward is a different network.
+        b.mp_input_norm = 'none'
+        self.assertGreater(rel(train_mpn.forward_outputs(b, inp),
+                               train_mpn.forward_outputs(loc, inp)), 1e-2)
+
+    def test_deep_eval_matches_training_forward(self):
+        inp, lab, msk = make_data(3, 4, 5, 3)
+        for residual in (False, True):
+            b = build_deep([5, 6, 6, 3], rule='bptt', residual=residual, seed=7)
+            torch.testing.assert_close(train_mpn.forward_outputs(b, inp),
+                                       b.bptt_gradients(inp, lab, msk)['outputs'],
+                                       rtol=1e-12, atol=1e-12, msg=f'res={residual}')
+
+
 class TestCLI(unittest.TestCase):
     def test_parser_and_params(self):
         args = train_mpn._parse_args(['--mp-input-norm', 'rms', '--mp-input-norm-eps', '1e-6'])

@@ -509,9 +509,15 @@ synapse `(i,I)` has gain `lambda + eta*phi'*W_iI*x_I**2`. Both traces stay
 bounded only while these gains stay below one along the trajectory. Without the
 norm, `sum_J W_iJ x_J**2` scales with the fan-in, with the magnitude of the input at
 that step and, with `--residual`, with the depth of the residual stream, so no single
-`--eta` is right for every layer. With `||x_hat||**2 = d` and Xavier weights the row
-sum is O(1) in every layer and at every step, and `eta/(1-lambda)` becomes the one
-dimensionless knob. On `contextdelaydm1` with `--hidden 64 64 64`
+`--eta` is right for every layer. For the **multiplicative** MPN (`--mp-type mult`,
+the default) `||x_hat||**2 = d` and zero-mean Xavier weights make the row sum O(1) in
+every layer and at every step, and `eta/(1-lambda)` becomes the one dimensionless
+knob. This does **not** carry over to the additive MPN (`--mp-type add`): there the
+row gain is `lambda + eta*phi'*sum_J x_J**2 = lambda + eta*phi'*d`, proportional to
+the fan-in, so the RMS norm pins it at its largest value; at `eta=0.003, lambda=0.99`
+on a 3x128 `contextdelaydm1` stack the row gain exceeds 1 in about 0.1% of
+unit-steps for `mult` but 5-6% for `add`. With `add`, scale `eta` by `1/d` (or
+normalize to unit L2 norm instead). On `contextdelaydm1` with `--hidden 64 64 64`
 (`notebooks/rflo_trace_gain.py --mp-input-norm rms --eta ETA --lam 0.99`, batch 8):
 
 | setting | row gain > 1 (per step, layers 1–3) | diagonal gain > 1 | max trace at the end | cos vs BPTT (exact / diag) |
@@ -522,7 +528,7 @@ dimensionless knob. On `contextdelaydm1` with `--hidden 64 64 64`
 | `rms, eta=0.003` (0.3) | 0–0.2 % | 0 % | 0.5–1.5 | 0.99–1.0 / 0.98–0.99 |
 | `rms, eta=0.015, lam=0.95` (0.3) | 0–0.2 % | 0 % | 0.8–3 | 0.94–1.0 / 0.89–0.97 |
 
-So with the norm on, `eta ≈ 0.3*(1-lambda)` keeps every layer's traces bounded
+So with the norm on (multiplicative MPN), `eta ≈ 0.3*(1-lambda)` keeps every layer's traces bounded
 without `--rflo-trace-rho` (the capped and uncapped diagonal variants then
 coincide), while the modulation still reaches `O(0.1)` per synapse. The condition
 depends on the weights, so a run that grows `W` substantially may re-enter the

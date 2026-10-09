@@ -43,7 +43,8 @@ matrix is `lam*I + eta*phi'(z_i) x x^T diag(W_i)`-like, with the single non-triv
 eigenvalue
 
 ```text
-mu_i,t = lam + eta * phi'(z_i,t) * sum_J W_iJ x_J,t^2        (exact row-local, BPTT)
+mu_i,t = lam + eta * phi'(z_i,t) * sum_J W_iJ x_J,t^2        (exact row-local, BPTT; mult)
+mu_i,t = lam + eta * phi'(z_i,t) * sum_J x_J,t^2              (additive MPN, W_eff = W + M)
 ```
 
 and the diagonal RFLO trace `A_iI` has the scalar gain
@@ -55,9 +56,14 @@ g_iI,t = lam + eta * phi'(z_i,t) * W_iI x_I,t^2              (diag RFLO)
 Traces stay bounded only while these stay inside `(-1, 1)` along the trajectory.
 `sum_J W_iJ x_J^2` scales with the fan-in, with `||x_t||^2` at that step and, under
 `--residual`, with the growing norm of the residual stream, so one `eta` cannot be
-right for every layer. With `||x_hat||^2 = d` and Xavier-scaled `W` the row sum is
-`O(1)` in every layer and at every step, and `eta/(1-lam)` becomes the single
-dimensionless knob. Measured on `contextdelaydm1` (`--hidden 64 64 64`), `eta ≈
+right for every layer. For the MULTIPLICATIVE MPN, `||x_hat||^2 = d` and zero-mean
+Xavier-scaled `W` make the row sum `O(1)` in every layer and at every step, and
+`eta/(1-lam)` becomes the single dimensionless knob. The additive MPN has no `W` in
+its row sum: its gain is `lam + eta*phi'*||x_hat||^2 = lam + eta*phi'*d`, which the
+RMS norm pins at the fan-in, so the same `eta` is far less stable there (at
+`eta=0.003, lam=0.99`, 3x128 `contextdelaydm1`: ~0.1% of unit-steps above 1 for
+`mult` versus 5-6% for `add`); with `add`, scale `eta` by `1/d`, or normalize to
+unit L2 norm. Measured on `contextdelaydm1` (`--hidden 64 64 64`, mult), `eta ≈
 0.3*(1-lam)` keeps all three layers' traces bounded without `--rflo-trace-rho`;
 see the README table. The row sum still depends on the weights, so it is a
 trajectory-dependent condition, not a fixed hyperparameter range.

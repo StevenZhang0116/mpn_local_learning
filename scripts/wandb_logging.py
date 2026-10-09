@@ -69,6 +69,8 @@ def _base_config(cfg, experiment):
         "learning_signal": getattr(cfg, "learning_signal", "global"),
         "input_mode": getattr(cfg, "input_mode", "match"),
         "input_normalize": getattr(cfg, "input_normalize", False),
+        "mp_input_norm": getattr(cfg, "mp_input_norm", "none"),
+        "mp_input_norm_eps": getattr(cfg, "mp_input_norm_eps", 1e-5),
         "mp_residual": getattr(cfg, "mp_residual", False),
         "residual_scale": getattr(cfg, "residual_scale", 1.0),
         "cross_layer_steps": getattr(cfg, "cross_layer_steps", 0),

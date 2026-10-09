@@ -524,6 +524,11 @@ def forward_outputs(net, inputs):
             out, _, _ = net.network_step(inputs[:, t, :], seq_idx=t)
             outs.append(out)
     else:  # MultiPlasticNet (single MP layer, no embedding)
+        # The layer, its Hebbian write and its traces consumed the optionally
+        # RMS-normalized input during training (mp_input_norm, applied once to the
+        # sequence exactly as bptt_gradients does); evaluate the SAME network.
+        # Identity unless the norm is on.
+        inputs = net._mp_input_norm_seq(inputs)
         for t in range(T):
             x_t = inputs[:, t, :]
             hidden_pre, _ = net.mp_layer(x_t)
