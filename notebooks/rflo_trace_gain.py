@@ -48,11 +48,14 @@ TEXT, MUTED, GRID = "#0b0b0b", "#52514e", "#d8d7d2"
 
 
 def build(task_name, widths, rule, rho, seed, batch, residual=False, device="cpu",
-          dtype=torch.float32, data_seed=1):
+          dtype=torch.float32, data_seed=1, overrides=None):
     """A deep MPN from train_mpn's parameter builder (so every default matches the
-    training script), plus one training batch. Returns (net, (x, y, mask))."""
+    training script), plus one training batch. Returns (net, (x, y, mask)).
+    overrides: extra train_mpn module globals to patch for this build, e.g.
+    {'MP_INPUT_NORM': 'rms', 'ETA': [0.01], 'LAM': 0.99} (same semantics as the
+    corresponding --mp-input-norm / --eta / --lam flags of train_mpn.py)."""
     with patch.multiple(train_mpn, N_HIDDEN=list(widths), RULESET=task_name,
-                        MP_RESIDUAL=residual, RFLO_TRACE_RHO=rho):
+                        MP_RESIDUAL=residual, RFLO_TRACE_RHO=rho, **(overrides or {})):
         # Seed BEFORE the task is initialized: the ring tasks draw their trial
         # generator's seed from the global numpy stream at init time.
         np.random.seed(seed)
@@ -138,14 +141,14 @@ def record_exact(net, x, y, mask):
 
 
 def analyze(task_name, widths=(128, 128, 128), batch=16, seed=0, rho=0.99, residual=False,
-            device="cpu", dtype=torch.float32):
+            device="cpu", dtype=torch.float32, overrides=None):
     """All measurements for one task/batch: three local variants on identical
     init and data, plus the BPTT reference. Returns a JSON-safe summary and the
-    per-step curves."""
+    per-step curves. overrides: see build()."""
     L = len(widths)
-    net_exact, (x, y, mask) = build(task_name, widths, "local_exact_rowlocal", None, seed, batch, residual, device, dtype)
-    net_diag, _ = build(task_name, widths, "local_diag_rflo", None, seed, batch, residual, device, dtype)
-    net_cap, _ = build(task_name, widths, "local_diag_rflo", rho, seed, batch, residual, device, dtype)
+    net_exact, (x, y, mask) = build(task_name, widths, "local_exact_rowlocal", None, seed, batch, residual, device, dtype, overrides=overrides)
+    net_diag, _ = build(task_name, widths, "local_diag_rflo", None, seed, batch, residual, device, dtype, overrides=overrides)
+    net_cap, _ = build(task_name, widths, "local_diag_rflo", rho, seed, batch, residual, device, dtype, overrides=overrides)
     for other in (net_diag, net_cap):          # same init by construction (same seed); assert it
         for k, p in net_exact._trainable_params().items():
             assert torch.equal(other._trainable_params()[k], p), k
@@ -176,6 +179,7 @@ def analyze(task_name, widths=(128, 128, 128), batch=16, seed=0, rho=0.99, resid
         ))
     summary = dict(task=task_name, T=int(T), batch=int(batch), widths=[int(w) for w in widths], seed=seed,
                    rho=rho, residual=residual, dtype=str(dtype),
+                   mp_input_norm=net_exact.mp_input_norm,
                    eta=float(net_exact.mp_layers[0].eta.mean()), lam=float(net_exact.mp_layers[0].lam.mean()),
                    layers=layers)
     curves = dict(T=T, keys=keys,
@@ -268,7 +272,8 @@ def plot(summary, curves, path):
         ax.grid(False, axis="x")
     fig.suptitle(f"{summary['task']}: why diagonal RFLO needs the trace-gain cap  "
                  f"(T={summary['T']}, batch={summary['batch']}, η={summary['eta']:g}, λ={summary['lam']:.3g}, "
-                 f"widths={summary['widths']}, residual={'on' if summary['residual'] else 'off'})",
+                 f"widths={summary['widths']}, residual={'on' if summary['residual'] else 'off'}"
+                 f"{', MP-input ' + summary['mp_input_norm'] + ' norm' if summary.get('mp_input_norm', 'none') != 'none' else ''})",
                  color=TEXT, fontsize=11, y=1.0)
     fig.tight_layout()
     Path(path).parent.mkdir(parents=True, exist_ok=True)
@@ -277,9 +282,16 @@ def plot(summary, curves, path):
     return path
 
 
-def run(task_name, widths, batch, seed, rho, residual, output_dir=None, device="cpu", dtype=torch.float32):
-    summary, curves = analyze(task_name, widths, batch, seed, rho, residual, device, dtype)
+def run(task_name, widths, batch, seed, rho, residual, output_dir=None, device="cpu", dtype=torch.float32,
+        overrides=None):
+    summary, curves = analyze(task_name, widths, batch, seed, rho, residual, device, dtype, overrides=overrides)
     tag = f"{task_name}_h{'-'.join(str(w) for w in widths)}_b{batch}_rho{rho:g}_seed{seed}"
+    if summary.get("mp_input_norm", "none") != "none":
+        tag += f"_mpnorm-{summary['mp_input_norm']}"
+    if overrides and overrides.get("ETA") is not None:
+        tag += "_eta" + "-".join(f"{e:g}" for e in overrides["ETA"])
+    if overrides and overrides.get("LAM") is not None:
+        tag += f"_lam{overrides['LAM']:g}"
     out = Path(output_dir) if output_dir else _bootstrap.ROOT / "notebooks" / "rflo_trace_gain"
     out.mkdir(parents=True, exist_ok=True)
     fig_path = plot(summary, curves, out / f"{tag}.png")
@@ -304,6 +316,12 @@ def _parse(argv=None):
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--rho", type=float, default=0.99, help="trace-gain cap for the capped variant")
     p.add_argument("--residual", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--mp-input-norm", choices=["none", "rms"], default="none",
+                   help="per-step RMS norm of each MP layer's input (train_mpn --mp-input-norm)")
+    p.add_argument("--eta", type=float, nargs="+", default=None,
+                   help="fixed Hebbian write rate(s), as train_mpn --eta (default: core 1.0)")
+    p.add_argument("--lam", type=float, default=None,
+                   help="fixed modulation decay, as train_mpn --lam (default: m_time_scale setup)")
     p.add_argument("--device", default="cpu")
     p.add_argument("--dtype", choices=["float32", "float64"], default="float32")
     p.add_argument("--output-dir", type=Path, default=None)
@@ -312,8 +330,13 @@ def _parse(argv=None):
 
 def main(argv=None):
     a = _parse(argv)
+    overrides = {"MP_INPUT_NORM": a.mp_input_norm}
+    if a.eta is not None:
+        overrides["ETA"] = list(a.eta)
+    if a.lam is not None:
+        overrides["LAM"] = a.lam
     return run(a.task, a.hidden, a.batch, a.seed, a.rho, a.residual, a.output_dir, a.device,
-               torch.float64 if a.dtype == "float64" else torch.float32)
+               torch.float64 if a.dtype == "float64" else torch.float32, overrides=overrides)
 
 
 if __name__ == "__main__":
