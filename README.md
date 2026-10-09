@@ -487,6 +487,63 @@ the setting; trace CSVs include `trace_gain_clipped_fraction`, the fraction of
 candidate gains outside `[-rho,rho]` before update masks/write gates (zero when
 the cap is disabled).
 
+### MP-input RMS normalization (`--mp-input-norm rms`)
+
+`--mp-input-norm rms` rescales the presynaptic vector that **every** MP layer
+consumes, at every time step: `x_hat = x / sqrt(mean_J(x_J**2) + eps)`, so
+`||x_hat||**2` equals the layer's fan-in. The modulated forward `W(1+M)x_hat`, the
+Hebbian write `eta * a * x_hat^T` and all eligibility traces use the same `x_hat`;
+an identity residual skip carries the **un-normalized** stream (pre-norm placement).
+It is parameter-free and stateless (no learnable gain, no buffers), so checkpoints
+and `state_dict`s are unchanged and load across the two settings; `none` (the
+default) is the previous computation byte for byte. It is independent of
+`--input-normalize`, which standardizes the raw input once with fixed statistics.
+`--mp-input-norm-eps` sets `eps` (default `1e-5`). The setting is saved as
+`net_params.mp_input_norm` / `mp_input_norm_eps` in checkpoints and `config.json`,
+appears in run metadata and in the console/figure notes, and is restored on reload.
+See [`docs/mp_input_norm.md`](docs/mp_input_norm.md) for the equations.
+
+Why: the recurrence gain of a row's plastic eligibility (exact row-local and BPTT
+alike) is `lambda + eta*phi'*sum_J W_iJ x_J**2`, and the diagonal RFLO trace of
+synapse `(i,I)` has gain `lambda + eta*phi'*W_iI*x_I**2`. Both traces stay
+bounded only while these gains stay below one along the trajectory. Without the
+norm, `sum_J W_iJ x_J**2` scales with the fan-in, with the magnitude of the input at
+that step and, with `--residual`, with the depth of the residual stream, so no single
+`--eta` is right for every layer. With `||x_hat||**2 = d` and Xavier weights the row
+sum is O(1) in every layer and at every step, and `eta/(1-lambda)` becomes the one
+dimensionless knob. On `contextdelaydm1` with `--hidden 64 64 64`
+(`notebooks/rflo_trace_gain.py --mp-input-norm rms --eta ETA --lam 0.99`, batch 8):
+
+| setting | row gain > 1 (per step, layers 1–3) | diagonal gain > 1 | max trace at the end | cos vs BPTT (exact / diag) |
+|---|---|---|---|---|
+| default `eta=1, lam=0.99`, no norm | 47–52 % | 10–17 % | `A` up to 1.6e5 | −0.5…1.0 / 0.03–0.06 |
+| `rms, eta=0.01` (`eta/(1-lam)=1`) | 7–10 % | 0 % | 2–10 | 0.88–1.0 / 0.77–0.94 |
+| `rms, eta=0.005` (0.5) | 0.5–3 % | 0 % | 0.9–3 | 0.97–1.0 / 0.93–0.98 |
+| `rms, eta=0.003` (0.3) | 0–0.2 % | 0 % | 0.5–1.5 | 0.99–1.0 / 0.98–0.99 |
+| `rms, eta=0.015, lam=0.95` (0.3) | 0–0.2 % | 0 % | 0.8–3 | 0.94–1.0 / 0.89–0.97 |
+
+So with the norm on, `eta ≈ 0.3*(1-lambda)` keeps every layer's traces bounded
+without `--rflo-trace-rho` (the capped and uncapped diagonal variants then
+coincide), while the modulation still reaches `O(0.1)` per synapse. The condition
+depends on the weights, so a run that grows `W` substantially may re-enter the
+unstable regime; `rflo_trace_gain.py` reports the exceedance fractions for a
+saved configuration. Trace boundedness is not a convergence guarantee.
+
+Learning rules under the norm. Each MP layer's own eligibility recursion is
+unchanged (its input is simply `x_hat`, which does not depend on that layer's
+parameters), so the exactness statements carry over: single-layer row-local equals
+BPTT, the top layer is exact under `exact_spatial`, and `--cross-layer-steps 1` is
+exact at `T=2`. Learning signals that travel from an MP layer back to the stream
+below it (`exact_spatial`, `layerwise_fa`, the embedding's three-factor rule and
+the cross-layer correction's sources and downward sweep) pass through the norm's
+transpose Jacobian `J^T g = (g - x_hat * mean_J(g_J x_hat_J)) / r` before the
+identity-skip term is added; `dfa` projects straight onto the stream and is
+unchanged; local readout heads read the un-normalized stream and are unchanged;
+`bptt` differentiates through the norm by autograd. `--input-mode diag_mtrace` (and
+`paired`, which resolves to it) is rejected with the norm on: its one-column-per-
+embedding-row bookkeeping does not describe a layer whose columns share a
+normalizer. `tests/test_mp_input_norm.py` checks all of the above against autograd.
+
 Every `train_mpn.py` CLI invocation also mirrors stdout and stderr to
 `log/<run-id>.log`, the same `<model>_<task>_<YYYYMMDD_HHMMSS>_<hash>` name as the
 run's figure, `.npz` and checkpoint folder. The file opens under a temporary timestamped name
