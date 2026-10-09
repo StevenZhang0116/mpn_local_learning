@@ -18,6 +18,7 @@ figure_data/
 /notebooks/compare_mpn_rnn_performance/
 /notebooks/diagnose_gradients/
 /notebooks/verify_rflo_scaling/
+/notebooks/rflo_trace_gain/
 
 # Weights & Biases local run logs (offline runs, cache, artifacts)
 wandb/
