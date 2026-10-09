@@ -447,7 +447,25 @@ all training rules. The value must be finite and in `[0, 1)`. Without this flag,
 the existing `m_time_scale=4000` setup gives lambda=0.99 at dt=40. An explicit
 value is saved as `net_params.ml_params.lam_clamp`, replacing `m_time_scale`;
 the core initializes lambda from it and derives the corresponding time constant.
-Eta remains 1.0. This parameter is separate from the RFLO trace-gain cap below.
+Eta is set separately by `--eta` (next paragraph). This parameter is separate from
+the RFLO trace-gain cap below.
+
+Use `--eta 0.3` to set the fixed Hebbian write rate eta of every MP layer. It is
+saved as `net_params.ml_params.eta_clamp`, which also initializes the (untrained)
+eta parameter because `eta_init='eta_clamp'`; without the flag the core's 1.0
+applies. One value per MP layer, e.g. `--eta 0.3 0.1 0.1` with
+`--hidden 128 128 128` (bottom to top), instead writes per-layer
+`net_params.ml_params<idx>` dictionaries: copies of the shared `ml_params` with
+their own `eta_clamp`, indexed in the full architecture, so under `--net dmpn` MP
+layer i is `ml_params<i+1>` (the input embedding occupies index 0).
+`DeepMultiPlasticNet` reads a layer's own dictionary in preference to the shared
+one, so checkpoints and `config.json` restore the per-layer rates unchanged; an
+all-equal list collapses to the shared form. Values must be finite; `0` freezes M
+at zero and a negative value is anti-Hebbian. Because the diagonal-RFLO trace gain
+is `lambda + eta*phi'*x**2*W`, a smaller eta is the most direct way to keep that
+gain below 1 without the `--rflo-trace-rho` cap; like `--lam`, it changes the
+forward dynamics for every rule, so paired comparisons must share it. The first
+seed's architecture printout shows each layer's `Eta_init`.
 
 For diagonal RFLO, `--rflo-trace-rho 0.99` optionally caps the MP-weight trace
 recurrence gain. With `k = assoc * eta * phi_prime * x**2`, the candidate update is
@@ -646,6 +664,24 @@ ratios avoid unstable elementwise division. Undefined/nonfinite metrics are
 JSON `null` or empty CSV cells, never silently replaced with zero. Trace summaries
 average/maximize defined per-step values. A one-batch comparison diagnoses local
 gradient geometry; it does not establish why an entire training run failed.
+
+### Why diagonal RFLO needs the trace-gain cap
+
+```bash
+python notebooks/rflo_trace_gain.py --task contextdelaydm1 --hidden 128 128 128 --batch 16 --rho 0.99
+```
+
+On one batch, the same forward trajectory is run through exact row-local, diagonal
+RFLO without a cap, and diagonal RFLO with `--rho`, and compared with BPTT. The
+modulation-trace recurrence has gain `lam + k*W` per synapse in the diagonal
+approximation (`k = eta * phi' * x^2`) but `lam + sum_J k_J W_iJ` for the exact row
+trace; the diagonal rule keeps one signed term of that sum, so its gain can exceed 1
+where the row's net feedback is damped, and the same-synapse trace then grows
+geometrically within a trial while the exact trace stays bounded. The figure
+(`notebooks/rflo_trace_gain/<tag>.png`, with a JSON summary and `.npz` curves) shows,
+per MP layer, the ECDFs of both gains, the fraction above 1 per step, the largest
+trace entry over time for the three variants, and each variant's gradient cosine with
+BPTT. CPU is fine; it is a single-batch diagnostic, not a training run.
 
 ### Test RFLO scaling in a single MP layer
 

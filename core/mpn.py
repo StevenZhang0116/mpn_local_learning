@@ -348,7 +348,8 @@ class MultiPlasticLayer(BaseNetworkFunctions):
         dtype=torch.float))
 
         if self.eta_type in ('scalar', 'pre_vector', 'post_vector', 'matrix'):
-            init_string += '\n      Eta: {} ({}) // '.format(self.eta_type, eta_train_str)
+            init_string += '\n      Eta: {} ({}) // Eta_init: {:.3g} // '.format(
+                self.eta_type, eta_train_str, self.eta_clamp)
         else:
             raise ValueError('eta_type: {} not recognized'.format(self.eta_type))
 

@@ -158,6 +158,13 @@ INPUT_MODE = "match"
 LOCAL_BIAS_MODE = "match"
 RFLO_TRACE_RHO = None  # optional cap on the MP-weight diagonal trace recurrence gain
 LAM = None  # optional fixed modulation decay; None retains dt / m_time_scale setup
+# Optional fixed Hebbian write rate eta: written to ml_params['eta_clamp'], which also
+# initializes the (untrained) eta parameter because eta_init='eta_clamp'. None keeps
+# the core default of 1.0 in every MP layer. One value is shared by all MP layers; a
+# list with one entry per MP layer (same order as the --hidden widths, bottom to top)
+# becomes per-layer ml_params<idx> overrides, which DeepMultiPlasticNet reads in
+# preference to the shared dict. --eta.
+ETA = None
 LOG_GRAD_ALIGN = True  # --dfa disables the optional BPTT diagnostic by default
 MODULATION_BOUNDS = True
 MODULATION_MODE = "hard"       # none | hard | scaled_tanh
@@ -306,6 +313,24 @@ def _hidden_widths():
     return [int(N_HIDDEN)]
 
 
+def _eta_per_layer(n_layers):
+    """ETA normalized to one Hebbian write rate per MP layer, or None when the core
+    default applies. A scalar / one-element list is broadcast to every layer; a longer
+    list must hold exactly one entry per MP layer (same order as the widths)."""
+    if ETA is None:
+        return None
+    etas = [float(e) for e in (ETA if isinstance(ETA, (list, tuple)) else [ETA])]
+    if any(not np.isfinite(e) for e in etas):
+        raise ValueError("eta values must be finite")
+    if len(etas) == 1:
+        return etas * n_layers
+    if len(etas) != n_layers:
+        raise ValueError(
+            f"eta needs one value or one per MP layer ({n_layers} MP layers from the "
+            f"hidden widths); got {len(etas)}")
+    return etas
+
+
 def _mp_residual():
     """Honor the residual setting at every depth; the model checks widths.
 
@@ -443,6 +468,21 @@ def build_params():
         # explicit decay when requested; its time constant is derived from dt.
         net_params["ml_params"].pop("m_time_scale")
         net_params["ml_params"]["lam_clamp"] = LAM
+    etas = _eta_per_layer(len(widths))
+    if etas is not None:
+        if len(set(etas)) == 1:
+            # One rate for every MP layer: the shared dict is enough.
+            net_params["ml_params"]["eta_clamp"] = etas[0]
+        else:
+            # Layer-specific rates: DeepMultiPlasticNet looks up ml_params<mpl_idx>
+            # before the shared dict, with mpl_idx counted in the FULL architecture
+            # (the dmpn input embedding occupies index 0, so MP layer i is
+            # ml_params<i+1>). Each override is a copy of the shared settings with
+            # its own eta_clamp, so checkpoints / config.json restore it verbatim.
+            offset = 1 if net_params.get("input_layer_add", False) else 0
+            for i, eta in enumerate(etas):
+                net_params[f"ml_params{offset + i}"] = {
+                    **net_params["ml_params"], "eta_clamp": eta}
     return task_params, train_params, net_params
 
 
@@ -717,6 +757,15 @@ def parse_arguments(argv=None):
     g.add_argument("--lam", type=float, default=LAM,
                    help="fixed modulation decay, 0 <= lambda < 1, in every MP layer; "
                         "default uses m_time_scale=4000 (lambda=0.99 at dt=40)")
+    g.add_argument("--eta", type=float, nargs="+", default=ETA, metavar="ETA",
+                   help="fixed Hebbian write rate(s) of the MP layers (ml_params eta_clamp; "
+                        "eta is not trained by this script). ONE value is shared by every "
+                        "MP layer; one value PER MP layer (as many as --hidden widths, "
+                        "bottom to top) gives layer-specific rates through per-layer "
+                        "ml_params<idx> overrides. The diagonal-RFLO trace gain is "
+                        "lambda + eta*phi'*x^2*W, so a smaller eta keeps it below 1 more "
+                        "often; 0 freezes M at zero, a negative value is anti-Hebbian. "
+                        "Default: the core's 1.0 in every layer.")
     g.add_argument("--modulation-mode", choices=["none", "hard", "scaled_tanh"],
                    default=MODULATION_MODE if MODULATION_BOUNDS or MODULATION_MODE == "scaled_tanh" else "none",
                    help="modulation write: unbounded, hard clipping, or B*tanh(S/B)")
@@ -900,6 +949,13 @@ def validate_config(p, args):
         p.error("--rflo-trace-rho must be finite and strictly between 0 and 1")
     if args.lam is not None and (not np.isfinite(args.lam) or not 0 <= args.lam < 1):
         p.error("--lam must be finite and satisfy 0 <= lambda < 1")
+    if args.eta is not None:
+        if any(not np.isfinite(e) for e in args.eta):
+            p.error("--eta values must be finite")
+        n_mp = len(args.hidden) if args.hidden is not None else len(_hidden_widths())
+        if len(args.eta) not in (1, n_mp):
+            p.error(f"--eta takes one value or one per MP layer ({n_mp} here, from "
+                    f"--hidden); got {len(args.eta)}")
     if args.batch_size <= 0:
         p.error("--batch-size must be a positive integer")
     return args
@@ -918,7 +974,7 @@ def main():
     global USE_WANDB, WANDB_PROJECT, WANDB_ENTITY, WANDB_MODE
     global MODULATION_MODE, MODULATION_BOUND, MODULATION_BOUNDS, MP_TYPE
     global DFA_PRESET
-    global RFLO_TRACE_RHO, LAM
+    global RFLO_TRACE_RHO, LAM, ETA
     global SEED, LEARNING_SIGNAL, LOCAL_SIGNAL_ALPHA
     global LR, HEAD_LR_MULT, LR_SCHEDULE, LR_PATIENCE, LR_FACTOR
     global RESIDUAL_SCALE
@@ -946,6 +1002,7 @@ def main():
     LOCAL_BIAS_MODE = args.local_bias_mode
     RFLO_TRACE_RHO = args.rflo_trace_rho
     LAM = args.lam
+    ETA = args.eta
     MODULATION_MODE = args.modulation_mode
     MP_TYPE = args.mp_type
     MODULATION_BOUND = args.modulation_bound

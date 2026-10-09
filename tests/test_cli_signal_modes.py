@@ -7,6 +7,7 @@ effective-configuration line. Run from tests/: python -m unittest test_cli_signa
 import contextlib
 import copy
 import io
+import json
 import sys
 import tempfile
 import unittest
@@ -39,7 +40,7 @@ def rejects(*argv):
 
 
 SIGNAL_INDEPENDENT = ('rules', 'input_mode', 'local_bias_mode', 'cross_layer_steps',
-                      'grad_align', 'net', 'residual', 'lam', 'rflo_trace_rho')
+                      'grad_align', 'net', 'residual', 'lam', 'rflo_trace_rho', 'eta')
 
 
 class TestSignalModeCLI(unittest.TestCase):
@@ -220,6 +221,81 @@ class TestPlateauKnobs(unittest.TestCase):
         self.assertIsNone(none)
         with self.assertRaises(ValueError):
             train_common.make_optim(net, 1e-3, lr_factor=1.5)
+
+
+def layer_etas(net):
+    return [round(float(mp.eta), 6) for mp in net.mp_layers]
+
+
+class TestEtaKnob(unittest.TestCase):
+    """--eta: the Hebbian write rate reaches ml_params['eta_clamp'] (one shared value)
+    or per-layer ml_params<idx> overrides (one value per MP layer, bottom to top); the
+    built layers carry it, the default leaves the core's 1.0, the setting survives the
+    config/checkpoint path and enters the run-ID signature, bad lists are rejected."""
+
+    def test_default_keeps_the_core_eta(self):
+        self.assertIsNone(parse().eta)
+        with patch.multiple(train_mpn, N_HIDDEN=[8, 8], NET_TYPE='dmpn'):
+            net_params = train_mpn.build_params()[2]
+            self.assertNotIn('eta_clamp', net_params['ml_params'])
+            self.assertEqual([k for k in net_params if k.startswith('ml_params')], ['ml_params'])
+            net = mpn.DeepMultiPlasticNet(net_params, verbose=False)
+        self.assertEqual(layer_etas(net), [1.0, 1.0])
+
+    def test_one_value_is_shared_by_every_layer(self):
+        self.assertEqual(parse('--eta', '0.3').eta, [0.3])
+        for eta in ([0.3], 0.3, [0.3, 0.3, 0.3]):      # CLI list, programmatic scalar, all-equal list
+            with self.subTest(eta=eta), \
+                    patch.multiple(train_mpn, ETA=eta, N_HIDDEN=[8, 8, 8], NET_TYPE='dmpn'):
+                net_params = train_mpn.build_params()[2]
+                self.assertEqual(net_params['ml_params']['eta_clamp'], 0.3)
+                self.assertEqual([k for k in net_params if k.startswith('ml_params')], ['ml_params'])
+                self.assertEqual(layer_etas(mpn.DeepMultiPlasticNet(net_params, verbose=False)),
+                                 [0.3, 0.3, 0.3])
+        with patch.multiple(train_mpn, ETA=[0.3], N_HIDDEN=8, NET_TYPE='mpn1', MP_RESIDUAL=False):
+            net_params = train_mpn.build_params()[2]
+            self.assertEqual(net_params['ml_params']['eta_clamp'], 0.3)
+            net = mpn.MultiPlasticNet(net_params, verbose=False)
+            self.assertEqual(round(float(net.mp_layer.eta), 6), 0.3)
+
+    def test_per_layer_values_become_ml_params_overrides(self):
+        a = parse('--eta', '0.3', '0.1', '0.05', '--hidden', '8', '8', '8')
+        self.assertEqual(a.eta, [0.3, 0.1, 0.05])
+        with patch.multiple(train_mpn, ETA=[0.3, 0.1, 0.05], N_HIDDEN=[8, 8, 8], NET_TYPE='dmpn'):
+            net_params = train_mpn.build_params()[2]
+            # dmpn: the input embedding is architecture index 0, so MP layer i is
+            # ml_params<i+1>; the shared dict stays eta-free and everything else is
+            # inherited from it.
+            self.assertNotIn('eta_clamp', net_params['ml_params'])
+            self.assertEqual([net_params[f'ml_params{i}']['eta_clamp'] for i in (1, 2, 3)],
+                             [0.3, 0.1, 0.05])
+            self.assertNotIn('ml_params0', net_params)
+            for i in (1, 2, 3):
+                rest = {k: v for k, v in net_params[f'ml_params{i}'].items() if k != 'eta_clamp'}
+                self.assertEqual(rest, net_params['ml_params'])
+            net = mpn.DeepMultiPlasticNet(net_params, verbose=False)
+            self.assertEqual(layer_etas(net), [0.3, 0.1, 0.05])
+            for mp in net.mp_layers:                     # lambda is untouched
+                self.assertAlmostEqual(float(mp.lam), 0.99, places=6)
+            # config.json serialization and a checkpoint-style rebuild keep the rates
+            json.dumps(train_common._json_safe(net_params))
+            rebuilt = mpn.DeepMultiPlasticNet(copy.deepcopy(net_params), verbose=False)
+            self.assertEqual(layer_etas(rebuilt), [0.3, 0.1, 0.05])
+            run_id_per_layer = train_mpn._cfg().run_id
+        with patch.multiple(train_mpn, ETA=[0.3], N_HIDDEN=[8, 8, 8], NET_TYPE='dmpn'):
+            self.assertNotEqual(train_mpn._cfg().run_id, run_id_per_layer)
+        with patch.multiple(train_mpn, ETA=[0.3, 0.1], N_HIDDEN=[8, 8, 8], NET_TYPE='dmpn'), \
+                self.assertRaises(ValueError):
+            train_mpn.build_params()
+
+    def test_bad_values_are_rejected(self):
+        for bad in (['--eta', 'nan'], ['--eta', 'inf'], ['--eta'],
+                    ['--eta', '0.3', '0.1'],                                # default --hidden: 1 MP layer
+                    ['--eta', '0.3', '0.1', '--hidden', '8', '8', '8']):   # 2 values, 3 MP layers
+            with self.subTest(bad=bad):
+                self.assertTrue(rejects(*bad))
+        self.assertEqual(parse('--eta', '0', '--hidden', '8', '8').eta, [0.0])  # frozen M
+        self.assertEqual(parse('--eta', '-0.5').eta, [-0.5])                     # anti-Hebbian
 
 
 class TestEffectiveConfigLine(unittest.TestCase):
