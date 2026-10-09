@@ -22,6 +22,40 @@ picks where each MP layer's signal comes from (`exact_spatial`, `layerwise_fa`, 
 picks how the embedding is trained. See "Choosing the learning signal" below.
 Readout gradients are always exact.
 
+## Additive and multiplicative MPNs
+
+`--mp-type mult` (default) uses `W_eff = W*(1+M)`; `--mp-type add` uses
+`W_eff = W+M`. Both support `bptt`, `local_direct`, `local_diag_rflo`, and
+`local_exact_rowlocal`, with `--net mpn1` or any depth of `--net dmpn`.
+The choice is independent of the learning signal, residual connections,
+input/bias policy, and `--cross-layer-steps` (their existing compatibility rules
+still apply). BPTT remains full main-loss BPTT under `--input-mode match`.
+
+For example, from the repository root:
+
+```bash
+python scripts/train_mpn.py --mp-type add --task contextdelaydm1 \
+  --hidden 128 128 128 --no-residual --learning-signal local_readout \
+  --rules local_direct local_diag_rflo local_exact_rowlocal bptt \
+  --input-mode match --local-bias-mode match --cross-layer-steps 0 \
+  --lam 0.99 --rflo-trace-rho 0.99 \
+  --modulation-mode hard --modulation-bound 0.1 \
+  --batch-size 128 --steps 5000 --runs 3 --lr 0.001
+```
+
+For one MP layer with an embedding, use `--hidden 128`; without an embedding,
+also use `--net mpn1 --learning-signal exact_spatial`. For temporal cross-layer
+correction, use `--learning-signal exact_spatial --cross-layer-steps 1`.
+
+Additive `--modulation-bound B` bounds **absolute weight increments** in
+`[-B,B]`, independently of W. It does not preserve weight signs. Multiplicative
+bounds remain dimensionless gains. The example's `B=0.1` is a starting value,
+not an established optimum: equal bounds/eta do not match the strength of the
+two architectures. Tune the bound or smooth scale when comparing them.
+The additive option changes neither the activation nor the Hebbian write rule;
+eta remains at its existing setting. See [the equations and tests](docs/additive_mpn.md).
+Configuration JSON and checkpoints save the choice as `net_params.ml_params.mp_type`.
+
 ## Layout
 
 - `core/` — shared library: `mpn.py` (MultiPlasticNet, DeepMultiPlasticNet),
@@ -419,6 +453,7 @@ For diagonal RFLO, `--rflo-trace-rho 0.99` optionally caps the MP-weight trace
 recurrence gain. With `k = assoc * eta * phi_prime * x**2`, the candidate update is
 `A_new = clip(lambda + k*W, -rho, rho)*A_old + k*(1+M)`; existing update masks,
 write derivatives, and frozen-state gates are then applied in their usual order.
+For additive MPNs the candidate is `A_new = clip(lambda + k, -rho, rho)*A_old + k`.
 `rho` must be finite and strictly between 0 and 1. Omit the flag to retain the
 original recurrence. This is an additional eligibility approximation: it limits
 repeated amplification of old traces, but does not guarantee better gradient

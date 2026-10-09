@@ -125,6 +125,7 @@ def build_model(checkpoint, device, dtype, feedback="saved"):
     if params.get("loss_type", "MSE") != "MSE":
         raise ValueError("This diagnostic requires a masked-MSE checkpoint; custom losses are not supported.")
     original = {"feedback_mode": params.get("feedback_mode", "exact_spatial"),
+                "mp_type": params["ml_params"].get("mp_type", "mult"),
                 "rflo_trace_rho": params["ml_params"].get("rflo_trace_rho"),
                 "input_mode": params.get("input_mode", "match"),
                 "cross_layer_steps": params.get("cross_layer_steps", 0),
@@ -159,7 +160,8 @@ def ratio(numerator, denominator):
 class TraceRecorder:
     """Observe existing local methods without changing gradients or retaining traces.
 
-    WA and 1+M are measured BEFORE the step advances A or M, matching the values
+    The correction (W*A for mult, A for add) and base (1+M for mult, 1 for add)
+    are measured BEFORE the step advances A or M, matching the values
     used in the RFLO gradient. Write/clipping statistics describe the subsequent
     M update. Fractions cover all batch/synapse entries, including zero-loss times.
     """
@@ -176,9 +178,10 @@ class TraceRecorder:
 
         def observe_step(original):
             def wrapped(this, x, phi_prime, ell, eta, lam, update_mask=None):
-                base = 1.0 + this.M
+                base = this._direct_weight_factor()
                 trace = getattr(this, "A", None)
-                correction = torch.zeros_like(base) if trace is None else this.W.unsqueeze(0) * trace
+                correction = (torch.zeros_like(base) if trace is None
+                              else this._modulation_read_weight().unsqueeze(0) * trace)
                 factor = base + correction
                 # Use absolute magnitude for a signed/zero base; never divide elementwise.
                 valid = base.abs() > self.near_zero
@@ -197,7 +200,7 @@ class TraceRecorder:
                 row["trace_gain_clipped_fraction"] = 0.0
                 if this.rflo_trace_rho is not None and trace is not None:
                     k = this._assoc * eta[None] * phi_prime[..., None] * x[:, None, :].square()
-                    raw_gain = lam[None] + k * this.W[None]
+                    raw_gain = lam[None] + k * this._modulation_read_weight()[None]
                     row["trace_gain_clipped_fraction"] = (
                         raw_gain.abs() > this.rflo_trace_rho).double().mean().item()
                 pending.append(row)
@@ -379,7 +382,7 @@ def save_trace_plot(results, directory):
     cmap.set_bad("#dddddd")
     for column, (field, title) in enumerate(zip(
             ("wa_to_base_rms_ratio", "correction_dominates_fraction", "write_clipped_fraction"),
-            ("log10(1 + RMS(WA)/RMS(1+M))", "Fraction |WA| > |1+M|", "Fraction of clipped M writes"))):
+            ("log10(1 + RMS(correction)/RMS(base))", "Fraction |correction| > |base|", "Fraction of clipped M writes"))):
         matrices = []
         for result in results.values():
             values = np.array([[r[field] if r[field] is not None else np.nan
@@ -400,7 +403,7 @@ def save_trace_plot(results, directory):
                 ax.set_ylabel(f"{LABELS[source]}-trained checkpoint" if paired else "MP layer")
         fig.colorbar(plot, ax=axes[:, column].tolist(), shrink=.85)
     fig.suptitle("Diagonal RFLO traces at each checkpoint's weights; shared color scales\n"
-                 "Pre-update WA and M; subsequent modulation writes. Gray = undefined.")
+                 "Pre-update eligibility factors; subsequent modulation writes. Gray = undefined.")
     filename = "trace_comparison.png" if paired else "trace_diagnostics.png"
     fig.savefig(directory / filename, dpi=150)
     plt.close(fig)
@@ -412,6 +415,7 @@ def make_summary(path, checkpoint, checkpoint_hash, net, original, result, batch
                    source_rule=checkpoint.get("learning_rule"), run_id=checkpoint.get("run_id"),
                    saved_settings=original,
                    diagnostic_settings=dict(feedback_mode=net.feedback_mode, input_mode="match",
+                       mp_type=[layer.mp_type for layer in net.mp_layers],
                        rflo_trace_rho=original["rflo_trace_rho"],
                        local_bias_mode="direct", cross_layer_steps=0, optimizer_steps=0,
                        dtype=str(net.W_output.dtype), device=str(net.W_output.device),
@@ -420,9 +424,9 @@ def make_summary(path, checkpoint, checkpoint_hash, net, original, result, batch
                        seed=BATCH_SEED if not batch_file else None,
                        source=str(batch_file) if batch_file else "saved task_params / random_batch"),
                    losses=result["losses"], forward_checks=result["forward_checks"],
-                   definitions=dict(ratio="RMS(WA) / RMS(1+M); undefined when denominator is zero",
+                   definitions=dict(ratio="RMS(correction) / RMS(base); mult: correction=W*A, base=1+M; add: correction=A, base=1; undefined when denominator is zero",
                        trace_gain_clipped_fraction="candidate A gains outside [-rho,rho], before update masks/write gates; zero when disabled",
-                       sign_flip_fraction="among entries with abs(1+M)>1e-8",
+                       sign_flip_fraction="among entries with abs(base)>1e-8",
                        null="undefined ratio/cosine or nonfinite value; never interpreted as zero",
                        trace_summary="unweighted mean/max over time steps with defined values; not a pooled elementwise ratio",
                        scope="raw masked-MSE gradients; layer metrics concatenate weights and biases",

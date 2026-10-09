@@ -301,6 +301,8 @@ class MultiPlasticLayer(BaseNetworkFunctions):
         init_string += '\n    M matrix parameters:'
 
         self.mp_type = ml_params.get('mp_type', 'mult')
+        if self.mp_type not in ('mult', 'add'):
+            raise ValueError("mp_type must be 'mult' or 'add'")
         # Controls the update equation of the M matrix (calculation of \Delta M)
         self.m_update_type = ml_params.get('m_update_type', 'hebb_assoc')
         # Activation function to pass M through after update (can enforce bounds)
@@ -315,7 +317,8 @@ class MultiPlasticLayer(BaseNetworkFunctions):
         # Initial modulation values
         self.register_buffer('M_init', torch.zeros((self.n_output, self.n_input,), dtype=torch.float))
 
-        # Controls maximum and minimum values of modulations so weights don't change signs
+        # Fixed M bounds: dimensionless gains for mult, weight increments for add.
+        # Additive bounds deliberately do not depend on the trainable W.
         self.modulation_bounds = ml_params.get('modulation_bounds', self.m_act != 'scaled_tanh')
         if self.m_act == 'scaled_tanh' and self.modulation_bounds:
             raise ValueError("scaled_tanh supplies its own bounds; set modulation_bounds=False")
@@ -324,10 +327,6 @@ class MultiPlasticLayer(BaseNetworkFunctions):
 
             M_bounds, init_string = self.build_M_bounds(init_string=init_string)
             self.register_buffer('M_bounds', M_bounds)
-
-            # These bounds will need to be continually updated if W is variable and M is additive, which is not yet implemented
-            if self.mp_type == 'add' and 'W' in self.params:
-                raise NotImplementedError('Need to continuously update bounds in this case.')
 
         init_string += '      type: {} // Update - type: {} // Act fn: {}'.format(
             self.mp_type, self.m_update_type, self.m_act
@@ -415,13 +414,13 @@ class MultiPlasticLayer(BaseNetworkFunctions):
     # ─── Exact row-local eligibility learning (MPN expressions) ───────────────
     # State parallel to M for computing dL/dW, dL/db locally in time (RTRL-style
     # forward-mode traces) instead of via BPTT. Only valid in the "clean"
-    # derivation config: mp_type='mult', linear or scaled-tanh writes.
+    # derivation config: mp_type='mult'/'add', linear or scaled-tanh writes.
     # Linear writes optionally have hard bounds. Indexing: i = post, I = param-pre,
     # W_{iI}, J = plastic-pre index. See run_sequence_local_mpn_exact.
 
     def assert_local_config(self):
         """Guard for the local (eligibility-trace) rules. They are derived for a
-        multiplicative modulation with linear/clipped or scaled-tanh writes, and
+        multiplicative/additive modulation with linear/clipped or scaled-tanh writes, and
         for one of two Hebbian M-updates:
 
             hebb_assoc: M_{iI,t} = lam M_{iI,t-1} + eta h_{i,t} x_{I,t}
@@ -433,9 +432,9 @@ class MultiPlasticLayer(BaseNetworkFunctions):
         is zero and the local rule is EXACT (see self._assoc). Other updates
         (oja) / other nonlinear m_act are refused here. The shared write
         finalizer applies the appropriate derivative and mask to P/A/Q."""
-        if self.mp_type != 'mult':
+        if self.mp_type not in ('mult', 'add'):
             raise NotImplementedError(
-                f"local rules derived for mp_type='mult', got '{self.mp_type}'")
+                f"local rules require mp_type='mult' or 'add', got '{self.mp_type}'")
         if self.m_update_type not in ('hebb_assoc', 'hebb_pre'):
             raise NotImplementedError(
                 f"local rules derived for m_update_type in (hebb_assoc, hebb_pre), "
@@ -447,6 +446,18 @@ class MultiPlasticLayer(BaseNetworkFunctions):
     # Back-compat aliases (older callers / tests used these names).
     assert_local_assoc_config = assert_local_config
     assert_exact_rowlocal_config = assert_local_config
+
+    def _direct_weight_factor(self):
+        """Elementwise dW_eff/dW with M fixed: 1+M (mult), 1 (add)."""
+        return 1.0 + self.M if self.mp_type == 'mult' else torch.ones_like(self.M)
+
+    def _modulation_read_weight(self):
+        """Elementwise dW_eff/dM: W (mult), 1 (add); not the spatial W_eff."""
+        return self.W if self.mp_type == 'mult' else torch.ones_like(self.W)
+
+    def _diagonal_weight_factor(self):
+        """Direct weight sensitivity plus the same-synapse modulation trace."""
+        return self._direct_weight_factor() + self._modulation_read_weight()[None] * self.A
 
     @property
     def _assoc(self):
@@ -486,14 +497,13 @@ class MultiPlasticLayer(BaseNetworkFunctions):
         phi_prime: (B, n_output)  phi'(h_tilde_t), hidden-activation derivative
         returns E (B, n_output, n_input), R (B, n_output)
         """
-        M_prev = self.M  # (B, i, I) = M_{t-1}, forward already consumed it
-
-        # E^I_{i} = phi'_i * [ (1 + M_{iI}) x_I + sum_J W_{iJ} x_J P^I_{iJ} ]
-        direct = (1.0 + M_prev) * x.unsqueeze(1)                       # (B, i, I)
-        row_recurrent = torch.einsum('iJ,BJ,BiIJ->BiI', self.W, x, self.P)
+        # E = phi' * [D*x_I + sum_J S*x_J*P^I_J], where
+        # (D,S) = (1+M,W) for mult, (1,1) for add.
+        direct = self._direct_weight_factor() * x.unsqueeze(1)
+        row_recurrent = torch.einsum('iJ,BJ,BiIJ->BiI', self._modulation_read_weight(), x, self.P)
         E = phi_prime.unsqueeze(-1) * (direct + row_recurrent)         # (B, i, I)
 
-        # R_i = phi'_i * [ 1 + sum_J W_{iJ} x_J Q_{iJ} ]
+        # R_i = phi'_i * [1 + sum_J S_{iJ} x_J Q_{iJ}].
         R = self._local_bias_eligibility(x, phi_prime)
 
         self.E, self.R = E, R
@@ -505,7 +515,7 @@ class MultiPlasticLayer(BaseNetworkFunctions):
         # overwrite local_bias_mode, which must survive rule switches/reloading.
         if self.Q is None:
             return phi_prime
-        recurrent = torch.einsum('iJ,BJ,BiJ->Bi', self.W, x, self.Q)
+        recurrent = torch.einsum('iJ,BJ,BiJ->Bi', self._modulation_read_weight(), x, self.Q)
         return phi_prime * (1.0 + recurrent)
 
     def _advance_local_bias_trace(self, x, R, eta, lam, update_mask):
@@ -584,9 +594,10 @@ class MultiPlasticLayer(BaseNetworkFunctions):
 
     def compute_diag_rflo_eligibility(self, x, phi_prime):
         """Diagonal approximation to dh_t/dW: drop the sum over J != I, keeping
-        only the same-synapse term W_{iI} x_I A_{iI}.
+        only the same-synapse modulation sensitivity.
 
             E_hat^I_{i,t} = phi'_i * x_I * (1 + M_{iI,t-1} + W_{iI} A_{iI,t-1}).
+        For additive modulation the final factor is (1 + A_{iI,t-1}).
 
         The bias eligibility is exact by default; local_bias_mode='direct'
         uses R=phi_prime and no Q trace. Call
@@ -594,15 +605,13 @@ class MultiPlasticLayer(BaseNetworkFunctions):
         so self.M, self.A, self.Q still hold time-(t-1) values.
         returns E_hat (B, n_output, n_input), R (B, n_output).
         """
-        M_prev = self.M   # (B, i, I) = M_{t-1}
-        A_prev = self.A   # (B, i, I)
         # The explicit trace update needs phi' itself: recovering it by dividing
         # E by x*(1+M+W*A) would be undefined at zero inputs/factors.
         if self.rflo_trace_rho is not None:
             self._diag_phi_prime = phi_prime
 
         E = (phi_prime.unsqueeze(-1) * x.unsqueeze(1)
-             * (1.0 + M_prev + self.W.unsqueeze(0) * A_prev))          # (B, i, I)
+             * self._diagonal_weight_factor())                       # (B, i, I)
 
         # Exact row-local bias trace (same as the exact rule).
         R = self._local_bias_eligibility(x, phi_prime)
@@ -640,21 +649,23 @@ class MultiPlasticLayer(BaseNetworkFunctions):
     def _capped_diag_trace(self, x, phi_prime, eta, lam):
         """Candidate A update with bounded recurrence gain, before masks/gates.
 
-        k = assoc*eta*phi'*x^2; gain = clip(lam + k*W, -rho, rho).
-        Only the coefficient of old A is capped. The drive k*(1+M) is retained.
+        k = assoc*eta*phi'*x^2; gain = clip(lam + k*S, -rho, rho).
+        (D,S) = (1+M,W) for mult, (1,1) for add. Only the coefficient
+        of old A is capped. The drive k*D is retained.
         This is a surrogate eligibility, not the exact modulation derivative.
         """
         k = (self._assoc * eta.unsqueeze(0) * phi_prime.unsqueeze(-1)
              * x.square().unsqueeze(1))
-        gain = lam.unsqueeze(0) + k * self.W.unsqueeze(0)
+        gain = lam.unsqueeze(0) + k * self._modulation_read_weight().unsqueeze(0)
         gain = gain.clamp(-self.rflo_trace_rho, self.rflo_trace_rho)
-        return gain * self.A + k * (1.0 + self.M)
+        return gain * self.A + k * self._direct_weight_factor()
 
     # ─── Direct / instantaneous local approximation ──────────────────────────
     # The strongest approximation: treat M_{t-1} as a stop-gradient modulatory
     # state and drop ALL sensitivity through the plasticity dynamics. No trace
     # (no P, no A, no Q) — only the current M, x_t, phi'(h_tilde), and ell_t.
     #   E_dir^I_{i} = phi'_i (1 + M_{iI,t-1}) x_I     (diag RFLO with A = 0)
+    # Additive modulation replaces (1+M) by 1.
     #   R_dir_{i}   = phi'_i                          (no bias trace Q)
     # For the WEIGHT gradient this is exactly diagonal RFLO with A forced to 0;
     # the bias differs from diagonal RFLO (which keeps an exact Q).
@@ -663,9 +674,7 @@ class MultiPlasticLayer(BaseNetworkFunctions):
         """Direct/instantaneous local eligibility (no trace, stop-gradient
         through the plasticity history). Call AFTER the forward pass so self.M
         holds M_{t-1}. returns E (B, n_output, n_input), R (B, n_output)."""
-        M_prev = self.M   # (B, i, I) = M_{t-1}, treated as a stop-gradient state
-
-        E = phi_prime.unsqueeze(-1) * (1.0 + M_prev) * x.unsqueeze(1)   # (B, i, I)
+        E = phi_prime.unsqueeze(-1) * self._direct_weight_factor() * x.unsqueeze(1)
         R = phi_prime                                                  # (B, i)
 
         self.E, self.R = E, R
@@ -693,7 +702,7 @@ class MultiPlasticLayer(BaseNetworkFunctions):
         """Advance M and finalize the already-advanced local sensitivity traces.
 
         Algebraically identical to update_M_matrix for the configurations allowed
-        by assert_local_config(): multiplicative MP with linear/hard-clipped or
+        by assert_local_config(): multiplicative/additive MP with linear/hard-clipped or
         scaled-tanh writes and Hebbian associative/pre-only updates. The shared
         finalizer handles activation derivatives, masks and frozen states.
         """
@@ -818,21 +827,21 @@ class MultiPlasticLayer(BaseNetworkFunctions):
     # the right one ONCE (via step_fn_for) instead of branching on `mode` every step.
 
     def _local_step_direct(self, x, phi_prime, ell, eta, lam, update_mask=None):
-        """Direct/instantaneous: grad_W = sum_B ell_i phi'_i (1 + M_iI) x_I,
+        """Direct/instantaneous: grad_W = sum_B ell_i phi'_i D_iI x_I,
+        with D=1+M (mult) or D=1 (add);
         grad_b = sum_B ell_i phi'_i. No trace (P/A/Q) touched."""
         ell_phi = ell * phi_prime
-        grad_W_t = (ell_phi.unsqueeze(-1) * (1.0 + self.M) * x.unsqueeze(1)).sum(0)
+        grad_W_t = (ell_phi.unsqueeze(-1) * self._direct_weight_factor() * x.unsqueeze(1)).sum(0)
         grad_b_t = ell_phi.sum(0)
         self.E, self.R = None, phi_prime
         return grad_W_t, grad_b_t
 
     def _local_step_diag(self, x, phi_prime, ell, eta, lam, update_mask=None):
-        """Diagonal RFLO: factor = 1 + M + W*A fused into grad_W and the A update
+        """Diagonal RFLO: factor = 1+M+W*A (mult) or 1+A (add), fused into grad_W and the A update
         (E_hat never built); optional A-gain cap and configurable exact/direct bias."""
-        W, M_prev = self.W, self.M
         a = self._assoc
         A_prev = self.A
-        factor = 1.0 + M_prev + W.unsqueeze(0) * A_prev
+        factor = self._diagonal_weight_factor()
         ell_phi = ell * phi_prime
 
         grad_W_t = (ell_phi.unsqueeze(-1) * x.unsqueeze(1) * factor).sum(0)
@@ -886,10 +895,11 @@ class MultiPlasticLayer(BaseNetworkFunctions):
         """Compute ell_x = ell_pre @ W_eff without materializing W_eff.
 
         ell_pre: (B, post), usually ell * phi_prime.
-        returns: (B, pre), sum_i ell_pre_i W_iI (1 + M_iI).
+        returns: (B, pre), sum_i ell_pre_i W_eff_iI.
         """
         base = ell_pre.matmul(self.W)
-        plastic = torch.bmm(ell_pre.unsqueeze(1), self.W.unsqueeze(0) * self.M).squeeze(1)
+        plastic_w = self.W.unsqueeze(0) * self.M if self.mp_type == 'mult' else self.M
+        plastic = torch.bmm(ell_pre.unsqueeze(1), plastic_w).squeeze(1)
         return base + plastic
 
     @torch.no_grad()
@@ -972,47 +982,21 @@ class MultiPlasticLayer(BaseNetworkFunctions):
         return param_expanded
 
     def build_M_bounds(self, init_string=''):
+        """Fixed absolute bounds on M, stored as (upper, lower).
+
+        For mult, M is a dimensionless gain; [-1, 1] keeps W_eff between
+        zero and 2*W. For add, M is a weight increment: the same numeric
+        bounds do NOT imply the same effective-weight range or preserve signs.
+        Bounds never depend on W, so trainable additive weights and all local
+        derivatives use the same parameter-independent write map.
         """
-        Controls maximum and minimum values of modulations. Generally used so
-        weights don't change signs (since these are often tied to cell type).
-
-        Bounds are in order: (upper_vals, lower_vals)
-        """
-
-        W_fixed = self.W.detach()
-
-        if self.mp_type == 'add':
-            MAX_ADD = self.M_bound_vals[1] # Default: 1.0, Controls how much a weight can be strengthened, 1.0 means the weight's mag can be doubled, 0.0 means it cant be strengthened
-            MIN_ADD = self.M_bound_vals[0] # Default: 0.0, Any value >0 prevents weight from being fully weakened, e.g. 0.2 means the weight can be weakened to at most 20% of its original value
-
-            # Expanation of this expression: (with example values MAX_ADD = 2.0 and MIN_ADD = 0.2)
-            #   First line: Upper bounds on Ms
-            #       For W_ij > 0: Maximum M value is MAX_ADD * W_ij, so 2 * W_ij > 0, meaning positive weights can be strengthened to 3x their initial value
-            #       For W_ij < 0: Maximum M value is -1 * (1 - MIN_ADD) * W_ij = -0.8 * W_ij > 0, since W_ij is negative. Since a positive M_ij would cancel the
-            #           negative W_ij, this means that at most W_ij can be weakened to 0.2 x its original value
-            #   Second line: Lower bounds for M
-            #       For W_ij > 0: Minimum M value is -1 * (1 - MIN_ADD) * W_ij = -0.8 * W_ij < 0, since W_ij is positive, a negative M_ij that saturates this bound
-            #           would reduce W_ij to 0.2 x its original value.
-            #       For W_ij < 0: Minimum M value is MAX_ADD * W_ij = 2 * W_ij < 0, since W_ij is negative. So can strengthen negative weight to 3x its initial value
-
-            M_bounds = torch.cat((
-                (MAX_ADD * W_fixed * (W_fixed > 0) - 1 * (1 - MIN_ADD) * W_fixed * (W_fixed < 0)).unsqueeze(0),
-                (MAX_ADD * W_fixed * (W_fixed < 0) - 1 * (1 - MIN_ADD) * W_fixed * (W_fixed > 0)).unsqueeze(0)
-            ))
-
-            init_string += '    update bounds - Max add: {}, Min add: {}\n'.format(MAX_ADD, MIN_ADD)
-        elif self.mp_type == 'mult':
-            max_mult = self.M_bound_vals[1] # Controls how much a weight can be enhanced, 1.0 means the weight's mag can be doubled
-            min_mult = self.M_bound_vals[0] # Controls how much a weight can be depressed, -1.0 means it can be fully depressed
-            M_bounds = torch.cat((
-                max_mult * torch.ones_like(W_fixed).unsqueeze(0),
-                min_mult * torch.ones_like(W_fixed).unsqueeze(0)
-            ))
-            init_string += '    update bounds - Max mult: {}, Min mult: {}\n'.format(max_mult, min_mult)
-        else:
-            raise ValueError('MP type not recognized in build_M_bounds.')
-
-        return M_bounds, init_string
+        lower, upper = self.M_bound_vals
+        if not (math.isfinite(lower) and math.isfinite(upper) and lower <= upper):
+            raise ValueError("m_bounds must be finite and ordered (lower, upper)")
+        bounds = torch.stack((torch.full_like(self.W, upper),
+                              torch.full_like(self.W, lower)))
+        init_string += f'    fixed M bounds ({self.mp_type}): [{lower}, {upper}]\n'
+        return bounds, init_string
 
     def update_M_matrix(self, pre, post, update_mask=None, eta_lam_build=None):
         """
@@ -2173,6 +2157,7 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
 
         D[j,k] = phi_embed'[j] * features[k]
         C[i,j,k] = phi0'[i] W0[i,j] ((1+M0[i,j]) D[j,k] + x[j] trace[i,j,k])
+        Additive: C = phi0' * ((W0+M0)*D + x*trace).
         raw_trace = lam*trace + eta*(post[i]*D[j,k] + x[j]*C[i,j,k])
 
         C is the raw first MP block activation's sensitivity. Its branch scale
@@ -2184,9 +2169,15 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
         """
         layer = self.mp_layers[0]
         direct = embed_prime.unsqueeze(-1) * features.unsqueeze(1)
-        eligibility = (phi_prime[:, :, None, None] * layer.W[None, :, :, None]
-                       * ((1.0 + layer.M).unsqueeze(-1) * direct.unsqueeze(1)
-                          + x[:, None, :, None] * trace))
+        if layer.mp_type == 'mult':
+            # Keep the legacy operation order for multiplicative checkpoints.
+            eligibility = (phi_prime[:, :, None, None] * layer.W[None, :, :, None]
+                           * ((1.0 + layer.M).unsqueeze(-1) * direct.unsqueeze(1)
+                              + x[:, None, :, None] * trace))
+        else:
+            eligibility = phi_prime[:, :, None, None] * (
+                layer.get_modulated_weights().unsqueeze(-1) * direct.unsqueeze(1)
+                + x[:, None, :, None] * trace)
         gradient = torch.einsum('bi,bijk->jk', self._branch_scales[0] * signal, eligibility)
         if self._residual_at[0]:
             gradient = gradient + torch.einsum('bj,bjk->jk', signal, direct)
@@ -2219,7 +2210,7 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
     # These implement the two ingredients the multi-MP-layer local rules need
     # (see the class docstring): a forward that stops short of the M update, and
     # a top-down learning-signal pass that backprojects the readout error through
-    # every layer's MODULATED weights W_eff = W ⊙ (1 + M_{t-1}). Both read the
+    # every layer's MODULATED weights W_eff (mult or add). Both read the
     # frozen M_{t-1}, so they must run before any layer advances its M.
 
     def _forward_local_stack(self, u_t, *, return_blocks=False):
@@ -2384,8 +2375,9 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
         write M[m]_{ki}=η a[m]_k h[m]_i depends on {W,b}[q-1] through BOTH factors:
           PRE  (∂/∂ the pre h[m]_i):  a[m]_{k,t-1} carried as prev_ablock[m];
           POST (∂/∂ the post a[m]_k): a[m]_{k,t-1} itself depends on h_stream[m]_{t-1},
-               backprojected through W_eff[m]_{t-1} (= prev_Weff[m] = W(1+M_{t-2})).
-        The loss-sensitivity covector to that write is S_ki = δ[m]_k W[m]_{ki} h[m]_{i,t}
+               backprojected through W_eff[m]_{t-1} (= prev_Weff[m]).
+        The loss-sensitivity covector to that write is
+        S_ki = δ[m]_k (dW_eff/dM)[m]_{ki} h[m]_{i,t}
         with δ[m]_t = branch_scale[m]*ell_h[m+1]_t·φ'(z[m]_t). The earlier POST
         derivative uses raw a[m], without another branch gain. Both brackets share
         the same downward route from h[m]_{t-1} to h_stream[q]_{t-1} through frozen
@@ -2397,7 +2389,7 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
         AND prev_R[q-1] for the bias
         (b[q-1] feeds h_stream[q]_{t-1} exactly as W[q-1] does, so it shares the whole
         downstream path — only the intra-layer eligibility differs). NOTE the two weight
-        operators differ: the PRE bracket uses the RAW W[m] (current-step pre h[m]_t),
+        operators differ: reading M uses dW_eff/dM (W for mult, 1 for add),
         the POST bracket and the downward Jacobian use the EFFECTIVE W_eff[m]_{t-1};
         conflating them breaks T=2 exactness. For pre-only plasticity the PRE
         factor is the same constant 1/sqrt(n_output) used by the forward write,
@@ -2411,7 +2403,8 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
         v = [None] * L
         for m in range(1, L):
             delta = self._branch_scales[m] * ell_h[m + 1] * phi_p[m]
-            We = layers[m].W * eta_lam[m][0]                      # W[m]·η[m]  (out_m, in_m)
+            # Reading M uses dW_eff/dM, not the same-time effective weight.
+            We = layers[m]._modulation_read_weight() * eta_lam[m][0]
             # PRE bracket uses the actual postsynaptic factor in the earlier write.
             associative = layers[m].m_update_type == 'hebb_assoc'
             post_factor = (prev_ablock[m] if associative
@@ -2838,7 +2831,8 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
                 # correction (it must read M_{t-2}).
                 cur_E = [None] * L
                 cur_R = [None] * L
-                cur_Weff = [mp.W * (1.0 + mp.M) for mp in layers]   # W(1+M_{t-1})
+                cur_Weff = [(mp.W * (1.0 + mp.M) if mp.mp_type == 'mult'
+                             else mp.W + mp.M) for mp in layers]
                 for n, mp in enumerate(layers):
                     E_n, R_n = compute_elig[n](h[n], phi_p[n])
                     branch_signal = self._branch_scales[n] * ell_h[n + 1]

@@ -283,11 +283,13 @@ class TestDFA(unittest.TestCase):
         torch.testing.assert_close(layer.Q, reference.Q)
         self.assertTrue((layer.M.abs() <= 1).all())
 
-    def test_clamp_derivative_matches_autograd_at_endpoints(self):
+    def test_clamp_derivative_uses_inclusive_endpoints(self):
         layer = make_net(bounded=True).mp_layers[0]
         raw = torch.tensor([[[-2., -1., -.5], [0., .5, 1.], [2., 2., -2.]]],
                            dtype=torch.double, requires_grad=True)
-        expected = torch.autograd.grad(raw.clamp(-1., 1.).sum(), raw)[0]
+        # The model deliberately defines its own inclusive endpoint derivative.
+        # torch.clamp's derivative at equality varies across PyTorch versions.
+        expected = ((raw.detach() >= -1.) & (raw.detach() <= 1.)).to(raw.dtype)
         clipped = layer._apply_modulation_bounds(raw)
         torch.testing.assert_close(clipped, raw.detach().clamp(-1., 1.))
         torch.testing.assert_close(torch.autograd.grad(clipped.sum(), raw)[0], expected)

@@ -161,6 +161,7 @@ LAM = None  # optional fixed modulation decay; None retains dt / m_time_scale se
 LOG_GRAD_ALIGN = True  # --dfa disables the optional BPTT diagnostic by default
 MODULATION_BOUNDS = True
 MODULATION_MODE = "hard"       # none | hard | scaled_tanh
+MP_TYPE = "mult"              # mult: W*(1+M); add: W+M (M in weight units)
 MODULATION_BOUND = 1.0         # symmetric hard bound / scaled-tanh scale B
 REG_LAMBDA = 0.0
 # Fixed input standardization of the raw input u_t. Because u_t feeds straight into
@@ -413,7 +414,7 @@ def build_params():
             "bias": True,
             "local_bias_mode": LOCAL_BIAS_MODE,
             "rflo_trace_rho": RFLO_TRACE_RHO,
-            "mp_type": "mult",
+            "mp_type": MP_TYPE,
             "m_update_type": "hebb_assoc",
             "m_activation": "scaled_tanh" if MODULATION_MODE == "scaled_tanh" else "linear",
             "m_scale": MODULATION_BOUND,
@@ -519,6 +520,8 @@ def _cfg():
     (e.g. NET_TYPE, N_HIDDEN, FEEDBACK_MODE) before any path/build helper below."""
     net_cls = _net_class()
     desc = "deep MPN" if NET_TYPE == "dmpn" else "MPN"
+    if MP_TYPE == "add":
+        desc += " additive"
     # Repeated helper calls for the same setup must resolve the same output paths.
     # Keep configuration details in metadata rather than encoding them in names.
     signature = json.dumps(tc._json_safe([
@@ -708,6 +711,9 @@ def parse_arguments(argv=None):
 
     g = p.add_argument_group(
         "forward dynamics (change the network itself, so EVERY rule including bptt is affected)")
+    g.add_argument("--mp-type", choices=["mult", "add"], default=MP_TYPE,
+                   help="effective synaptic weights: mult = W*(1+M), add = W+M. "
+                        "Supported by every rule at any MP depth. Default: %(default)s.")
     g.add_argument("--lam", type=float, default=LAM,
                    help="fixed modulation decay, 0 <= lambda < 1, in every MP layer; "
                         "default uses m_time_scale=4000 (lambda=0.99 at dt=40)")
@@ -715,7 +721,9 @@ def parse_arguments(argv=None):
                    default=MODULATION_MODE if MODULATION_BOUNDS or MODULATION_MODE == "scaled_tanh" else "none",
                    help="modulation write: unbounded, hard clipping, or B*tanh(S/B)")
     g.add_argument("--modulation-bound", type=float, default=MODULATION_BOUND,
-                   help="positive bound/scale B for hard or scaled_tanh (default: %(default)s)")
+                   help="positive bound/scale B for hard or scaled_tanh: dimensionless "
+                        "for mult, absolute weight units for add; additive bounds are "
+                        "independent of W and do not preserve its sign. Default: %(default)s.")
 
     g = p.add_argument_group("training and logging")
     g.add_argument("--lr", type=float, default=LR,
@@ -908,7 +916,7 @@ def main():
     global NET_TYPE, RULESET, N_RUNS, N_HIDDEN, N_DATASETS, FEEDBACK_MODE, BATCH
     global INPUT_MODE, INPUT_NORMALIZE, MP_RESIDUAL, CROSS_LAYER_STEPS, LOCAL_BIAS_MODE, RULES_TO_RUN, LOG_GRAD_ALIGN
     global USE_WANDB, WANDB_PROJECT, WANDB_ENTITY, WANDB_MODE
-    global MODULATION_MODE, MODULATION_BOUND, MODULATION_BOUNDS
+    global MODULATION_MODE, MODULATION_BOUND, MODULATION_BOUNDS, MP_TYPE
     global DFA_PRESET
     global RFLO_TRACE_RHO, LAM
     global SEED, LEARNING_SIGNAL, LOCAL_SIGNAL_ALPHA
@@ -939,6 +947,7 @@ def main():
     RFLO_TRACE_RHO = args.rflo_trace_rho
     LAM = args.lam
     MODULATION_MODE = args.modulation_mode
+    MP_TYPE = args.mp_type
     MODULATION_BOUND = args.modulation_bound
     MODULATION_BOUNDS = args.modulation_mode == "hard"
     RULES_TO_RUN = args.rules
