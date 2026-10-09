@@ -45,6 +45,18 @@ P_raw[i,j,k] = lambda[i,j] * P_(t-1)[i,j,k]
                + eta[i,j] * (a_t[i] * D[j,k] + x_t[j] * C[i,j,k])
 ```
 
+These expressions use multiplicative weights. With `--mp-type add`, replace
+only the expression for `C` by
+
+```text
+C[i,j,k] = phi_first'(pre_first[i]) *
+           ((W[i,j] + M_(t-1)[i,j]) * D[j,k] + x_t[j] * P_(t-1)[i,j,k])
+```
+
+The input drive uses the effective weight `W+M`; the modulation sensitivity
+has coefficient 1. The write, masks, residual handling and approximation
+boundaries are unchanged. See [additive MPN](additive_mpn.md).
+
 For an active first-layer identity residual with `--residual-scale alpha`,
 multiply the `ell_first * C` gradient contribution by `alpha`, then add
 `sum_batch ell_first[j] * D[j,k]` for the unscaled identity path. Keep `C` and
