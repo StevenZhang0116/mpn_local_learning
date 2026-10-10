@@ -180,19 +180,30 @@ REG_LAMBDA = 0.0
 # --input-normalize on CLI. The sample size used to estimate the stats:
 INPUT_NORMALIZE = False
 INPUT_NORM_SAMPLE = 2048      # #trials sampled to estimate the fixed input stats
-# Per-step RMS normalization of every MP layer's PRESYNAPTIC input (both nets):
-# x_hat = x / sqrt(mean_J x_J^2 + eps), so ||x_hat||^2 = fan-in at every step. The
-# modulated forward, the Hebbian write and all eligibility traces consume x_hat; the
-# residual skip carries the un-normalized stream. Parameter-free and stateless, so
-# it adds no state_dict entries. It makes the plastic loop gain of a row,
-# eta * phi' * sum_J W_iJ x_J^2, independent of the fan-in, of the depth of the
-# residual stream and of the input magnitude, which is what lets ONE --eta satisfy
-# the trace-stability condition in every layer. Local rules carry their learning
-# signals through the norm's transpose Jacobian (see mpn.DeepMultiPlasticNet).
-# Incompatible with --input-mode diag_mtrace/paired. 'none' (default) is the
-# previous computation byte for byte. --mp-input-norm / --mp-input-norm-eps on CLI.
+# Per-step RMS normalization of every MP layer's PRESYNAPTIC input (both nets; layers
+# 1..L-1 only with MP_INPUT_NORM_SKIP_FIRST): x_hat = x / sqrt(mean_J x_J^2 + eps), so
+# ||x_hat||^2 = fan-in at every step. The modulated forward, the Hebbian write and all
+# eligibility traces consume x_hat; the residual skip carries the un-normalized
+# stream. Parameter-free and stateless, so it adds no state_dict entries. For the
+# multiplicative MPN it makes the plastic loop gain of a row, eta * phi' * sum_J W_iJ
+# x_J^2, independent of the fan-in, of the depth of the residual stream and of the
+# input magnitude, i.e. the trace-stability condition on --eta becomes scale-free
+# (the same eta means the same loop gain in every layer). It does NOT lower the
+# gain by itself: on contextdelaydm1 a small --eta alone bounds the traces just as
+# well (README table). Local rules carry their learning signals through the norm's
+# transpose Jacobian (see mpn.DeepMultiPlasticNet).
+# Incompatible with --input-mode diag_mtrace/paired unless layer 0 is skipped (below).
+# 'none' (default) is the previous computation byte for byte. --mp-input-norm /
+# --mp-input-norm-eps on CLI.
 MP_INPUT_NORM = "none"        # none | rms
 MP_INPUT_NORM_EPS = 1e-5
+# With the norm on, leave MP layer 0's input (the embedding output; the raw input for
+# mpn1) un-normalized and normalize layers 1..L-1 only: a per-step rescaling of the
+# first input erases its amplitude (e.g. the adding task's value channel), while the
+# upper layers' inputs are activities whose scale carries no task information. Layer
+# 0's transpose Jacobian is then the identity, and --input-mode diag_mtrace/paired
+# are accepted again. Needs --net dmpn with >= 2 MP layers. --mp-input-norm-skip-first.
+MP_INPUT_NORM_SKIP_FIRST = False
 # Identity skip around each MP block: h_{n+1} = h_n + RESIDUAL_SCALE * act(z_n)
 # (dmpn only). A same-time, parameter-free, memoryless op — it stays fully local (the
 # local rules gain the residual's identity Jacobian term in the inter-layer signal;
@@ -444,6 +455,7 @@ def build_params():
         "input_normalize": INPUT_NORMALIZE,  # fixed per-feature input standardization
         "mp_input_norm": MP_INPUT_NORM,      # per-step RMS norm of each MP layer's input
         "mp_input_norm_eps": MP_INPUT_NORM_EPS,
+        "mp_input_norm_skip_first": MP_INPUT_NORM_SKIP_FIRST,  # layer 0 raw, layers 1.. normalized
         "mp_residual": _mp_residual(),   # identity skip around each equal-width MP block
         "residual_scale": RESIDUAL_SCALE,
         "cross_layer_steps": CROSS_LAYER_STEPS,  # depth-1 cross-layer temporal correction
@@ -605,6 +617,7 @@ def _cfg():
         feedback_mode=FEEDBACK_MODE,
         input_normalize=INPUT_NORMALIZE, input_norm_sample=INPUT_NORM_SAMPLE,
         mp_input_norm=MP_INPUT_NORM, mp_input_norm_eps=MP_INPUT_NORM_EPS,
+        mp_input_norm_skip_first=MP_INPUT_NORM_SKIP_FIRST,
         mp_residual=_mp_residual(), residual_scale=RESIDUAL_SCALE,
         cross_layer_steps=CROSS_LAYER_STEPS,
         input_mode=INPUT_MODE, learning_signal=LEARNING_SIGNAL,
@@ -700,16 +713,29 @@ def parse_arguments(argv=None):
     g.add_argument("--mp-input-norm", choices=["none", "rms"], default=MP_INPUT_NORM,
                    help="per-step RMS normalization of every MP layer's presynaptic input "
                         "(x_hat = x / sqrt(mean(x^2) + eps), so ||x_hat||^2 equals the fan-in "
-                        "at each step). The modulated forward, the Hebbian write and every "
-                        "eligibility trace consume x_hat; the residual skip carries the raw "
-                        "stream; local learning signals pass through the norm's transpose "
-                        "Jacobian. Parameter-free. It decouples each row's plastic loop gain "
-                        "eta*phi'*sum_J W_iJ x_J^2 from fan-in, depth and input scale, so one "
-                        "--eta can keep the traces stable in every layer. Applies to every "
-                        "rule (bptt differentiates through it). Not combinable with "
-                        "--input-mode diag_mtrace/paired. Default: %(default)s.")
+                        "at each step; layers 1..L-1 only with --mp-input-norm-skip-first). "
+                        "The modulated forward, the Hebbian write and every eligibility trace "
+                        "consume x_hat; the residual skip carries the raw stream; local "
+                        "learning signals pass through the norm's transpose Jacobian. "
+                        "Parameter-free. For the multiplicative MPN it makes each row's "
+                        "plastic loop gain eta*phi'*sum_J W_iJ x_J^2 independent of fan-in, "
+                        "depth and input scale (the same --eta then means the same gain in "
+                        "every layer); it does not lower the gain by itself. Applies to every "
+                        "rule (bptt differentiates through it). Combinable with --input-mode "
+                        "diag_mtrace/paired only together with --mp-input-norm-skip-first. "
+                        "Default: %(default)s.")
     g.add_argument("--mp-input-norm-eps", type=float, default=MP_INPUT_NORM_EPS,
                    help="eps inside the RMS norm's square root (default: %(default)s)")
+    g.add_argument("--mp-input-norm-skip-first", action="store_true",
+                   default=MP_INPUT_NORM_SKIP_FIRST,
+                   help="with --mp-input-norm rms, leave MP layer 0's input (the embedding "
+                        "output) un-normalized and normalize layers 1..L-1 only. A per-step "
+                        "rescaling of the first input erases its amplitude (e.g. the adding "
+                        "task's value channel); the upper layers' inputs are activities whose "
+                        "scale carries no task information. Layer 0's transpose Jacobian is "
+                        "then the identity, so the exactness statements are unchanged, and "
+                        "--input-mode diag_mtrace/paired are accepted again. Needs --net dmpn "
+                        "with at least two --hidden widths. Default: off.")
 
     g = p.add_argument_group(
         "learning algorithm",
@@ -950,12 +976,21 @@ def validate_config(p, args):
     if args.input_mode == 'paired' and 'local_exact_rowlocal' in args.rules:
         p.error("--input-mode paired does not support local_exact_rowlocal; "
                 "use match or an explicit input mode")
-    if args.mp_input_norm != 'none' and args.input_mode in ('diag_mtrace', 'paired'):
+    if (args.mp_input_norm != 'none' and not args.mp_input_norm_skip_first
+            and args.input_mode in ('diag_mtrace', 'paired')):
         p.error(f"--mp-input-norm {args.mp_input_norm} is not supported with --input-mode "
                 f"{args.input_mode}: the diagonal input-column trace assumes each embedding "
-                "row feeds only its own column of the first MP layer's input")
+                "row feeds only its own column of the first MP layer's input; add "
+                "--mp-input-norm-skip-first to keep layer 0's input un-normalized")
     if not np.isfinite(args.mp_input_norm_eps) or args.mp_input_norm_eps <= 0:
         p.error("--mp-input-norm-eps must be finite and positive")
+    if args.mp_input_norm_skip_first:
+        if args.mp_input_norm == 'none':
+            p.error("--mp-input-norm-skip-first requires --mp-input-norm rms")
+        n_mp = len(args.hidden) if args.hidden is not None else len(_hidden_widths())
+        if args.net != "dmpn" or n_mp < 2:
+            p.error("--mp-input-norm-skip-first leaves nothing to normalize: it needs "
+                    "--net dmpn with at least two --hidden widths")
     if args.dfa and (args.feedback != "direct_fa" or args.input_mode != "match"
                      or args.cross_layer_steps != 0):
         p.error("--dfa requires --feedback direct_fa, --input-mode match, "
@@ -1018,7 +1053,7 @@ def main():
     global SEED, LEARNING_SIGNAL, LOCAL_SIGNAL_ALPHA
     global LR, HEAD_LR_MULT, LR_SCHEDULE, LR_PATIENCE, LR_FACTOR
     global RESIDUAL_SCALE
-    global MP_INPUT_NORM, MP_INPUT_NORM_EPS
+    global MP_INPUT_NORM, MP_INPUT_NORM_EPS, MP_INPUT_NORM_SKIP_FIRST
     args = _parse_args()
     DFA_PRESET = args.dfa
     NET_TYPE = args.net
@@ -1053,6 +1088,7 @@ def main():
     INPUT_NORMALIZE = args.input_normalize
     MP_INPUT_NORM = args.mp_input_norm
     MP_INPUT_NORM_EPS = args.mp_input_norm_eps
+    MP_INPUT_NORM_SKIP_FIRST = args.mp_input_norm_skip_first
     MP_RESIDUAL = args.residual
     RESIDUAL_SCALE = args.residual_scale
     CROSS_LAYER_STEPS = args.cross_layer_steps

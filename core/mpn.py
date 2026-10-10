@@ -1223,7 +1223,8 @@ class MultiPlasticNetBase(BaseNetwork):
         # ── Per-step MP-input RMS normalization (opt-in) ─────────────────────
         # Independent of input_normalize (which fixes the RAW input's per-feature
         # scale once). mp_input_norm='rms' rescales the PRESYNAPTIC vector that every
-        # MP layer consumes, at every time step and for every layer:
+        # MP layer consumes, at every time step and for every layer (layers 1..L-1
+        # only under mp_input_norm_skip_first, parsed below):
         #     x_hat = x / r,   r = sqrt(mean_J x_J^2 + eps),   ||x_hat||^2 ≈ d_in.
         # The forward W(1+M)x_hat, the Hebbian write eta*a*x_hatᵀ and all eligibility
         # traces use the SAME x_hat, so the plastic loop gain of a row,
@@ -1242,9 +1243,19 @@ class MultiPlasticNetBase(BaseNetwork):
         self.mp_input_norm_eps = float(net_params.get('mp_input_norm_eps', 1e-5))
         if not math.isfinite(self.mp_input_norm_eps) or self.mp_input_norm_eps <= 0:
             raise ValueError("mp_input_norm_eps must be finite and positive")
+        # Optionally leave MP layer 0's input UN-normalized (layers 1..L-1 still are).
+        # Layer 0 consumes the embedding output (dmpn) or the raw input (mpn1), and a
+        # per-step rescaling there erases the input's amplitude (e.g. the adding
+        # task's value channel); the upper layers' inputs are activities whose scale
+        # carries no task information, which is where the loop-gain argument applies.
+        # Implemented entirely in _mp_input_norm_forward (layer 0 returns (x, None), so
+        # the transpose Jacobian is the identity there). Ignored when the norm is off;
+        # a net with a single MP layer rejects it (nothing would be normalized).
+        self.mp_input_norm_skip_first = bool(net_params.get('mp_input_norm_skip_first', False))
         if self.mp_input_norm != 'none':
-            init_string += '  MP-input normalization: {} (eps={:.1e})\n'.format(
-                self.mp_input_norm, self.mp_input_norm_eps)
+            init_string += '  MP-input normalization: {} (eps={:.1e}{})\n'.format(
+                self.mp_input_norm, self.mp_input_norm_eps,
+                ', layer 0 un-normalized' if self.mp_input_norm_skip_first else '')
 
         if verbose: # Full summary of readout parameters (MP layer prints out internally)
             print(init_string)
@@ -1260,15 +1271,17 @@ class MultiPlasticNetBase(BaseNetwork):
     def _mp_norm_active(self):
         return getattr(self, 'mp_input_norm', 'none') != 'none'
 
-    def _mp_input_norm_forward(self, x):
+    def _mp_input_norm_forward(self, x, layer_idx=None):
         """Normalize one MP layer's presynaptic input for one time step.
 
         x: (..., d). Returns (x_hat, r) with r of shape (..., 1), or (x, None) when
-        mp_input_norm is 'none' (no copy, so the default path is unchanged). The
-        pair (x_hat, r) is exactly what _mp_input_norm_backward needs to transpose
-        the normalization's Jacobian at the same point; callers keep it per layer
-        (and, for the cross-layer correction, per step)."""
-        if not self._mp_norm_active:
+        mp_input_norm is 'none' (no copy, so the default path is unchanged) or when
+        layer_idx == 0 and mp_input_norm_skip_first is set (layer 0 consumes the raw
+        stream; None is omitted only by callers outside the layer loop). The pair
+        (x_hat, r) is exactly what _mp_input_norm_backward needs to transpose the
+        normalization's Jacobian at the same point — r=None makes it the identity —
+        and callers keep it per layer (and, for the cross-layer correction, per step)."""
+        if not self._mp_norm_active or (layer_idx == 0 and self.mp_input_norm_skip_first):
             return x, None
         r = torch.sqrt(x.square().mean(dim=-1, keepdim=True) + self.mp_input_norm_eps)
         return x / r, r
@@ -1276,9 +1289,10 @@ class MultiPlasticNetBase(BaseNetwork):
     def _mp_input_norm_seq(self, inputs):
         """Sequence form of _mp_input_norm_forward for a single MP layer fed by the
         raw (standardized) input: (B, T, d) -> normalized (B, T, d). Identity when
-        mp_input_norm is 'none'. Used by MultiPlasticNet, whose only MP layer has
-        nothing trainable below it, so no Jacobian transpose is ever needed."""
-        return self._mp_input_norm_forward(inputs)[0]
+        mp_input_norm is 'none'. Used by MultiPlasticNet, whose only MP layer (layer
+        0) has nothing trainable below it, so no Jacobian transpose is ever needed;
+        that net rejects mp_input_norm_skip_first, which would leave it un-normalized."""
+        return self._mp_input_norm_forward(inputs, layer_idx=0)[0]
 
     def _mp_input_norm_backward(self, g, x_hat, r):
         """Transpose-Jacobian of x_hat = x / r applied to a covector g at x_hat:
@@ -1459,11 +1473,17 @@ class MultiPlasticNet(MultiPlasticNetBase):
 
         self.mp_layers = [self.mp_layer,] # List of all mp_layers in this network
 
+        if self._mp_norm_active and self.mp_input_norm_skip_first:
+            raise ValueError(
+                "mp_input_norm_skip_first leaves nothing to normalize in the single-layer "
+                "net (its only MP layer is layer 0); drop it, or use DeepMultiPlasticNet "
+                "with at least two MP layers.")
+
     def forward(self, inputs, run_mode='minimal', verbose=False):
 
         # Per-step MP-input normalization (identity unless mp_input_norm is on).
         # x is what the MP layer consumes and what the Hebbian write must use.
-        x, _ = self._mp_input_norm_forward(inputs)
+        x, _ = self._mp_input_norm_forward(inputs, layer_idx=0)
 
         # Returns pre-activation
         hidden_pre, db_mp = self.mp_layer(x, run_mode=run_mode)
@@ -1499,7 +1519,7 @@ class MultiPlasticNet(MultiPlasticNetBase):
         # M updated internally when this is called, M here is only used if finding fixed points (not yet implemented)
         # The write uses the same (optionally RMS-normalized) presynaptic vector the
         # forward consumed; identity unless mp_input_norm is on.
-        x_in, _ = self._mp_input_norm_forward(current_input)
+        x_in, _ = self._mp_input_norm_forward(current_input, layer_idx=0)
         M = self.mp_layer.update_M_matrix(x_in, current_hidden)
 
         return output, db
@@ -1892,13 +1912,17 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
         # (dM0[i,j]/dU[j,k]); under the RMS norm every embedding row enters every
         # normalized column through the shared denominator, so that diagonal
         # bookkeeping no longer describes the model. Rejected rather than silently
-        # approximated ('paired' resolves to diag_mtrace for local_diag_rflo).
-        if self._mp_norm_active and self.input_mode in ('diag_mtrace', 'paired'):
+        # approximated ('paired' resolves to diag_mtrace for local_diag_rflo). With
+        # mp_input_norm_skip_first layer 0 consumes the raw embedding output, the
+        # bookkeeping holds again, and the rule is allowed.
+        if (self._mp_norm_active and not self.mp_input_norm_skip_first
+                and self.input_mode in ('diag_mtrace', 'paired')):
             raise ValueError(
                 f"input_mode='{self.input_mode}' is not supported with mp_input_norm="
                 f"'{self.mp_input_norm}': the diagonal input-column trace assumes each "
                 "embedding row feeds only its own column of the first MP layer's input. "
-                "Use input_mode='match', 'three_factor' or 'exact'.")
+                "Use input_mode='match', 'three_factor' or 'exact', or set "
+                "mp_input_norm_skip_first so that layer 0's input stays un-normalized.")
 
         # Fixed random feedback matrix for the TOP (readout → top-hidden) boundary,
         # used by 'layerwise_fa' (top + every inter-layer boundary). Must match
@@ -1985,6 +2009,11 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
 
             self.mp_layers.append(getattr(self, 'mp_layer{}'.format(mpl_idx)))
             self.params.extend([param+str(mpl_idx) for param in self.mp_layers[-1].params])
+
+        if self._mp_norm_active and self.mp_input_norm_skip_first and len(self.mp_layers) < 2:
+            raise ValueError(
+                "mp_input_norm_skip_first leaves nothing to normalize: this net has a "
+                "single MP layer (layer 0). Drop it, or stack at least two MP layers.")
 
         # ── Per-boundary fixed random feedback for layerwise / direct FA ──────
         # (built AFTER the MP layers so their widths are known; B_feedback for the
@@ -2133,7 +2162,7 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
             # Hebbian write) consumes the optionally normalized x_in; the identity
             # skip below carries the UN-normalized stream (pre-norm placement).
             layer_input_old = layer_input
-            x_in, _ = self._mp_input_norm_forward(layer_input)
+            x_in, _ = self._mp_input_norm_forward(layer_input, layer_idx=mpl_idx)
             mp_inputs.append(x_in)
             hidden_pre, db_mp = mp_layer(x_in, run_mode=run_mode)
 
@@ -2319,8 +2348,10 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
         With return_blocks=True, append the raw block activations for M writes.
         With return_norm=True, append `norm`, a per-layer list of (x_in, r):
             x_in[n]   the presynaptic vector MP layer n CONSUMED — h[n] itself, or
-                      its RMS-normalized form when mp_input_norm is on
+                      its RMS-normalized form when mp_input_norm is on (layer 0
+                      stays h[0] under mp_input_norm_skip_first)
             r[n]      the per-sample RMS divisor (B,1), or None when the norm is off
+                      (and for n == 0 under mp_input_norm_skip_first)
         x_in is what the Hebbian write and every eligibility trace of layer n must
         use; (x_in, r) is what _mp_input_norm_backward needs to carry a learning
         signal from x_in back to the stream h[n]. h[.] always holds the UN-normalized
@@ -2340,7 +2371,7 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
         blocks = []
         norm = []
         for n, mp in enumerate(self.mp_layers):
-            x_in, r_n = self._mp_input_norm_forward(h[-1])   # identity unless norm is on
+            x_in, r_n = self._mp_input_norm_forward(h[-1], layer_idx=n)   # identity unless norm is on
             norm.append((x_in, r_n))
             z_n, _ = mp(x_in)               # uses this layer's M_{t-1}
             phi_p.append(self.act_fn_p(z_n))
@@ -2368,8 +2399,10 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
         (or B_inter[n]) lands on the NORMALIZED input x_in[n], so it is mapped to the
         stream h[n] through the transpose Jacobian of the norm
         (_mp_input_norm_backward) BEFORE the identity-skip term — which lives on the
-        un-normalized stream — is added. direct_fa projects straight onto the
-        stream and is unaffected. With the norm off, norm may be omitted.
+        un-normalized stream — is added. An entry (x, None) makes that map the
+        identity (layer 0 under mp_input_norm_skip_first). direct_fa projects
+        straight onto the stream and is unaffected. With the norm off, norm may be
+        omitted.
 
         head_errors (local readout heads; see _LEARNING_SIGNALS): the per-head
         output errors e_n = dL_n/dq^(n) for n = 0..L-2, or None (global signal).

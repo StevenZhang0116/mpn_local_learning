@@ -17,13 +17,20 @@ What is checked (float64, CPU, tight tolerances):
     same B-matrix chain through the norm.
   * local_readout heads at T = 1 under the norm: each non-top module's W/b equal
     autograd of its OWN head loss, the top layer equals autograd of the main loss.
-  * diag_mtrace / paired input modes are rejected with the norm on.
+  * diag_mtrace / paired input modes are rejected while layer 0 is normalized.
   * train_mpn CLI: --mp-input-norm / --mp-input-norm-eps validation, net_params
     wiring, and a checkpoint round-trip through the saved configuration.
+  * train_mpn.forward_outputs (validation) equals the trained forward for both nets.
+  * mp_input_norm_skip_first: layer 0 consumes the raw stream ((x_in, r) = (h[0],
+    None)) while layers 1.. are normalized; every exactness statement above still
+    holds; diag_mtrace is accepted again and exact at T = 1; single-MP-layer nets
+    reject the flag; the CLI wires, validates and tags it.
 """
 import _bootstrap  # noqa: F401
 
+import contextlib
 import copy
+import io
 import json
 import os
 import tempfile
@@ -33,6 +40,7 @@ import numpy as np
 import torch
 
 import mpn
+import train_common
 import train_mpn
 
 
@@ -47,13 +55,15 @@ def _ml_params(bounds=False, matrix=False):
 
 def build_deep(arch, *, norm='rms', residual=False, cross=0, rule='local_exact_rowlocal',
                feedback='exact_spatial', embed=True, input_mode='match',
-               learning_signal='global', bounds=False, matrix=False, seed=0, eps=1e-5):
+               learning_signal='global', bounds=False, matrix=False, seed=0, eps=1e-5,
+               skip_first=False):
     torch.manual_seed(seed)
     npar = {'n_neurons': arch, 'loss_type': 'MSE', 'activation': 'tanh',
             'output_bias': True, 'output_matrix': '', 'dt': 40,
             'feedback_mode': feedback, 'mp_residual': residual,
             'cross_layer_steps': cross, 'learning_rule': rule,
             'input_mode': input_mode, 'learning_signal': learning_signal,
+            'mp_input_norm_skip_first': skip_first,
             'ml_params': _ml_params(bounds, matrix)}
     if norm is not None:
         npar['mp_input_norm'] = norm
@@ -76,11 +86,13 @@ def build_deep(arch, *, norm='rms', residual=False, cross=0, rule='local_exact_r
     return net
 
 
-def build_single(n_in, n_hid, n_out, *, norm='rms', rule='local_exact_rowlocal', seed=0):
+def build_single(n_in, n_hid, n_out, *, norm='rms', rule='local_exact_rowlocal', seed=0,
+                 skip_first=False):
     torch.manual_seed(seed)
     npar = {'n_neurons': [n_in, n_hid, n_out], 'loss_type': 'MSE', 'activation': 'tanh',
             'output_bias': True, 'output_matrix': '', 'dt': 40,
             'learning_rule': rule, 'feedback_mode': 'exact_spatial',
+            'mp_input_norm_skip_first': skip_first,
             'ml_params': _ml_params()}
     if norm is not None:
         npar['mp_input_norm'] = norm
@@ -114,6 +126,15 @@ def mp_keys(net, bias=True):
 
 def rel(a, b):
     return ((a - b).norm() / (b.norm() + 1e-300)).item()
+
+
+def pair(arch, **kw):
+    """(bptt net, local net) with identical parameters; kw as build_deep."""
+    kw_b = dict(kw); kw_b['rule'] = 'bptt'
+    b = build_deep(arch, **kw_b)
+    l = build_deep(arch, **kw)
+    l.load_state_dict(b.state_dict())
+    return b, l
 
 
 class TestNormHelpers(unittest.TestCase):
@@ -377,6 +398,141 @@ class TestTrainingScriptEval(unittest.TestCase):
             torch.testing.assert_close(train_mpn.forward_outputs(b, inp),
                                        b.bptt_gradients(inp, lab, msk)['outputs'],
                                        rtol=1e-12, atol=1e-12, msg=f'res={residual}')
+
+
+class TestSkipFirstLayer(unittest.TestCase):
+    """mp_input_norm_skip_first: MP layer 0 consumes the raw stream (its (x_in, r) is
+    (h[0], None), so every signal mapped through layer 0 is the identity) while layers
+    1..L-1 are normalized as before. The exactness statements hold unchanged, the
+    diag_mtrace input rule is allowed again (and exact at T=1), nets with a single MP
+    layer reject the flag, the norm-off net ignores it, and the CLI wires/validates it."""
+
+    def test_layer0_raw_upper_layers_normalized(self):
+        net = build_deep([5, 6, 6, 6, 3], residual=True, seed=31, skip_first=True)
+        self.assertTrue(net.mp_input_norm_skip_first)
+        inp, _, _ = make_data(3, 2, 5, 3)
+        u = net._standardize_input(inp)[:, 0]
+        net.reset_state(B=3)
+        out, h, z, phi, _, blocks, norm = net._forward_local_stack(u, return_blocks=True,
+                                                                   return_norm=True)
+        self.assertIs(norm[0][0], h[0])
+        self.assertIsNone(norm[0][1])
+        for n in range(1, len(net.mp_layers)):
+            self.assertIsNotNone(norm[n][1])
+            torch.testing.assert_close(norm[n][0].square().sum(-1),
+                                       torch.full((3,), 6.0, dtype=torch.float64),
+                                       rtol=0, atol=6e-4)
+        # The stepping forward agrees: after one step layer 0's M is eta*a0*h[0]^T
+        # (raw stream) and layer 1's is eta*a1*x_hat[1]^T (normalized input).
+        net.reset_state(B=3)
+        net.network_step(u)
+        m0, m1 = net.mp_layers[0], net.mp_layers[1]
+        torch.testing.assert_close(m0.M, m0.eta * blocks[0].unsqueeze(-1) * h[0].unsqueeze(1),
+                                   rtol=1e-12, atol=1e-12)
+        torch.testing.assert_close(m1.M, m1.eta * blocks[1].unsqueeze(-1) * norm[1][0].unsqueeze(1),
+                                   rtol=1e-12, atol=1e-12)
+        # Layer 0's signal mapping is the identity; an upper layer's is not.
+        g = torch.randn(3, 6, dtype=torch.float64)
+        self.assertIs(net._mp_input_norm_backward(g, *norm[0]), g)
+        self.assertGreater(rel(net._mp_input_norm_backward(g, *norm[1]), g), 1e-3)
+        # Validation forward runs the same network.
+        lab = torch.randn(3, 2, 3, dtype=torch.float64); msk = torch.ones_like(lab)
+        b = build_deep([5, 6, 6, 6, 3], rule='bptt', residual=True, seed=31, skip_first=True)
+        b.load_state_dict(net.state_dict())
+        torch.testing.assert_close(train_mpn.forward_outputs(b, inp),
+                                   b.bptt_gradients(inp, lab, msk)['outputs'],
+                                   rtol=1e-12, atol=1e-12)
+
+    def test_exactness_statements_hold(self):
+        # T=1: every parameter incl. the three-factor embedding, for every local rule.
+        for rule in ('local_exact_rowlocal', 'local_diag_rflo', 'local_direct'):
+            for residual in (False, True):
+                b, l = pair([5, 6, 6, 6, 3], rule=rule, residual=residual, seed=32, skip_first=True)
+                inp, lab, msk = make_data(5, 1, 5, 3, seed=23)
+                gb, gl = b.sequence_gradients(inp, lab, msk), l.sequence_gradients(inp, lab, msk)
+                for k in mp_keys(l) + ['W_in', 'b_in', 'W_output', 'b_output']:
+                    torch.testing.assert_close(gl[k], gb[k], rtol=1e-9, atol=1e-11,
+                                               msg=f'{rule} {k} res={residual}')
+        # Long T: the top layer is exact.
+        b, l = pair([5, 6, 6, 6, 3], residual=True, bounds=True, seed=33, skip_first=True)
+        inp, lab, msk = make_data(4, 6, 5, 3, seed=5)
+        gb, gl = b.sequence_gradients(inp, lab, msk), l.sequence_gradients(inp, lab, msk)
+        top = len(l.mp_layers) - 1
+        for k in (f'W{top}', f'b{top}', 'W_output', 'b_output'):
+            torch.testing.assert_close(gl[k], gb[k], rtol=1e-9, atol=1e-11, msg=k)
+        self.assertGreater(rel(gl['W'], gb['W']), 1e-4)
+        # cross_layer_steps=1: exact at T=2 (the one-hop sources and the downward
+        # sweep pass through layer 0 as identities, through layers 1.. via J^T_{t-1}).
+        for residual in (False, True):
+            b, l = pair([5, 6, 6, 6, 3], residual=residual, cross=1, embed=False, seed=34,
+                        skip_first=True)
+            inp, lab, msk = make_data(4, 2, 5, 3, seed=29)
+            gb, gl = b.sequence_gradients(inp, lab, msk), l.sequence_gradients(inp, lab, msk)
+            for k in mp_keys(l) + ['W_output', 'b_output']:
+                torch.testing.assert_close(gl[k], gb[k], rtol=1e-9, atol=1e-11,
+                                           msg=f'{k} res={residual}')
+
+    def test_diag_mtrace_allowed_again_and_exact_at_T1(self):
+        b, l = pair([5, 6, 6, 3], rule='local_diag_rflo', input_mode='diag_mtrace', seed=35,
+                    skip_first=True)
+        self.assertEqual(l.resolved_input_mode, 'diag_mtrace')
+        inp, lab, msk = make_data(4, 1, 5, 3, seed=31)
+        gb, gl = b.sequence_gradients(inp, lab, msk), l.sequence_gradients(inp, lab, msk)
+        for k in mp_keys(l) + ['W_in', 'b_in', 'W_output', 'b_output']:
+            torch.testing.assert_close(gl[k], gb[k], rtol=1e-9, atol=1e-11, msg=k)
+        # Longer sequences run (the column trace is an approximation, not exact).
+        inp, lab, msk = make_data(4, 4, 5, 3, seed=37)
+        g = l.sequence_gradients(inp, lab, msk)
+        self.assertTrue(all(torch.isfinite(v).all() for v in g.values() if torch.is_tensor(v)))
+        # Still rejected while layer 0 IS normalized.
+        with self.assertRaisesRegex(ValueError, 'diag_mtrace'):
+            build_deep([5, 6, 6, 3], input_mode='diag_mtrace', skip_first=False)
+
+    def test_single_mp_layer_rejects_the_flag(self):
+        with self.assertRaisesRegex(ValueError, 'skip_first'):
+            build_single(5, 6, 3, skip_first=True)
+        with self.assertRaisesRegex(ValueError, 'skip_first'):
+            build_deep([5, 6, 3], skip_first=True)              # dmpn with ONE MP layer
+        # Ignored when the norm is off (no error, same computation as norm off).
+        a = build_single(5, 6, 3, norm='none', seed=3)
+        c = build_single(5, 6, 3, norm='none', seed=3, skip_first=True)
+        c.load_state_dict(a.state_dict())      # MP-layer init draws from numpy's RNG
+        inp, lab, msk = make_data(3, 4, 5, 3)
+        self.assertTrue(torch.equal(a.sequence_gradients(inp, lab, msk)['W'],
+                                    c.sequence_gradients(inp, lab, msk)['W']))
+        build_deep([5, 6, 3], norm='none', skip_first=True)
+
+    def test_cli(self):
+        on = ['--mp-input-norm', 'rms', '--mp-input-norm-skip-first', '--hidden', '8', '8']
+        self.assertTrue(train_mpn._parse_args(on).mp_input_norm_skip_first)
+        self.assertFalse(train_mpn._parse_args([]).mp_input_norm_skip_first)
+        self.assertFalse(train_mpn._parse_args(['--mp-input-norm', 'rms']).mp_input_norm_skip_first)
+        for bad in (['--mp-input-norm-skip-first', '--hidden', '8', '8'],                    # needs the norm
+                    ['--mp-input-norm', 'rms', '--mp-input-norm-skip-first', '--hidden', '8'],  # one MP layer
+                    ['--mp-input-norm', 'rms', '--mp-input-norm-skip-first',
+                     '--net', 'mpn1', '--hidden', '8', '--no-residual'],
+                    ['--mp-input-norm', 'rms', '--input-mode', 'diag_mtrace', '--hidden', '8', '8']):
+            with self.subTest(bad=bad), contextlib.redirect_stderr(io.StringIO()), \
+                    self.assertRaises(SystemExit):
+                train_mpn._parse_args(bad)
+        a = train_mpn._parse_args(on + ['--input-mode', 'diag_mtrace'])   # accepted again
+        self.assertEqual(a.input_mode, 'diag_mtrace')
+        saved = train_mpn.MP_INPUT_NORM, train_mpn.MP_INPUT_NORM_SKIP_FIRST, train_mpn.N_HIDDEN
+        try:
+            train_mpn.MP_INPUT_NORM, train_mpn.MP_INPUT_NORM_SKIP_FIRST, train_mpn.N_HIDDEN = 'rms', True, [8, 8]
+            net_params = train_mpn.build_params()[2]
+            self.assertTrue(net_params['mp_input_norm_skip_first'])
+            net = mpn.DeepMultiPlasticNet(net_params, verbose=False)
+            self.assertTrue(net.mp_input_norm_skip_first)
+            cfg = train_mpn._cfg()
+            self.assertTrue(cfg.mp_input_norm_skip_first)
+            cfg.run_id = ''
+            self.assertIn('_mpnorm-rms-skip0', train_common.param_tag(cfg))
+            train_mpn.MP_INPUT_NORM_SKIP_FIRST = False
+            cfg = train_mpn._cfg(); cfg.run_id = ''
+            self.assertNotIn('skip0', train_common.param_tag(cfg))
+        finally:
+            train_mpn.MP_INPUT_NORM, train_mpn.MP_INPUT_NORM_SKIP_FIRST, train_mpn.N_HIDDEN = saved
 
 
 class TestCLI(unittest.TestCase):

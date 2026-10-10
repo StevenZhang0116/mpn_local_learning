@@ -96,6 +96,7 @@ class RunConfig:
     # console/figure notes; the net reads it from net_params. 'none' = off.
     mp_input_norm: str = "none"
     mp_input_norm_eps: float = 1e-5
+    mp_input_norm_skip_first: bool = False   # layer 0's input raw, layers 1.. normalized
     # Identity skip (residual) connections around each equal-width MP block (dmpn;
     # see mpn.DeepMultiPlasticNet mp_residual). Recorded in metadata and console/
     # figure notes; the net reads it from net_params. Legacy names include "_res".
@@ -181,6 +182,8 @@ def param_tag(cfg):
         tag += "_inorm"
     if getattr(cfg, "mp_input_norm", "none") != "none":
         tag += f"_mpnorm-{cfg.mp_input_norm}"
+        if getattr(cfg, "mp_input_norm_skip_first", False):
+            tag += "-skip0"
     if getattr(cfg, "mp_residual", False):
         tag += "_res"
         if getattr(cfg, "residual_scale", 1.0) != 1.0:
@@ -802,6 +805,7 @@ def run_seed(cfg, seed, record_steps, run_idx=0, wandb_logger=None):
                     getattr(nets[rule], "_has_trainable_embed", lambda: False)()),
                 "input_normalize": cfg.input_normalize,
                 "mp_input_norm": getattr(cfg, "mp_input_norm", "none"),
+                "mp_input_norm_skip_first": getattr(cfg, "mp_input_norm_skip_first", False),
                 "mp_residual": cfg.mp_residual,
                 "residual_scale": getattr(cfg, "residual_scale", 1.0),
                 "input_mode": cfg.input_mode,
@@ -924,6 +928,7 @@ def save_plot_data(cfg, record_steps, runs, agg, path=None,
         "lr_patience": getattr(cfg, "lr_patience", 30), "lr_factor": getattr(cfg, "lr_factor", 0.95),
         "feedback_mode": cfg.feedback_mode, "input_normalize": cfg.input_normalize,
         "mp_input_norm": getattr(cfg, "mp_input_norm", "none"),
+        "mp_input_norm_skip_first": getattr(cfg, "mp_input_norm_skip_first", False),
         "mp_input_norm_eps": getattr(cfg, "mp_input_norm_eps", 1e-5),
         "mp_residual": cfg.mp_residual,
         "residual_scale": getattr(cfg, "residual_scale", 1.0),
@@ -1027,6 +1032,7 @@ def save_config(cfg, path=None):
             "input_normalize": cfg.input_normalize,
             "input_norm_sample": cfg.input_norm_sample,
             "mp_input_norm": getattr(cfg, "mp_input_norm", "none"),
+            "mp_input_norm_skip_first": getattr(cfg, "mp_input_norm_skip_first", False),
             "mp_input_norm_eps": getattr(cfg, "mp_input_norm_eps", 1e-5),
             "log_grad_align": cfg.log_grad_align,
             "mp_residual": cfg.mp_residual,
@@ -1102,7 +1108,7 @@ def run_experiment(cfg):
           f"{f'  signal: {cfg.signal_mode}' if getattr(cfg, 'signal_mode', '') else ''}"
           f"  feedback: {cfg.feedback_mode}"
           f"{'  (input norm ON)' if getattr(cfg, 'input_normalize', False) else ''}"
-          f"{f'  (MP-input norm: {cfg.mp_input_norm})' if getattr(cfg, 'mp_input_norm', 'none') != 'none' else ''}"
+          f"{f'  (MP-input norm: {cfg.mp_input_norm}' + (', layer 0 un-normalized' if getattr(cfg, 'mp_input_norm_skip_first', False) else '') + ')' if getattr(cfg, 'mp_input_norm', 'none') != 'none' else ''}"
           f"{f'  (residual scale={cfg.residual_scale:g})' if getattr(cfg, 'mp_residual', False) else ''}"
           f"{f'  (cross-layer x{cfg.cross_layer_steps})' if getattr(cfg, 'cross_layer_steps', 0) else ''}"
           f"  input_mode: {getattr(cfg, 'input_mode', 'match')}"
@@ -1180,6 +1186,7 @@ def run_experiment(cfg):
     # existing (norm-off, match) figure titles are unchanged.
     inorm_note = ", input norm" if getattr(cfg, "input_normalize", False) else ""
     mpnorm_note = (f", MP-input {cfg.mp_input_norm} norm"
+                   + (" (layer 0 un-normalized)" if getattr(cfg, "mp_input_norm_skip_first", False) else "")
                    if getattr(cfg, "mp_input_norm", "none") != "none" else "")
     resid_note = (f", residual scale={cfg.residual_scale:g}"
                   if getattr(cfg, "mp_residual", False) else "")

@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Why diagonal RFLO needs the trace-gain cap: exact row gain vs diagonal gain.
+"""Trace-gain diagnostic: exact row-local gain vs diagonal-RFLO gain, and when the cap matters.
 
 For one batch of one task, a deep MPN is run through three local passes on the
 SAME forward trajectory and compared with BPTT:
@@ -19,9 +19,19 @@ largest trace entry (exact diag(P), uncapped A, capped A) and each variant's
 gradient cosine with BPTT. Outputs: <output-dir>/<tag>.png, <tag>_summary.json,
 <tag>_curves.npz (default output dir notebooks/rflo_trace_gain/).
 
+Whether the cap is needed depends on the loop gain lam + k*W: at the defaults
+(eta=1, lam=0.99) the uncapped A diverges; with a small eta (e.g. 0.003 at lam=0.99),
+with or without --mp-input-norm rms, all three variants stay bounded and aligned
+(README, "MP-input RMS normalization"). --eta / --lam / --mp-input-norm /
+--mp-input-norm-skip-first take the same values as train_mpn.py.
+
 Run from the project root, e.g.
     python notebooks/rflo_trace_gain.py --task contextdelaydm1 --hidden 128 128 128
     python notebooks/rflo_trace_gain.py --task adding_L200 --batch 16 --rho 0.99
+    python notebooks/rflo_trace_gain.py --task contextdelaydm1 --hidden 64 64 64 --batch 8 \
+        --eta 0.003 --lam 0.99                      # no-norm control
+    python notebooks/rflo_trace_gain.py --task contextdelaydm1 --hidden 64 64 64 --batch 8 \
+        --mp-input-norm rms --mp-input-norm-skip-first --eta 0.003 --lam 0.99
 """
 import argparse
 import contextlib
@@ -180,6 +190,7 @@ def analyze(task_name, widths=(128, 128, 128), batch=16, seed=0, rho=0.99, resid
     summary = dict(task=task_name, T=int(T), batch=int(batch), widths=[int(w) for w in widths], seed=seed,
                    rho=rho, residual=residual, dtype=str(dtype),
                    mp_input_norm=net_exact.mp_input_norm,
+                   mp_input_norm_skip_first=bool(getattr(net_exact, "mp_input_norm_skip_first", False)),
                    eta=float(net_exact.mp_layers[0].eta.mean()), lam=float(net_exact.mp_layers[0].lam.mean()),
                    layers=layers)
     curves = dict(T=T, keys=keys,
@@ -270,10 +281,10 @@ def plot(summary, curves, path):
         ax.set_title("gradient cosine with BPTT (this batch)" if n == 0 else "", color=TEXT, fontsize=9)
         _style(ax)
         ax.grid(False, axis="x")
-    fig.suptitle(f"{summary['task']}: why diagonal RFLO needs the trace-gain cap  "
+    fig.suptitle(f"{summary['task']}: diagonal-RFLO trace gain vs the exact row-local trace  "
                  f"(T={summary['T']}, batch={summary['batch']}, η={summary['eta']:g}, λ={summary['lam']:.3g}, "
                  f"widths={summary['widths']}, residual={'on' if summary['residual'] else 'off'}"
-                 f"{', MP-input ' + summary['mp_input_norm'] + ' norm' if summary.get('mp_input_norm', 'none') != 'none' else ''})",
+                 f"{', MP-input ' + summary['mp_input_norm'] + ' norm' + (' (layer 0 un-normalized)' if summary.get('mp_input_norm_skip_first') else '') if summary.get('mp_input_norm', 'none') != 'none' else ''})",
                  color=TEXT, fontsize=11, y=1.0)
     fig.tight_layout()
     Path(path).parent.mkdir(parents=True, exist_ok=True)
@@ -288,6 +299,8 @@ def run(task_name, widths, batch, seed, rho, residual, output_dir=None, device="
     tag = f"{task_name}_h{'-'.join(str(w) for w in widths)}_b{batch}_rho{rho:g}_seed{seed}"
     if summary.get("mp_input_norm", "none") != "none":
         tag += f"_mpnorm-{summary['mp_input_norm']}"
+        if summary.get("mp_input_norm_skip_first"):
+            tag += "-skip0"
     if overrides and overrides.get("ETA") is not None:
         tag += "_eta" + "-".join(f"{e:g}" for e in overrides["ETA"])
     if overrides and overrides.get("LAM") is not None:
@@ -318,6 +331,8 @@ def _parse(argv=None):
     p.add_argument("--residual", action=argparse.BooleanOptionalAction, default=False)
     p.add_argument("--mp-input-norm", choices=["none", "rms"], default="none",
                    help="per-step RMS norm of each MP layer's input (train_mpn --mp-input-norm)")
+    p.add_argument("--mp-input-norm-skip-first", action="store_true", default=False,
+                   help="leave MP layer 0's input un-normalized (train_mpn --mp-input-norm-skip-first)")
     p.add_argument("--eta", type=float, nargs="+", default=None,
                    help="fixed Hebbian write rate(s), as train_mpn --eta (default: core 1.0)")
     p.add_argument("--lam", type=float, default=None,
@@ -330,7 +345,8 @@ def _parse(argv=None):
 
 def main(argv=None):
     a = _parse(argv)
-    overrides = {"MP_INPUT_NORM": a.mp_input_norm}
+    overrides = {"MP_INPUT_NORM": a.mp_input_norm,
+                 "MP_INPUT_NORM_SKIP_FIRST": bool(a.mp_input_norm_skip_first)}
     if a.eta is not None:
         overrides["ETA"] = list(a.eta)
     if a.lam is not None:

@@ -71,6 +71,7 @@ def _base_config(cfg, experiment):
         "input_normalize": getattr(cfg, "input_normalize", False),
         "mp_input_norm": getattr(cfg, "mp_input_norm", "none"),
         "mp_input_norm_eps": getattr(cfg, "mp_input_norm_eps", 1e-5),
+        "mp_input_norm_skip_first": getattr(cfg, "mp_input_norm_skip_first", False),
         "mp_residual": getattr(cfg, "mp_residual", False),
         "residual_scale": getattr(cfg, "residual_scale", 1.0),
         "cross_layer_steps": getattr(cfg, "cross_layer_steps", 0),

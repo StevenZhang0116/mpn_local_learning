@@ -8,6 +8,7 @@ Targets (the contents of each directory; the directories themselves are kept):
     figure_data/                           the .npz behind each figure
     log/                                   console logs (log/<run-id>.log)
     notebooks/diagnose_gradients/          analysis outputs
+    notebooks/rflo_trace_gain/             analysis outputs
     notebooks/verify_rflo_scaling/         analysis outputs
     notebooks/visualize_trained_networks/  analysis outputs
 All of them are git-ignored output folders written by scripts/train_mpn.py,
@@ -42,6 +43,7 @@ TARGET_DIRS = {
     "figure_data": "figure_data",
     "log": "log",
     "diagnose_gradients": "notebooks/diagnose_gradients",
+    "rflo_trace_gain": "notebooks/rflo_trace_gain",
     "verify_rflo_scaling": "notebooks/verify_rflo_scaling",
     "visualize_trained_networks": "notebooks/visualize_trained_networks",
 }

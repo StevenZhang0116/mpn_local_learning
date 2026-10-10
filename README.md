@@ -73,7 +73,8 @@ Configuration JSON and checkpoints save the choice as `net_params.ml_params.mp_t
   `compare_mpn_rnn_performance.py`.
 - `clean.py` (project root) — deletes STALE OUTPUTS only: the contents of
   `checkpoints/`, `figure/`, `figure_data/`, `log/` and the `notebooks/diagnose_gradients/`,
-  `notebooks/verify_rflo_scaling/`, `notebooks/visualize_trained_networks/` output folders.
+  `notebooks/rflo_trace_gain/`, `notebooks/verify_rflo_scaling/`,
+  `notebooks/visualize_trained_networks/` output folders.
   Dry run by default; `python clean.py --run` deletes, `--keep '<glob>'` spares matching
   entries, positional names limit it to some folders. `utils/clean.py` forwards to it.
 - Outputs (git-ignored): `figure/` (PNGs), `figure_data/` (`.npz` behind each figure),
@@ -490,7 +491,8 @@ the cap is disabled).
 ### MP-input RMS normalization (`--mp-input-norm rms`)
 
 `--mp-input-norm rms` rescales the presynaptic vector that **every** MP layer
-consumes, at every time step: `x_hat = x / sqrt(mean_J(x_J**2) + eps)`, so
+consumes (layers 1..L-1 only with `--mp-input-norm-skip-first`, below), at every
+time step: `x_hat = x / sqrt(mean_J(x_J**2) + eps)`, so
 `||x_hat||**2` equals the layer's fan-in. The modulated forward `W(1+M)x_hat`, the
 Hebbian write `eta * a * x_hat^T` and all eligibility traces use the same `x_hat`;
 an identity residual skip carries the **un-normalized** stream (pre-norm placement).
@@ -508,8 +510,9 @@ alike) is `lambda + eta*phi'*sum_J W_iJ x_J**2`, and the diagonal RFLO trace of
 synapse `(i,I)` has gain `lambda + eta*phi'*W_iI*x_I**2`. Both traces stay
 bounded only while these gains stay below one along the trajectory. Without the
 norm, `sum_J W_iJ x_J**2` scales with the fan-in, with the magnitude of the input at
-that step and, with `--residual`, with the depth of the residual stream, so no single
-`--eta` is right for every layer. For the **multiplicative** MPN (`--mp-type mult`,
+that step and, with `--residual`, with the depth of the residual stream, so the
+stability condition on `--eta` is not scale-free: the value that fits one layer, task
+or depth need not fit another. For the **multiplicative** MPN (`--mp-type mult`,
 the default) `||x_hat||**2 = d` and zero-mean Xavier weights make the row sum O(1) in
 every layer and at every step, and `eta/(1-lambda)` becomes the one dimensionless
 knob. This does **not** carry over to the additive MPN (`--mp-type add`): there the
@@ -523,10 +526,21 @@ normalize to unit L2 norm instead). On `contextdelaydm1` with `--hidden 64 64 64
 | setting | row gain > 1 (per step, layers 1–3) | diagonal gain > 1 | max trace at the end | cos vs BPTT (exact / diag) |
 |---|---|---|---|---|
 | default `eta=1, lam=0.99`, no norm | 47–52 % | 10–17 % | `A` up to 1.6e5 | −0.5…1.0 / 0.03–0.06 |
+| **control:** `eta=0.003, lam=0.99`, no norm (same seed/batch) | 0 % | 0 % | 0.06–0.12 | 1.00 / 1.00 |
 | `rms, eta=0.01` (`eta/(1-lam)=1`) | 7–10 % | 0 % | 2–10 | 0.88–1.0 / 0.77–0.94 |
 | `rms, eta=0.005` (0.5) | 0.5–3 % | 0 % | 0.9–3 | 0.97–1.0 / 0.93–0.98 |
 | `rms, eta=0.003` (0.3) | 0–0.2 % | 0 % | 0.5–1.5 | 0.99–1.0 / 0.98–0.99 |
 | `rms, eta=0.015, lam=0.95` (0.3) | 0–0.2 % | 0 % | 0.8–3 | 0.94–1.0 / 0.89–0.97 |
+
+The control row (added after the merge, from the same diagnostic with the same seed
+and batch) shows that on this task the whole improvement over the default row comes
+from the smaller `eta`, not from the norm: without the norm the stream has
+`||x||**2 < d` (tanh activities plus the embedding), so at the same `eta` its loop
+gain is lower still and its traces smaller. What the norm buys is scale invariance —
+the same `eta` gives the same loop gain whatever the fan-in, activity level or
+residual-stream depth — which a single-task, no-residual diagnostic does not
+exercise; whether that matters for training has to be settled by paired runs
+(`--seed`, same `--eta`, norm on/off).
 
 So with the norm on (multiplicative MPN), `eta ≈ 0.3*(1-lambda)` keeps every layer's traces bounded
 without `--rflo-trace-rho` (the capped and uncapped diagonal variants then
@@ -546,9 +560,26 @@ transpose Jacobian `J^T g = (g - x_hat * mean_J(g_J x_hat_J)) / r` before the
 identity-skip term is added; `dfa` projects straight onto the stream and is
 unchanged; local readout heads read the un-normalized stream and are unchanged;
 `bptt` differentiates through the norm by autograd. `--input-mode diag_mtrace` (and
-`paired`, which resolves to it) is rejected with the norm on: its one-column-per-
+`paired`, which resolves to it) is rejected while layer 0 is normalized (see
+`--mp-input-norm-skip-first` below): its one-column-per-
 embedding-row bookkeeping does not describe a layer whose columns share a
 normalizer. `tests/test_mp_input_norm.py` checks all of the above against autograd.
+
+`--mp-input-norm-skip-first` leaves MP layer 0's input un-normalized and normalizes
+layers 1..L-1 only (`--net dmpn` with at least two MP layers). Layer 0 consumes the
+embedding output (for `mpn1`, the raw input), and a per-step rescaling there erases
+the input's amplitude: in the adding task the single-layer input `(v, 0)` becomes
+`(±sqrt(2), 0)` whatever the value `v`, and with a trainable embedding the amplitude
+survives only relative to the embedding bias. The upper layers' inputs are
+activities whose scale carries no task information, which is where the loop-gain
+argument applies. Layer 0's `(x_in, r)` is then `(h[0], None)`, so every signal that
+maps through it (`exact_spatial`, `layerwise_fa`, the embedding's three-factor rule,
+the cross-layer sweep) is the identity there, and `--input-mode diag_mtrace`/`paired`
+are accepted again (their one-column-per-embedding-row bookkeeping holds). The
+exactness statements above are unchanged and re-checked with the flag on. The flag
+requires `--mp-input-norm rms`, is saved as `net_params.mp_input_norm_skip_first`,
+appears in the metadata and the console/figure notes, and adds `-skip0` to the
+legacy `_mpnorm-rms` tag. `notebooks/rflo_trace_gain.py` accepts the same flag.
 
 Every `train_mpn.py` CLI invocation also mirrors stdout and stderr to
 `log/<run-id>.log`, the same `<model>_<task>_<YYYYMMDD_HHMMSS>_<hash>` name as the
@@ -728,10 +759,14 @@ JSON `null` or empty CSV cells, never silently replaced with zero. Trace summari
 average/maximize defined per-step values. A one-batch comparison diagnoses local
 gradient geometry; it does not establish why an entire training run failed.
 
-### Why diagonal RFLO needs the trace-gain cap
+### Trace-gain diagnostic: when diagonal RFLO needs the cap
 
 ```bash
 python notebooks/rflo_trace_gain.py --task contextdelaydm1 --hidden 128 128 128 --batch 16 --rho 0.99
+# same diagnostic at a small write rate, with / without the MP-input norm:
+python notebooks/rflo_trace_gain.py --task contextdelaydm1 --hidden 64 64 64 --batch 8 --eta 0.003 --lam 0.99
+python notebooks/rflo_trace_gain.py --task contextdelaydm1 --hidden 64 64 64 --batch 8 --eta 0.003 --lam 0.99 \
+  --mp-input-norm rms --mp-input-norm-skip-first
 ```
 
 On one batch, the same forward trajectory is run through exact row-local, diagonal
@@ -740,7 +775,11 @@ modulation-trace recurrence has gain `lam + k*W` per synapse in the diagonal
 approximation (`k = eta * phi' * x^2`) but `lam + sum_J k_J W_iJ` for the exact row
 trace; the diagonal rule keeps one signed term of that sum, so its gain can exceed 1
 where the row's net feedback is damped, and the same-synapse trace then grows
-geometrically within a trial while the exact trace stays bounded. The figure
+geometrically within a trial while the exact trace stays bounded. That is the
+picture at the default `eta=1, lambda=0.99`; whether it happens at all is set by
+the loop gain `lambda + k*W`, and at a small `--eta` (0.003 at `lambda=0.99`, with
+or without `--mp-input-norm rms`) all three variants stay bounded and aligned, see
+the table in the MP-input normalization section. The figure
 (`notebooks/rflo_trace_gain/<tag>.png`, with a JSON summary and `.npz` curves) shows,
 per MP layer, the ECDFs of both gains, the fraction above 1 per step, the largest
 trace entry over time for the three variants, and each variant's gradient cosine with
