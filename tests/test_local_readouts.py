@@ -553,7 +553,6 @@ class TestLocalReadoutRunner(unittest.TestCase):
             self.assertIn('head0: acc', text)
             self.assertIn('head1: acc', text)
             # Every clip call is either all-main or all-head: the two groups never mix.
-            heads_seen = 0
             for rule in cfg.rules_to_run:
                 ckpt = torch.load(train_common.ckpt_path(cfg, rule, 13), weights_only=False)
                 self.assertEqual(ckpt['learning_signal'], 'local_readout')

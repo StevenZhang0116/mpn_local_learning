@@ -1,10 +1,12 @@
 #!/usr/bin/env python
 # coding: utf-8
 """
-Verify core/mpn_revise.py matches core/mpn.py in forward AND backward dynamics,
-within tolerance.
+Verify the efficiency-optimized core/mpn.py (formerly mpn_revise.py) matches the
+reference core/mpn_archive.py in forward AND backward dynamics, within tolerance.
+Below, `mpn` names the reference and `mpn_revise` the optimized module (the
+historical names, kept as import aliases).
 
-mpn_revise.py is an efficiency refactor. Some changes are bitwise-identical
+mpn_revise is an efficiency refactor. Some changes are bitwise-identical
 (loss-only helper, dropped clones), but the main speedups REORDER floating-point
 ops and so are only identical up to round-off:
   - MP-layer forward: W_eff·x split into F.linear(x, W) + bmm(W⊙M, x), instead of

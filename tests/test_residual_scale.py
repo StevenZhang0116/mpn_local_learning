@@ -14,7 +14,6 @@ import torch
 import torch.nn.functional as F
 
 import _bootstrap  # noqa: F401
-import mpn
 import train_common as tc
 import train_mpn
 import test_dfa as dfa

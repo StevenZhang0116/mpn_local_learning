@@ -3,7 +3,6 @@ import contextlib
 import io
 import json
 from pathlib import Path
-import re
 import tempfile
 from types import SimpleNamespace
 import unittest

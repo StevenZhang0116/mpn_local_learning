@@ -105,7 +105,7 @@ def test_seqmnist_task(mode, T_expected, feat_expected):
 
 def test_adding_task():
     print("── AddingProblemTask ──")
-    from adding_tasks import AddingProblemTask, adding_problem_generator
+    from adding_tasks import AddingProblemTask
 
     t = AddingProblemTask(seq_len=200, n_marks=2)
     check("seq_len / feat_dim / n_output",

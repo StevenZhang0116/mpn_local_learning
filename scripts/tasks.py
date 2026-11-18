@@ -227,10 +227,6 @@ class SeqMNISTTask:
 
 
 # ─── Task registry ────────────────────────────────────────────────────────────
-def is_seqmnist(ruleset):
-    """True if the RULESET string names a seq-MNIST variant."""
-    return str(ruleset).lower() in (
-        "seqmnist", "smnist", "mnist", "seqmnist_pixel", "pmnist", "pixelmnist")
 
 
 def is_adding(ruleset):

@@ -923,8 +923,6 @@ def tier13_input_mode():
     allok &= ok_a
     print(f"  [{'PASS' if ok_a else 'FAIL'}] 'match' is a no-op (native) for bptt/diag/direct")
 
-    keys_all = ['W', 'b', 'W_output', 'b_output', 'W_in', 'b_in']
-
     # (b) bptt + three_factor: W_in/b_in := local rule; W/W_output := exact BPTT.
     g_b3 = grads('bptt', 'three_factor')
     g_bptt = grads('bptt', 'match')

@@ -6,24 +6,8 @@ import numpy as np
 
 import torch
 import net_helpers
-import time
 import random
-import sys
 
-def get_rules(ruleset):
-    return rules_dict[ruleset]
-
-# def get_num_ring(ruleset):
-#     '''get number of stimulus rings'''
-#     return 3 if ruleset=='oicdmc' else 2
-
-def get_num_rule(ruleset):
-    '''get number of rules'''
-    return len(rules_dict[ruleset])
-
-def get_rule_index(rule, config):
-    '''get the input index for the given rule'''
-    return rule_index_map[config['ruleset']][rule]+config['rule_start']
 
 def get_prefs(config):
     """ Perferred locations given the config, used in trial and also used for computing accuracy"""
@@ -211,7 +195,6 @@ class Trial(object):
         if isinstance(rule, int):
             self.x[on:off, :, self.config['rule_start']+rule] = strength
         else:
-            # ind_rule = get_rule_index(rule, self.config)
             ind_rule = self.config['rules'].index(rule)
             self.x[on:off, :, self.config['rule_start']+ind_rule] = strength
 
@@ -1757,7 +1740,6 @@ def convert_and_init_multitask_params(params):
     """
     task_params, train_params, net_params = params
 
-    # task_params['rules'] = get_rules(task_params['ruleset'])
     num_ring = 2 if 'oic' not in task_params['rules'] else 3
     n_rule = len(task_params['rules']) 
     task_params['n_rules'] = n_rule
@@ -1946,9 +1928,9 @@ def generate_trials_wrap(task_params,
         if verbose:
             print('Rule: {}'.format(rules[0]))
     elif type(rules) == str: # Single rule passed in as string
-        assert rule in task_params['rules']
+        assert rules in task_params['rules']
+        rule_idxs = (task_params['rules'].index(rules),)
         rules = (rules,)
-        rule_idxs = (task_params['rules'].index(rule),)
     elif type(rules) == tuple or type(rules) == list: # Many rules together
         rule_idxs = []
         for rule in rules:
@@ -1968,18 +1950,6 @@ def generate_trials_wrap(task_params,
     max_seq_len = 0
     n_batches_all = 0
 
-    def allocate_integer_to_divisions(integer, divisor):
-        quotient = integer // divisor
-        remainder = integer % divisor
-        
-        result = [quotient] * divisor        
-        if remainder > 0:
-            indices = np.random.choice(divisor, remainder, replace=False)
-            for idx in indices:
-                result[idx] += 1
-        
-        return result
-    
     # 2026-03-29: we add an additional mode "long_all" as an additional mode for post-training analysis,
     # which generates deta trail with longest (but still in reasonable range) delay, response, stimulus, and fixation
     # currently only implemented in the "random" mode for which different task period is aligned across trials 

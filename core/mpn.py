@@ -42,7 +42,6 @@ core/mpn_archive.py is left untouched as the reference implementation.
 """
 import torch
 from torch import nn
-from torch.utils.data import TensorDataset
 import torch.nn.functional as F
 
 from torch.nn.init import orthogonal_
@@ -1516,11 +1515,11 @@ class MultiPlasticNet(MultiPlasticNetBase):
 
         output, current_hidden, db = self.forward(current_input, run_mode=run_mode, verbose=verbose)
 
-        # M updated internally when this is called, M here is only used if finding fixed points (not yet implemented)
+        # M is updated internally when this is called.
         # The write uses the same (optionally RMS-normalized) presynaptic vector the
         # forward consumed; identity unless mp_input_norm is on.
         x_in, _ = self._mp_input_norm_forward(current_input, layer_idx=0)
-        M = self.mp_layer.update_M_matrix(x_in, current_hidden)
+        self.mp_layer.update_M_matrix(x_in, current_hidden)
 
         return output, db
 

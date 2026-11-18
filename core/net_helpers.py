@@ -2,11 +2,9 @@ import time # For debugging
 import copy 
 import numpy as np
 import matplotlib.pyplot as plt 
-import math 
-import seaborn as sns 
-import copy 
-import math, os, gc 
-import sys 
+import math
+import seaborn as sns
+import gc
 
 import torch
 from torch import nn
@@ -25,85 +23,6 @@ l_vals = ['solid', 'dashed', 'dotted', 'dashdot', '-', '--', '-.', ':', (0, (3, 
 markers_vals = ['.', 'o', 'v', '^', '<', '>', '1', '2', '3', '4', 's', 'p', '*', 'h', 'H', '+', 'x', 'D', 'd', '|', '_']
 
 GLOBAL_PRINT_FREQUENCY = 1
-
-def _to_cpu(x):
-    # torch tensor -> cpu tensor; numpy stays; python stays
-    if isinstance(x, torch.Tensor):
-        return x.detach().cpu()
-    return x
-
-def save_checkpoint(path, net, params, hyp_dict, seed,
-                    test_bundle=None,
-                    training_bundle=None):
-    """
-    Save a compact checkpoint suitable for reloading the trained net and running downstream analyses.
-
-    Args:
-      path: str, e.g. "./ckpts/exp1.pt"
-      net: trained model
-      params: tuple (task_params, train_params, net_params)
-      hyp_dict: dict
-      seed: int
-      test_bundle: dict of tensors/arrays needed for analysis
-      training_bundle: optional dict of large training traces (counter_lst, db_lst, etc.)
-    """
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-
-    ckpt = {
-        "seed": seed,
-        "hyp_dict": hyp_dict,
-        "params": params,
-        "net_state_dict": net.state_dict(),
-        "net_class": hyp_dict.get("chosen_network", None),  # e.g. "dmpn"/"gru"/"vanilla"
-    }
-
-    if hasattr(net, "hist"):
-        ckpt["net_hist"] = net.hist  # learning curves; usually small
-
-    if test_bundle is not None:
-        # move torch tensors to CPU to make reload portable
-        ckpt["test_bundle"] = {k: _to_cpu(v) for k, v in test_bundle.items()}
-
-    if training_bundle is not None:
-        # WARNING: this can be huge if you include db_lst/netout_lst
-        ckpt["training_bundle"] = training_bundle
-
-    torch.save(ckpt, path)
-    print(f"Saved checkpoint to: {path}")
-
-
-def load_checkpoint(path, device, netFunction, rebuild_net_kwargs=None):
-    """
-    Load checkpoint and reconstruct net.
-
-    Args:
-      path: str to .pt
-      device: torch.device
-      netFunction: the class constructor you already use (e.g., mpn.DeepMultiPlasticNet / nets.GRU)
-      rebuild_net_kwargs: optional dict passed into constructor
-
-    Returns:
-      net, params, hyp_dict, test_bundle, training_bundle (may be None)
-    """
-    ckpt = torch.load(path, map_location="cpu")
-    task_params, train_params, net_params = ckpt["params"]
-    hyp_dict = ckpt["hyp_dict"]
-
-    rebuild_net_kwargs = rebuild_net_kwargs or {}
-
-    # Rebuild network exactly as train_network would
-    # Most codebases use something like: net = netFunction(task_params, net_params, train_params, **kwargs)
-    # If your constructor differs, adjust here once.
-    net = netFunction(task_params, net_params, train_params, **rebuild_net_kwargs)
-
-    net.load_state_dict(ckpt["net_state_dict"])
-    net.to(device)
-    net.eval()
-
-    test_bundle = ckpt.get("test_bundle", None)
-    training_bundle = ckpt.get("training_bundle", None)
-
-    return net, (task_params, train_params, net_params), hyp_dict, test_bundle, training_bundle
 
 
 def tail_mean_decay(lst, N, decay=0.95):
@@ -498,70 +417,6 @@ def train_network(params, net=None, device=torch.device('cuda'), verbose=False,
     return net, (train_data, valid_data), (counter_lst, netout_lst, db_lst, Winput_lst, Winputbias_lst, \
                 Woutput_lst, Wall_lst, marker_lst, loss_lst, acc_lst), dataset_idx_early_stop
 
-def net_eta_lambda_analysis(net, net_params, hyp_dict=None, verbose=False):
-    """
-    """
-    layer_index = 0 # 1 layer MPN 
-    if net_params["input_layer_add"]:
-        layer_index += 1 # 2 layer MPN
-
-    # only make sense for dmpn for eta and lambda information extraction
-    if net_params['net_type'] in ("dmpn",):
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
-
-        for mpl_idx, mp_layer in enumerate(net.mp_layers):
-            if net.mp_layers[mpl_idx].eta_type in ('pre_vector', 'post_vector', 'matrix',):
-                full_eta = np.concatenate([
-                    eta.flatten()[np.newaxis, :] for eta in net.hist['eta{}'.format(mpl_idx+layer_index)]
-                ], axis=0)
-            else:
-                full_eta = net.hist['eta{}'.format(mpl_idx+layer_index)]
-
-            if net.mp_layers[mpl_idx].lam_type in ('pre_vector', 'post_vector', 'matrix',):
-                full_lam = np.concatenate([
-                    lam.flatten()[np.newaxis, :] for lam in net.hist['lam{}'.format(mpl_idx+layer_index)]
-                ], axis=0)
-            else:
-                full_lam = net.hist['lam{}'.format(mpl_idx+layer_index)]
-            ax1.plot(net.hist['iters_monitor'], full_eta, color=c_vals[mpl_idx], label='MPL{}'.format(mpl_idx+layer_index))
-            ax2.plot(net.hist['iters_monitor'], full_lam, color=c_vals[mpl_idx], label='MPL{}'.format(mpl_idx+layer_index))
-
-        ax1.axhline(0.0, color='k', linestyle='dashed')
-
-        ax1.set_ylabel('Eta')
-        ax2.set_ylabel('Lambda')
-
-        if net.mp_layers[mpl_idx].eta_type not in ('pre_vector', 'post_vector', 'matrix',):
-            ax1.legend()
-            ax2.legend()
-
-        if verbose:
-            fig.savefig(f"./results/eta_lambda_{hyp_dict['ruleset']}_{hyp_dict['chosen_network']}_{hyp_dict['addon_name']}.png")
-
-        # only for deep mpn with multiple layers
-        n_mplayers = len(net.mp_layers)
-        if n_mplayers > 1:
-            fig, axs = plt.subplots(1, n_mplayers, figsize=(4+4*n_mplayers, 4))
-            n_bins = 50
-
-            for mpl_idx, (mp_layer, ax) in enumerate(zip(net.mp_layers, axs)):
-
-                init_eta = net.hist['eta{}'.format(mpl_idx+layer_index)][0].flatten()
-                final_eta = net.hist['eta{}'.format(mpl_idx+layer_index)][-1].flatten()
-
-                max_eta = np.max((np.max(np.abs(init_eta)), np.max(np.abs(final_eta))))
-
-                bins = np.linspace(-max_eta, max_eta, n_bins+1)[1:]
-
-                ax.hist(init_eta, bins=bins, color=c_vals_l[mpl_idx], alpha=0.3, label='init')
-                ax.hist(final_eta, bins=bins, color=c_vals[mpl_idx], alpha=0.3, label='final')
-
-                ax.set_ylabel('Count')
-                ax.set_xlabel('Eta value')
-                ax.legend()
-
-            if verbose:
-                fig.savefig(f"./results/eta_distribution_{hyp_dict['ruleset']}_{hyp_dict['chosen_network']}_{hyp_dict['addon_name']}.png")
 
 def rand_weight_init(n_inputs, n_outputs=None, init_type='gaussian', cell_types=None,
                      ei_balance_val=None, sparsity=None, weight_norm=None, self_couplings=True):
@@ -683,30 +538,6 @@ def rand_weight_init(n_inputs, n_outputs=None, init_type='gaussian', cell_types=
 
     return rand_weights
 
-def append_to_average(avg_raw, raw, n_window=1):
-    """ Rolling average """
-    if len(raw) < n_window:
-        avg_raw.append(np.mean(raw))
-    else:
-        avg_raw.append(np.mean(raw[-n_window:]))
-    return avg_raw
-
-def accumulate_decay(decay_raw, raw, n_window=10, base_val=0.0):
-    """ Average by accumulation and decay """
-    gamma = 1. - 1./n_window
-
-    if len(decay_raw) == 0: # Use base_val for previous value
-        if np.isnan(raw[-1]): # Skips nans and just set to base value
-            decay_raw.append(base_val)
-        else:
-            decay_raw.append(gamma*base_val + 1/n_window * raw[-1])
-    else:
-        if np.isnan(raw[-1]): # Skips nans and just holds decay_raw constant
-            decay_raw.append(decay_raw[-1])
-        else:
-            decay_raw.append(gamma*decay_raw[-1] + 1/n_window * raw[-1])
-        # print('Raw {} new avg {}'.format(decay_raw[-1], decay_raw[-1]))
-    return decay_raw
 
 def relu_fn(x):
     return torch.maximum(x, torch.zeros_like(x))
@@ -839,18 +670,6 @@ def shuffle_dataset(inputs, labels, masks=None):
 
     return inputs, labels, masks
 
-def round_to_values(array, round_vals):
-    """ Round all elements of an array to closest value in round_vals, numpy version """
-
-    assert len(round_vals.shape) == 1
-
-    dims_unsqueeze = [i for i in range(len(array.shape))] # How many times to unsqueeze round_vals based on array shape
-    dists = np.abs(
-        np.expand_dims(array, axis=-1) - # shape: (array.shape*, 1)
-        np.expand_dims(round_vals, axis=dims_unsqueeze) 
-    )
-
-    return round_vals[np.argmin(dists, axis=-1)]
 
 def round_to_values_torch(array, round_vals):
     """ Round all elements of an array to closest value in round_vals, pytorch version """
@@ -879,21 +698,6 @@ def one_hot_argidx(x: torch.Tensor) -> torch.Tensor:
     # argmax gives the index of the sole “1” along D
     return torch.argmax(x, dim=-1)
 
-def unique_nonzero_value(x: torch.Tensor):
-    """
-    """
-    # allow (N,1) input
-    if x.ndim == 2 and x.shape[1] == 1:
-        x = x.squeeze(1)
-
-    u = torch.unique(x)
-
-    # must be exactly two distinct values, one of them 0
-    if u.numel() != 2 or not (u == 0).any():
-        return 0 
-        
-    # return the non-zero entry
-    return u[u != 0].item()
 
 def mean_by_group(A: torch.Tensor, B: torch.Tensor) -> Dict[int, float]:
     """
@@ -1671,8 +1475,6 @@ class BaseNetwork(BaseNetworkFunctions):
                 
             return result_acc, acc_per_task
 
-    def compute_gradients(self):
-        raise NotImplementedError('Should be implemented in children.')
 
     @torch.no_grad()
     def param_clamp(self):
@@ -1683,28 +1485,6 @@ class BaseNetwork(BaseNetworkFunctions):
                 bounds = getattr(self, p_name + '_bounds')
                 p.data.clamp_(bounds[0], bounds[1])
 
-    @torch.no_grad()
-    def build_param_zero_bounds(self):
-    
-        MAX_VAL = 1e8 # Magnitude bound for parameters
-
-        if self.verbose: print('Maintaining parameter sparsity:')
-        for p_name, p in self.named_parameters():
-
-            if not p.requires_grad:
-                continue
-
-            if self.verbose:
-                print(' {} nonzero: {:.3f}'.format(
-                    p_name, torch.mean(torch.where(p == 0., torch.zeros_like(p), torch.ones_like(p)))
-                ))
-
-            upper = torch.where(p == 0., torch.zeros_like(p), MAX_VAL * torch.ones_like(p))
-            lower = -1 * torch.clone(upper)
-
-            self.register_buffer(f'{p_name}_bounds', torch.cat((
-                lower.unsqueeze(0), upper.unsqueeze(0)
-            ), dim=0))
 
     @torch.no_grad()
     def _monitor_init(self, train_params, train_data, train_trails, valid_batch=None, valid_trails=None):

@@ -29,14 +29,12 @@ What is checked (float64, CPU, tight tolerances):
 import _bootstrap  # noqa: F401
 
 import contextlib
-import copy
 import io
 import json
 import os
 import tempfile
 import unittest
 
-import numpy as np
 import torch
 
 import mpn
