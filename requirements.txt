@@ -1,0 +1,10 @@
+# Packages the code imports. The versions are the ones the test suite was last
+# verified with (Python 3.9); newer releases are expected to work.
+# torch must support your GPU: a Tesla V100 (compute capability 7.0) is not
+# supported by recent CUDA 13 builds, see docs/training_and_outputs.md.
+torch>=2.5.1
+numpy>=2.0.1
+scipy>=1.13.1
+matplotlib>=3.9.4
+# test_analysis_scripts.py and test_gradient_diagnostics.py open the saved figures
+pillow

@@ -1,7 +1,5 @@
 """Collections of tasks."""
 
-from __future__ import division
-import six
 import numpy as np
 
 import torch
@@ -1705,7 +1703,7 @@ def generate_trials(rule, hp, mode, noise_on=True,
         # Add no rule
         return trial
 
-    if isinstance(rule, six.string_types):
+    if isinstance(rule, str):
         # rule is not iterable
         # Expand to list
         if 'rule_strength' in kwargs:

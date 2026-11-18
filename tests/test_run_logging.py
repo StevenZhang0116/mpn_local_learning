@@ -127,6 +127,21 @@ class TestRunLogging(unittest.TestCase):
             self.assertIn("experiment stdout", stdout.getvalue())
             self.assertIn("experiment stderr", stderr.getvalue())
 
+    def test_train_mpn_help_creates_no_log(self):
+        script = _bootstrap.ROOT / "scripts" / "train_mpn.py"
+        for flag in ("--help", "-h"):
+            stdout = io.StringIO()
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory).resolve()
+                with patch.object(run_logging, "__file__", str(root / "core" / "run_logging.py")), \
+                        patch.object(sys, "argv", ["train_mpn.py", flag]), \
+                        contextlib.redirect_stdout(stdout), self.assertRaises(SystemExit) as stop:
+                    runpy.run_path(str(script), run_name="__main__")
+                self.assertEqual(stop.exception.code, 0)
+                self.assertIn("usage:", stdout.getvalue())
+                self.assertNotIn("Logging stdout/stderr to:", stdout.getvalue())
+                self.assertFalse((root / "log").exists())
+
 
 if __name__ == "__main__":
     unittest.main()

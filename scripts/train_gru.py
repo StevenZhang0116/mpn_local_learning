@@ -15,7 +15,8 @@ Same lockstep protocol as the other scripts (identical init / data / valid set
 per seed), same figure + .npz output. The shared machinery lives in
 train_common.py; this file only sets the GRU config and hooks.
 
-Hyperparameters mirror train_rnn.py. A GRU has three gate blocks, so N_HIDDEN
+Hyperparameters mirror train_rnn.py (the `# one_task.py:` comments below refer to
+one_task.py of the upstream MultiTaskMPN repository). A GRU has three gate blocks, so N_HIDDEN
 defaults to 100 (about the same number of recurrent parameters as the 180-unit
 leaky RNN); pass --hidden to change it. net_type='gru'; class = gru.GRU.
 
@@ -73,7 +74,6 @@ def build_params():
     disabled so the objective is pure masked-MSE (what the traces are derived
     for). net_type='gru'; class = gru.GRU."""
     task_params = {
-        "task_type": "multitask",
         "rules": [RULESET],
         "dt": 40,
         "ruleset": RULESET,
@@ -97,19 +97,10 @@ def build_params():
         "lr": LR,
         "n_batches": BATCH,
         "batch_size": BATCH,
-        "gradient_clip": GRAD_CLIP,
         "valid_n_batch": BATCH * 3,
         "n_datasets": N_DATASETS,
         "weight_reg": "L2",
-        "activity_reg": "L2",
         "reg_lambda": 0.0,           # no regularization → objective = masked MSE
-        "scheduler": {
-            "type": "ReduceLROnPlateau",
-            "mode": "min",
-            "factor": 0.95,
-            "patience": 30,
-            "min_lr": 1e-8,
-        },
     }
 
     net_params = {

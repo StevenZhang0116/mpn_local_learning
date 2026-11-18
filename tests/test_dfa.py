@@ -201,7 +201,6 @@ class TestDFA(unittest.TestCase):
         self.assertTrue(net_params['ml_params']['modulation_bounds'])
         self.assertEqual(net_params['ml_params']['m_bounds'], (-1.0, 1.0))
         self.assertEqual(train_params['reg_lambda'], 0.0)
-        self.assertIsNone(train_params['activity_reg'])
         _, optimizer, _ = train_common.make_optim(
             make_net(), .001, weight_decay=train_params['reg_lambda'])
         self.assertTrue(all(group['weight_decay'] == 0 for group in optimizer.param_groups))
@@ -236,7 +235,6 @@ class TestDFA(unittest.TestCase):
                     task_params, train_params, net_params = original_builder()
                     train_params['valid_n_batch'] = 2
                     self.assertEqual(train_params['reg_lambda'], 1e-4)
-                    self.assertIsNone(train_params['activity_reg'])
                     self.assertEqual(net_params['ml_params']['modulation_bounds'], mode == 'hard')
                     self.assertEqual(net_params['ml_params']['m_bounds'], (-.4, .4))
                     return task_params, train_params, net_params

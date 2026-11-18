@@ -192,8 +192,8 @@ class TestPlateauKnobs(unittest.TestCase):
         with patch.multiple(train_mpn, LR_PATIENCE=200, LR_FACTOR=0.5):
             cfg = train_mpn._cfg()
             self.assertEqual((cfg.lr_patience, cfg.lr_factor), (200, 0.5))
-            self.assertEqual(train_mpn.build_params()[1]['scheduler']['patience'], 200)
-            self.assertEqual(train_mpn.build_params()[1]['scheduler']['factor'], 0.5)
+            train_params = train_mpn.build_params()[1]
+            self.assertEqual((train_params['lr_patience'], train_params['lr_factor']), (200, 0.5))
             cfg.run_id = ''
             self.assertIn('_pat200_fac0.5', train_common.param_tag(cfg))
         cfg = train_mpn._cfg(); cfg.run_id = ''

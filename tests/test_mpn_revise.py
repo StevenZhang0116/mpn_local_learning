@@ -4,7 +4,9 @@
 Verify the efficiency-optimized core/mpn.py (formerly mpn_revise.py) matches the
 reference core/mpn_archive.py in forward AND backward dynamics, within tolerance.
 Below, `mpn` names the reference and `mpn_revise` the optimized module (the
-historical names, kept as import aliases).
+historical names, kept as import aliases). Only the baseline configuration the
+archive implements is compared; features added to core/mpn.py since the refactor
+are covered by the other test files, not here.
 
 mpn_revise is an efficiency refactor. Some changes are bitwise-identical
 (loss-only helper, dropped clones), but the main speedups REORDER floating-point

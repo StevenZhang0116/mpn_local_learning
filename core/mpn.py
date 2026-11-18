@@ -7,8 +7,13 @@ same public API (bptt_gradients / local_* / sequence_gradients), producing resul
 IDENTICAL to mpn_archive.py up to floating-point round-off (some changes are
 bitwise-exact, the speedups reorder ops). Verified by tests/test_mpn_revise.py:
 float64 diffs are ~1e-16 (pure round-off → same computation), float32 well within
-1e-5, across BPTT and all local rules on both nets for shared configurations.
-Optional rflo_trace_rho adds a capped-gain RFLO approximation beyond the archive.
+1e-5, across BPTT and all local rules on both nets.
+
+That comparison covers only the BASELINE the archive implements. Everything added
+since the refactor exists only in this file and is checked against independent
+autograd oracles by the other tests instead: local rules on more than one MP layer,
+the feedback and learning-signal modes, the input modes, additive MP layers, residual
+scaling, MP-input normalization, scaled-tanh writes and the RFLO trace-gain cap.
 
 What is optimized (vs mpn_archive.py), all result-preserving:
   Forward / BPTT
@@ -38,7 +43,8 @@ What is optimized (vs mpn_archive.py), all result-preserving:
       time-major so writes are contiguous. All calc-preserving.
   Measured: local_direct ~2.0×, local_diag_rflo ~1.6×, BPTT ~1.4× vs archive (CPU).
 
-core/mpn_archive.py is left untouched as the reference implementation.
+core/mpn_archive.py is kept as the reference for that baseline. Its numerics are
+frozen; the only edit since the refactor removed its unused training-monitor hooks.
 """
 import torch
 from torch import nn

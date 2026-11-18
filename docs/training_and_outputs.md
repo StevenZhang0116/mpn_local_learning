@@ -3,6 +3,19 @@
 Details of the training entry points (`scripts/train_mpn.py`, `train_rnn.py`,
 `train_gru.py`). The quick-start commands are in the [README](../README.md).
 
+## Environment
+
+`pip install -r requirements.txt` installs what the code imports: PyTorch, NumPy,
+SciPy and Matplotlib (plus Pillow for two test files). The suite was
+last verified with Python 3.9 and PyTorch 2.5.1.
+
+The PyTorch build has to support the GPU. A Tesla V100 has compute capability 7.0,
+which recent CUDA 13 builds no longer include: with such a build
+`torch.cuda.is_available()` still returns `True`, but the first tensor moved to the
+GPU fails with `CUDA error: no kernel image is available for execution on the
+device`. `torch.cuda.get_arch_list()` shows what a build supports; it must contain
+`sm_70` for a V100.
+
 ## Tasks, models and objectives
 
 `--task` (the `RULESET`) selects the task:
@@ -110,12 +123,14 @@ run's figure, `.npz` and checkpoint folder. The file opens under a temporary tim
 renamed as soon as the run ID exists; both paths are printed at startup. The log
 directory is anchored to the project root regardless of the working directory, and
 output remains visible in the terminal. No extra flag is needed; importing
-`train_mpn` and running `train_rnn.py` do not enable this logging.
+`train_mpn` and running `train_rnn.py` do not enable this logging, and
+`train_mpn.py --help` prints the usage without creating a log file.
 
 ## Cleaning outputs
 
 `clean.py` (project root) deletes STALE OUTPUTS only: the contents of
-`checkpoints/`, `figure/`, `figure_data/`, `log/` and the `notebooks/diagnose_gradients/`,
+`checkpoints/`, `figure/`, `figure_data/`, `log/` and the
+`notebooks/compare_mpn_rnn_performance/`, `notebooks/diagnose_gradients/`,
 `notebooks/rflo_trace_gain/`, `notebooks/verify_rflo_scaling/`,
 `notebooks/visualize_trained_networks/` output folders.
 Dry run by default; `python clean.py --run` deletes, `--keep '<glob>'` spares matching

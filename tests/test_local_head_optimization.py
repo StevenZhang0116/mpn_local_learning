@@ -188,14 +188,14 @@ class TestOptimizationSurface(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             def inspect(cfg):
                 self.assertEqual((cfg.lr, cfg.head_lr_mult, cfg.lr_schedule), (.002, 3., 'constant'))
-                self.assertIsNone(cfg.build_params()[1]['scheduler'])
+                self.assertEqual(cfg.build_params()[1]['lr_schedule'], 'constant')
                 cfg.fig_dir = cfg.ckpt_dir = cfg.data_dir = directory
                 cfg.n_runs = 1
                 path = tc.save_config(cfg, str(Path(directory) / 'config.json'))
                 record = json.loads(Path(path).read_text())
                 self.assertEqual(record['head_lr_mult'], 3.)
                 self.assertEqual(record['lr_schedule'], 'constant')
-                self.assertIsNone(record['train_params']['scheduler'])
+                self.assertEqual(record['train_params']['lr_schedule'], 'constant')
                 cfg.rules_to_run = ['local_direct']
                 runs = {'local_direct': {'train': [[.1]], 'valid': [[.2]]}}
                 agg = {'local_direct': {split: {'mean': [.1], 'std': [0.]}

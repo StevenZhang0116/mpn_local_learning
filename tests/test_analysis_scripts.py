@@ -82,6 +82,7 @@ class TestAnalysisScripts(unittest.TestCase):
         task_params, train_params, net_params = tasks.make_task('delaygo').init_params(
             task_params, train_params, net_params)
         for index, rule in enumerate(self.rules):
+            np.random.seed(37)
             torch.manual_seed(37)
             with contextlib.redirect_stdout(io.StringIO()):
                 net = mpn.DeepMultiPlasticNet(net_params, verbose=False)

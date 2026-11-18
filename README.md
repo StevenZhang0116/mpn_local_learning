@@ -41,6 +41,7 @@ Readout gradients are always exact. `--mp-type mult` (default) uses
 - `tests/` — rule-correctness and integration tests; see [tests/README.md](tests/README.md).
 - `docs/` — the detailed documentation indexed below.
 - `clean.py` — deletes stale outputs (dry run by default).
+- `requirements.txt` — the packages the code imports.
 - Outputs (git-ignored): `figure/`, `figure_data/`, `checkpoints/`, `log/`.
 
 ## Usage
@@ -55,10 +56,11 @@ python train_mpn.py --net dmpn --task adding --runs 3    # deep MPN on the addin
 python train_rnn.py --task adding --runs 3               # leaky RNN on the adding problem
 python train_gru.py --task seqmnist --runs 3             # GRU: BPTT vs GRU-RFLO, same tasks/protocol
 
-cd ../tests
-python validate_local_learning.py                        # rule correctness checks
-python test_tasks.py                                     # task-adapter tests
+cd ..
+python tests/run_all.py                                  # the whole test suite
 ```
+
+Install the dependencies with `pip install -r requirements.txt`.
 
 `--task` takes a ring-task name (`delaygo`, `contextdelaydm1`, …), `seqmnist` /
 `seqmnist_pixel`, or `adding` / `adding_L<len>_m<marks>`. `--hidden` sets the MP

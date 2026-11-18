@@ -1,8 +1,5 @@
-import time # For debugging
 import numpy as np
-import matplotlib.pyplot as plt
 import math
-import seaborn as sns
 
 import torch
 from torch import nn
@@ -387,20 +384,12 @@ class BaseNetwork(BaseNetworkFunctions):
         # Time difference between discrete steps, used to set biologically-realistic parameters
         self.dt = net_params.get('dt', 40) # units of ms
 
-    def compute_acc(self, output, labels, output_mask, input_, round_type='prefs', mode="angle",  verbose=False, isvalid=False):
+    def compute_acc(self, output, labels, output_mask, input_, round_type='prefs', mode="angle", isvalid=False):
         """
         output shape: (batches, seq_len, output_size)
         labels shape: (batches, seq_len)
         output_mask shape: (batches, seq_len, output_size)
         """		
-        start_time = time.time()
-        
-        if verbose: 
-            fig, ax = plt.subplots(1,5,figsize=(10*5,4))
-            for i in range(5): 
-                sns.heatmap(output_mask[i].cpu().detach().numpy(), ax=ax[i], cbar=True)
-            fig.savefig("output_mask.png")
-            
         # batches * seq_len * output_size
         output_mask_alter = torch.full(output_mask.shape, float('nan'), device=output_mask.device) 
 
@@ -582,10 +571,6 @@ class BaseNetwork(BaseNetworkFunctions):
                 masked_labels_round = masked_labels
             else:
                 raise ValueError(f'Round type {round_type} not recognized or invalid.')
-
-            end_time = time.time() 
-            if verbose:
-                print(f"Accuracy calculation: {end_time - start_time}s")
 
             acc_per_task = None 
             if isvalid:

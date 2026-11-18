@@ -35,6 +35,7 @@ import os
 import tempfile
 import unittest
 
+import numpy as np
 import torch
 
 import mpn
@@ -55,6 +56,7 @@ def build_deep(arch, *, norm='rms', residual=False, cross=0, rule='local_exact_r
                feedback='exact_spatial', embed=True, input_mode='match',
                learning_signal='global', bounds=False, matrix=False, seed=0, eps=1e-5,
                skip_first=False):
+    np.random.seed(seed)
     torch.manual_seed(seed)
     npar = {'n_neurons': arch, 'loss_type': 'MSE', 'activation': 'tanh',
             'output_bias': True, 'output_matrix': '', 'dt': 40,
@@ -86,6 +88,7 @@ def build_deep(arch, *, norm='rms', residual=False, cross=0, rule='local_exact_r
 
 def build_single(n_in, n_hid, n_out, *, norm='rms', rule='local_exact_rowlocal', seed=0,
                  skip_first=False):
+    np.random.seed(seed)
     torch.manual_seed(seed)
     npar = {'n_neurons': [n_in, n_hid, n_out], 'loss_type': 'MSE', 'activation': 'tanh',
             'output_bias': True, 'output_matrix': '', 'dt': 40,
@@ -417,9 +420,12 @@ class TestSkipFirstLayer(unittest.TestCase):
         self.assertIsNone(norm[0][1])
         for n in range(1, len(net.mp_layers)):
             self.assertIsNotNone(norm[n][1])
+            # ||x_hat||^2 = d * m / (m + eps) with m = mean_J h[n]_J^2: it equals the
+            # fan-in d up to eps/m, which is not small for a weakly driven stream.
+            m = h[n].square().mean(-1)
             torch.testing.assert_close(norm[n][0].square().sum(-1),
-                                       torch.full((3,), 6.0, dtype=torch.float64),
-                                       rtol=0, atol=6e-4)
+                                       6.0 * m / (m + net.mp_input_norm_eps),
+                                       rtol=1e-12, atol=0)
         # The stepping forward agrees: after one step layer 0's M is eta*a0*h[0]^T
         # (raw stream) and layer 1's is eta*a1*x_hat[1]^T (normalized input).
         net.reset_state(B=3)

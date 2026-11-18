@@ -3,6 +3,7 @@ from copy import deepcopy
 import sys
 import unittest
 
+import numpy as np
 import torch
 
 import _bootstrap
@@ -33,6 +34,7 @@ class TestRFLOScaling(unittest.TestCase):
         self.assertAlmostEqual(float((u*f).sum()), -.0298)
 
     def test_diagonal_generalizes_only_when_stable(self):
+        np.random.seed(6)
         torch.manual_seed(6)
         d = torch.randn(8, 6, dtype=torch.double)
         gains = torch.tensor([.5, 1., 2., 3., 4., 6.], dtype=torch.double)
@@ -52,6 +54,7 @@ class TestRFLOScaling(unittest.TestCase):
         self.assertAlmostEqual(fit["unsupported_diagonal_fraction"], 1/6)
 
     def test_virtual_adam_matches_torch_and_fixed_positive_scaling(self):
+        np.random.seed(4)
         torch.manual_seed(4)
         grads = torch.randn(8, 7, dtype=torch.double)
         parameter = torch.nn.Parameter(torch.zeros(7, dtype=torch.double))

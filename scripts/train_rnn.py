@@ -13,7 +13,9 @@ Same lockstep protocol as train_mpn.py (identical init / data / valid set per
 seed), same figure + .npz plot-data output. The shared machinery lives in
 train_common.py; this file only sets the RNN config and hooks.
 
-Hyperparameters mirror train_mpn.py / one_task.py. output_bias=False; no
+Hyperparameters mirror train_mpn.py and one_task.py of the upstream MultiTaskMPN
+repository (the `# one_task.py:` comments below refer to that file).
+output_bias=False; no
 regularization. net_type='vanilla' selects the RNN in the param converter; the
 class used here is rnn.LeakyRNN.
 
@@ -72,7 +74,6 @@ def build_params():
     Regularization disabled so the objective is pure masked-MSE (what RFLO is
     derived for). net_type='vanilla' for the param converter; class = rnn.LeakyRNN."""
     task_params = {
-        "task_type": "multitask",
         "rules": [RULESET],
         "dt": 40,
         "ruleset": RULESET,
@@ -96,19 +97,10 @@ def build_params():
         "lr": LR,
         "n_batches": BATCH,
         "batch_size": BATCH,
-        "gradient_clip": GRAD_CLIP,
         "valid_n_batch": BATCH * 3,
         "n_datasets": N_DATASETS,
         "weight_reg": "L2",
-        "activity_reg": "L2",
         "reg_lambda": 0.0,           # no regularization → objective = masked MSE
-        "scheduler": {
-            "type": "ReduceLROnPlateau",
-            "mode": "min",
-            "factor": 0.95,
-            "patience": 30,
-            "min_lr": 1e-8,
-        },
     }
 
     net_params = {

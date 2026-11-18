@@ -744,7 +744,7 @@ def run_seed(cfg, seed, record_steps):
             n_accum = 0
 
     # Save each trained network (per rule) so it can be reloaded later. Stores
-    # state_dict + net_params (as in one_task.py) plus rule/seed metadata. Also
+    # state_dict + net_params (as in MultiTaskMPN's one_task.py) plus rule/seed metadata. Also
     # stores the (initialized) task_params/train_params so a downstream viewer can
     # draw held-out trials from the checkpoint ALONE — no need to re-run
     # build_params() with a matching config (see notebooks/visualize_trained_networks.py).

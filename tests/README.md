@@ -1,9 +1,10 @@
 # tests
 
 Test / sanity-check / validation code for `mpn_local_learning`. Each file imports
-`_bootstrap` first (a copy lives here, same as `scripts/` and `notebooks/`), which
-adds `../core` and `../scripts` to the path so `mpn`, `rnn`, `tasks`, `train_mpn`,
-etc. import cleanly. Run from this directory.
+`_bootstrap` first (a copy lives here, same as `scripts/`, `notebooks/` and `utils/`),
+which adds `../core` and `../scripts` to the path so `mpn`, `rnn`, `tasks`,
+`train_mpn`, etc. import cleanly. Run a single file from this directory, or the
+whole suite with `run_all.py` (see the end of this page).
 
 | File | What it checks |
 |---|---|
@@ -28,15 +29,24 @@ etc. import cleanly. Run from this directory.
 | `test_local_readouts.py` | Local readout heads (`learning_signal` = `local_readout` / `mixed`): head gradients vs independent autograd (MSE + CE), exact row-local gradients per layer against an isolated-layer oracle under each head's own loss, locality (one head perturbs one module), single-layer and `global` limiting cases (byte-identical), `mixed` linearity in alpha, private head RNG (paired init/data), bptt ignoring the heads, model/CLI guards, checkpoint round-trip, and the runner's separate clipping / head logging / metadata. |
 | `test_dfa.py` | Layerwise/direct feedback alignment against independent autograd oracles, fixed and serialized feedback matrices, explicit vs fused trace paths, modulation modes (none/hard/scaled-tanh) and clamp-derivative endpoints, frozen plastic states, L2 regularization against an explicit gradient, and the `--dfa` preset with its conflict checks. |
 | `test_residual_correction.py` | Residual stacks with `--cross-layer-steps 1`: two-step MP gradients against a full-sequence autograd oracle (bounded, frozen and scaled-tanh writes), no correction when writes are disabled, and the CLI's residual setting at every depth. |
-| `test_run_logging.py` | `core/run_logging.py`: stdout/stderr mirroring and flushing, the project-relative default path, renaming the active log to the run ID, stream restoration on exceptions, and capture of a `train_mpn` CLI run. |
-| `test_mpn_revise.py` | The optimized `core/mpn.py` against the reference `core/mpn_archive.py`: outputs, loss and every gradient for BPTT and the three local rules on `dmpn` and `mpn1` (float64 and float32), masked updates, `return_outputs=False`, scratch-buffer reuse, pixel-MNIST alignment and a timing benchmark. Requires CUDA; run as a script. |
-| `validate_local_learning.py` | Correctness of the local-learning rules vs BPTT (Tiers 1-8 + a real-task integration check). float64, tight tolerances. |
+| `test_run_logging.py` | `core/run_logging.py`: stdout/stderr mirroring and flushing, the project-relative default path, renaming the active log to the run ID, stream restoration on exceptions, capture of a `train_mpn` CLI run, and no log file for `--help`. |
+| `test_mpn_revise.py` | The optimized `core/mpn.py` against the reference `core/mpn_archive.py`, for the baseline configuration the archive implements (features added since are covered by the other files): outputs, loss and every gradient for BPTT and the three local rules on `dmpn` and `mpn1` (float64 and float32), masked updates, `return_outputs=False`, scratch-buffer reuse, pixel-MNIST alignment and a timing benchmark. Requires CUDA; run as a script. |
+| `validate_local_learning.py` | Correctness of the local-learning rules vs BPTT, as numbered tiers (1-11 and 13-17; there is no tier 12): exact row-local vs BPTT, diagonal RFLO limits and its zeroed reference, direct rule, real-task integration, deep input embedding, RNN RFLO, pre-only Hebbian writes, custom and cross-entropy losses, feedback modes, input modes, input normalization, partially frozen embedding, residual stacks and cross-layer steps. float64, tight tolerances. |
 | `test_tasks.py` | The task adapters in `scripts/tasks.py`: seq-MNIST data loading / batching / masking / metric / determinism, the registry, and an end-to-end "loss decreases" integration check for both MPN and RNN. |
 
+Run everything with one command, from the repository root:
+
 ```bash
-cd tests
-python validate_local_learning.py   # rule correctness (all tiers)
-python test_tasks.py                 # task adapters + integration
+python tests/run_all.py            # one verdict line per file; non-zero exit on any failure
+python tests/run_all.py -k norm    # only the files whose name contains "norm"
 ```
 
-Both print per-check `[PASS]/[FAIL]` lines and exit non-zero if anything fails.
+`run_all.py` starts one subprocess per file, because the suite mixes two styles:
+most files are `unittest` modules (`python -m unittest <name>` from this directory),
+while `validate_local_learning.py`, `test_tasks.py` and `test_mpn_revise.py` are
+scripts that print per-check `[PASS]/[FAIL]` lines and exit non-zero on a failure.
+`test_mpn_revise.py` needs a CUDA GPU and is skipped when there is none. Network
+weights are drawn from numpy's global RNG, so every builder in these files seeds
+numpy as well as torch. Run the suite on a compute node, not on a login node; it
+takes about fifteen minutes, most of it in `test_analysis_scripts.py` and the GPU
+comparison.

@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -21,6 +22,7 @@ import train_mpn
 def make_net(embed=3, widths=(3, 2), write_mode='linear', kind='hebb_assoc',
              residual=False, rule='local_diag_rflo', input_mode='diag_mtrace',
              residual_scale=1.0):
+    np.random.seed(13)
     torch.manual_seed(13)
     cfg = dict(net_type='dmpn', n_neurons=[2, *widths, 2], dt=1,
                activation='tanh', output_matrix='', output_bias=True,
@@ -45,6 +47,7 @@ def make_net(embed=3, widths=(3, 2), write_mode='linear', kind='hebb_assoc',
 
 
 def data():
+    np.random.seed(29)
     torch.manual_seed(29)
     inputs = torch.randn(2, 5, 2, dtype=torch.double) * .8
     labels = torch.randn(2, 5, 2, dtype=torch.double) * .4

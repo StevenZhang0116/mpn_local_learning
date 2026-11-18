@@ -5,9 +5,10 @@ Compare BPTT vs local learning on an MPN, over N runs.
 
 Network is selectable with --net (or the NET_TYPE global):
   'dmpn' (default) — DeepMultiPlasticNet: raw input -> trainable input embedding
-      (W_initial_linear, act) -> one MP layer (plastic W, M) -> readout. Directly
-      comparable to the RNN in train_rnn.py (input -> hidden -> output), with the
-      plastic M playing the role the RNN's recurrence plays.
+      (W_initial_linear, act) -> one or more MP layers (plastic W, M; one per
+      --hidden width) -> readout. With a single MP layer it is directly comparable
+      to the RNN in train_rnn.py (input -> hidden -> output), with the plastic M
+      playing the role the RNN's recurrence plays.
   'mpn1' — MultiPlasticNet: single MP layer -> readout (no input embedding).
 
 For each of N_RUNS seeds we train the RULES_TO_RUN networks in lockstep:
@@ -29,8 +30,9 @@ step — each rule mean ± std across the N runs, plus a .npz of the plotted arr
 (replot_from_npz regenerates the figure without retraining). Accuracy is the
 library's angle accuracy (train isvalid=False, valid isvalid=True).
 
-Hyperparameters align with one_task.py (hidden=200, lr=1e-3, batch=128, clip=10,
-Adam, ReduceLROnPlateau, tanh). Modulation bounds default to [-1, 1]; L2 weight
+Default hyperparameters (hidden=200, lr=1e-3, batch=128, clip=10, Adam,
+ReduceLROnPlateau, tanh) follow one_task.py of the upstream MultiTaskMPN repository;
+that file is not part of this one, and the `# one_task.py:` comments below refer to it. Modulation bounds default to [-1, 1]; L2 weight
 regularization is disabled by default. Logged losses remain task losses.
 Shared machinery lives in train_common.py.
 
@@ -86,6 +88,7 @@ keeps invocations distinct even within the same second. Architecture is also in
 figure titles and plot-data metadata.
 """
 import argparse
+import sys
 from datetime import datetime
 import json
 import uuid
@@ -349,7 +352,6 @@ def build_params():
     or 'mpn1' (single MP layer, no embedding). N_HIDDEN may be a single width (one
     MP layer) or a list of widths (a deep MP stack: in→h1→h2→...→out)."""
     task_params = {
-        "task_type": "multitask",
         "rules": [RULESET],
         "dt": 40,
         "ruleset": RULESET,
@@ -377,19 +379,10 @@ def build_params():
         "lr_factor": LR_FACTOR,
         "n_batches": BATCH,
         "batch_size": BATCH,
-        "gradient_clip": GRAD_CLIP,
         "valid_n_batch": BATCH * 3,
         "n_datasets": N_DATASETS,
         "weight_reg": "L2",
-        "activity_reg": None,
         "reg_lambda": REG_LAMBDA,
-        "scheduler": {               # one_task.py: ReduceLROnPlateau
-            "type": "ReduceLROnPlateau",
-            "mode": "min",
-            "factor": LR_FACTOR,
-            "patience": LR_PATIENCE,
-            "min_lr": 1e-8,
-        } if LR_SCHEDULE == "plateau" else None,
     }
 
     widths = _hidden_widths()            # one entry per MP layer
@@ -1054,5 +1047,8 @@ def main():
 
 
 if __name__ == "__main__":
-    with tee_output("train_mpn"):
-        main()
+    if any(arg in ("-h", "--help") for arg in sys.argv[1:]):
+        main()                      # usage only: nothing worth a log file
+    else:
+        with tee_output("train_mpn"):
+            main()

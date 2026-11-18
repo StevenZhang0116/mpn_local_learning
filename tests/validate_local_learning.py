@@ -31,6 +31,7 @@ Tiers (see the plan in the extension description):
 Runs in float64 for a tight tolerance.
 Run from this directory (mpn_local_learning/tests):  python validate_local_learning.py
 """
+import numpy as np
 import torch
 
 import _bootstrap  # prepends ../core + ../scripts to sys.path; exposes ROOT
@@ -40,6 +41,7 @@ import mpn
 def build_net(n_input, n_hidden, n_output, activation, layer_bias, output_bias,
               eta_type, lam_type, learning_rule='local_exact_rowlocal',
               feedback_mode='exact_spatial', m_update_type='hebb_assoc', seed=0):
+    np.random.seed(seed)
     torch.manual_seed(seed)
     net_params = {
         'n_neurons': [n_input, n_hidden, n_output],
@@ -383,6 +385,7 @@ def tier6_deep_input_embedding():
     print("── Tier 6: deep-net input embedding (direct 3-factor) ──────────────")
 
     def build(seed, input_layer, trainable, eta):
+        np.random.seed(seed)
         torch.manual_seed(seed)
         npar = {
             'n_neurons': [6, 12, 3], 'loss_type': 'MSE', 'activation': 'tanh',
@@ -401,6 +404,7 @@ def tier6_deep_input_embedding():
         return net
 
     def data(B=4, T=10, n_in=6, n_out=3):
+        np.random.seed(0)
         torch.manual_seed(0)
         return (torch.randn(B, T, n_in), torch.randn(B, T, n_out), torch.rand(B, T, n_out))
 
@@ -441,6 +445,7 @@ def tier7_rnn_rflo():
     import rnn
 
     def build(seed, zero_wrec=False):
+        np.random.seed(seed)
         torch.manual_seed(seed)
         npar = {'n_neurons': [6, 12, 3], 'loss_type': 'MSE', 'activation': 'tanh',
                 'output_bias': True, 'hidden_bias': True, 'dt': 40, 'leaky': True,
@@ -453,6 +458,7 @@ def tier7_rnn_rflo():
         return net
 
     def data(B=4, T=10, n_in=6, n_out=3):
+        np.random.seed(0)
         torch.manual_seed(0)
         return (torch.randn(B, T, n_in), torch.randn(B, T, n_out), torch.rand(B, T, n_out))
 
@@ -525,6 +531,7 @@ def tier8_hebb_pre():
                           'm_activation': 'linear', 'modulation_bounds': False,
                           'eta_type': 'scalar', 'eta_train': False, 'lam_type': 'scalar',
                           'lam_train': False, 'm_time_scale': 400, 'W_freeze': False}}
+    np.random.seed(3)
     torch.manual_seed(3)
     net = mpn.DeepMultiPlasticNet(npar, verbose=False).double()
     inp, lab, msk, _ = make_data(6, 12, 5, 3)
@@ -573,6 +580,7 @@ def tier9_custom_loss():
                               'm_activation': 'linear', 'modulation_bounds': False,
                               'eta_type': 'scalar', 'eta_train': False, 'lam_type': 'scalar',
                               'lam_train': False, 'm_time_scale': 400, 'W_freeze': False}}
+        np.random.seed(seed)
         torch.manual_seed(seed)
         net = mpn.DeepMultiPlasticNet(npar, verbose=False).double()
         with torch.no_grad():
@@ -691,6 +699,7 @@ def tier10_cross_entropy():
     print(f"  [{'PASS' if ok_c else 'FAIL'}] eta=0 CE exact == BPTT       {fmt(d_c, keys)}")
 
     # (d) deep net, T=1: exact-local (incl. W_in) == BPTT under CE.
+    np.random.seed(4)
     torch.manual_seed(4)
     npar = {'n_neurons': [5, 7, 3], 'loss_type': 'MSE', 'activation': 'tanh',
             'output_bias': True, 'output_matrix': '', 'dt': 40,
@@ -743,6 +752,7 @@ def tier11_feedback_modes():
     allok = True
 
     def build(nn, fb, seed=0, m_update='hebb_assoc', embed=False):
+        np.random.seed(seed)
         torch.manual_seed(seed)
         npar = {'n_neurons': nn, 'loss_type': 'MSE', 'activation': 'tanh',
                 'output_bias': True, 'output_matrix': '', 'dt': 40,
@@ -1261,6 +1271,7 @@ def tier17_cross_layer_steps():
     allok = True
 
     def build(arch, cross, matrix_eta=False, residual=False, seed=3, etas=None):
+        np.random.seed(seed)
         torch.manual_seed(seed)
         npar = {'n_neurons': arch, 'loss_type': 'MSE', 'activation': 'tanh',
                 'output_bias': True, 'output_matrix': '', 'dt': 40,

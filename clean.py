@@ -7,6 +7,7 @@ Targets (the contents of each directory; the directories themselves are kept):
     figure/                                training figures
     figure_data/                           the .npz behind each figure
     log/                                   console logs (log/<run-id>.log)
+    notebooks/compare_mpn_rnn_performance/ analysis outputs
     notebooks/diagnose_gradients/          analysis outputs
     notebooks/rflo_trace_gain/             analysis outputs
     notebooks/verify_rflo_scaling/         analysis outputs
@@ -42,6 +43,7 @@ TARGET_DIRS = {
     "figure": "figure",
     "figure_data": "figure_data",
     "log": "log",
+    "compare_mpn_rnn_performance": "notebooks/compare_mpn_rnn_performance",
     "diagnose_gradients": "notebooks/diagnose_gradients",
     "rflo_trace_gain": "notebooks/rflo_trace_gain",
     "verify_rflo_scaling": "notebooks/verify_rflo_scaling",

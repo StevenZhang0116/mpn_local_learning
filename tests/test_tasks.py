@@ -47,7 +47,7 @@ def _mnist_available(t):
 
 
 # ─── 1-6: SeqMNISTTask unit checks ───────────────────────────────────────────
-def test_seqmnist_task(mode, T_expected, feat_expected):
+def check_seqmnist_task(mode, T_expected, feat_expected):
     print(f"── SeqMNISTTask(mode='{mode}') ──")
     t = tasks.SeqMNISTTask(mode=mode)
     if not _mnist_available(t):
@@ -255,8 +255,8 @@ def test_integration_adding():
 
 if __name__ == "__main__":
     print("=" * 68)
-    test_seqmnist_task("row", 28, 28)
-    test_seqmnist_task("pixel", 784, 1)
+    check_seqmnist_task("row", 28, 28)
+    check_seqmnist_task("pixel", 784, 1)
     test_adding_task()
     test_registry()
     test_integration_seqmnist()
