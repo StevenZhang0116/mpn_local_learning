@@ -14,7 +14,7 @@ from net_helpers import rand_weight_init, get_activation_function
 
 
 def masked_mse_loss_and_output_grad(output, labels, mask):
-    """Masked MSE identical to net_helpers.compute_loss (float 'cost' mask, mean
+    """Masked MSE (float 'cost' mask, mean
     reduction over all B*T*n_out elements) plus its analytic output gradient.
 
     output, labels, mask: (B, T, n_out); mask is a float cost mask.
@@ -790,35 +790,6 @@ class MultiPlasticNetBase(BaseNetwork):
         for mp_layer in self.mp_layers:
             mp_layer.param_clamp()
 
-    @torch.no_grad()
-    def _monitor_init(self, train_params, train_data, train_trails=None, valid_batch=None, valid_trails=None):
-
-        # Additional quantities to track during training, note initializes these first so that _monitor call
-        # inside super()._monitor_init can append additional quantities.
-        if self.hist is None:
-            self.hist = {
-                'iter': 0,
-            }
-            for mpl_idx, mp_layer in enumerate(self.mp_layers):
-                self.hist['eta{}'.format(mp_layer.mp_layer_name)] = []
-                self.hist['lam{}'.format(mp_layer.mp_layer_name)] = []
-
-        super()._monitor_init(train_params, train_data, train_trails=train_trails, valid_batch=valid_batch, valid_trails=valid_trails)
-
-    @torch.no_grad()
-    def _monitor(self, train_batch, train_go_info_batch, valid_go_info_batch, train_type='supervised', output=None, loss=None, loss_components=None,
-                 acc=None, valid_batch=None, nowiter=None):
-
-        super()._monitor(train_batch, train_go_info_batch, valid_go_info_batch, output=output, loss=loss, loss_components=loss_components,
-                         valid_batch=valid_batch, nowiter=nowiter)
-
-        for mpl_idx, mp_layer in enumerate(self.mp_layers):
-            self.hist['eta{}'.format(mp_layer.mp_layer_name)].append(
-                mp_layer.eta.detach().cpu().numpy()
-            )
-            self.hist['lam{}'.format(mp_layer.mp_layer_name)].append(
-                mp_layer.lam.detach().cpu().numpy()
-            )
 
 class MultiPlasticNet(MultiPlasticNetBase):
     """

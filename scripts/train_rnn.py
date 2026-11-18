@@ -90,8 +90,6 @@ def build_params():
         "long_stimulus": "normal",
         "long_delay": "normal",
         "long_response": "normal",
-        "adjust_task_prop": True,
-        "adjust_task_decay": 0.9,
     }
 
     train_params = {
@@ -101,9 +99,6 @@ def build_params():
         "gradient_clip": GRAD_CLIP,
         "valid_n_batch": BATCH * 3,
         "n_datasets": N_DATASETS,
-        "valid_check": None,
-        "n_epochs_per_set": 1,
-        "task_mask": None,
         "weight_reg": "L2",
         "activity_reg": "L2",
         "reg_lambda": 0.0,           # no regularization → objective = masked MSE
@@ -124,8 +119,6 @@ def build_params():
         "loss_type": "MSE",
         "activation": "tanh",
         "cuda": False,
-        "monitor_freq": train_params["n_epochs_per_set"],
-        "monitor_valid_out": False,
         "output_matrix": "",
         "acc_measure": "angle",
         "leaky": True,

@@ -1,26 +1,6 @@
 import numpy as np
 
 
-def is_power_of_n_or_zero(x: int, n: int) -> bool:
-    """
-    Returns True if x is 0 or an exact power of n (n^0, n^1, n^2, ...),
-    with n >= 2.
-    """
-    if n < 2:
-        raise ValueError("n must be >= 2")
-
-    if x == 0:
-        return True
-
-    if x < 0:
-        return False
-
-    while x % n == 0:
-        x //= n
-
-    return x == 1
-
-
 def find_zero_chunks(array):
     """
     Find consecutive rows of all zeros in an N*3 array.

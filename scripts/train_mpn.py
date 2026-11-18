@@ -367,8 +367,6 @@ def build_params():
         "long_stimulus": "normal",
         "long_delay": "normal",
         "long_response": "normal",
-        "adjust_task_prop": True,
-        "adjust_task_decay": 0.9,
     }
 
     train_params = {
@@ -382,9 +380,6 @@ def build_params():
         "gradient_clip": GRAD_CLIP,
         "valid_n_batch": BATCH * 3,
         "n_datasets": N_DATASETS,
-        "valid_check": None,
-        "n_epochs_per_set": 1,
-        "task_mask": None,
         "weight_reg": "L2",
         "activity_reg": None,
         "reg_lambda": REG_LAMBDA,
@@ -424,8 +419,6 @@ def build_params():
         "loss_type": "MSE",
         "activation": "tanh",
         "cuda": False,
-        "monitor_freq": train_params["n_epochs_per_set"],
-        "monitor_valid_out": False,
         "output_matrix": "",
         "acc_measure": "angle",
         "learning_rule": "bptt",         # overwritten per rule below
@@ -502,7 +495,7 @@ def forward_outputs(net, inputs):
     for evaluating the held-out validation set. Works for both net types:
     DeepMultiPlasticNet.network_step runs the full forward (embedding + MP layer)
     and returns 3 values; MultiPlasticNet's returns 2, so drive its mp_layer
-    directly (the library's iterate_sequence_batch can't unpack the 2-tuple)."""
+    directly."""
     B, T, _ = inputs.shape
     # Apply the SAME fixed input standardization the gradient paths use (identity
     # unless the net has input_normalize on), so held-out eval matches training.
