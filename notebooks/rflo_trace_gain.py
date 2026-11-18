@@ -22,7 +22,7 @@ gradient cosine with BPTT. Outputs: <output-dir>/<tag>.png, <tag>_summary.json,
 Whether the cap is needed depends on the loop gain lam + k*W: at the defaults
 (eta=1, lam=0.99) the uncapped A diverges; with a small eta (e.g. 0.003 at lam=0.99),
 with or without --mp-input-norm rms, all three variants stay bounded and aligned
-(README, "MP-input RMS normalization"). --eta / --lam / --mp-input-norm /
+(docs/mp_input_norm.md, "Measurements"). --eta / --lam / --mp-input-norm /
 --mp-input-norm-skip-first take the same values as train_mpn.py.
 
 Run from the project root, e.g.

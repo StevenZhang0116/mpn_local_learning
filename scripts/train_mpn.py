@@ -181,7 +181,7 @@ INPUT_NORM_SAMPLE = 2048      # #trials sampled to estimate the fixed input stat
 # input magnitude, i.e. the trace-stability condition on --eta becomes scale-free
 # (the same eta means the same loop gain in every layer). It does NOT lower the
 # gain by itself: on contextdelaydm1 a small --eta alone bounds the traces just as
-# well (README table). Local rules carry their learning signals through the norm's
+# well (docs/mp_input_norm.md, "Measurements"). Local rules carry their learning signals through the norm's
 # transpose Jacobian (see mpn.DeepMultiPlasticNet).
 # Incompatible with --input-mode diag_mtrace/paired unless layer 0 is skipped (below).
 # 'none' (default) is the previous computation byte for byte. --mp-input-norm /

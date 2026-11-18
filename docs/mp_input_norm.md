@@ -5,7 +5,11 @@ presynaptic vector that every MP layer consumes (layers `1..L-1` only with
 `mp_input_norm_skip_first`, see below), at every time step. It is
 parameter-free and stateless, off by default (`'none'`), and recorded in checkpoints
 and `config.json`. `mp_input_norm_eps` (CLI `--mp-input-norm-eps`, default `1e-5`)
-is the constant inside the square root.
+is the constant inside the square root. There is no learnable gain and no buffer,
+so checkpoints and `state_dict`s load across the two settings and `none` reproduces
+the previous computation byte for byte. The setting appears in the run metadata and
+the console/figure notes and is restored on reload. It is independent of
+`--input-normalize`, which standardizes the raw input once with fixed statistics.
 
 ## Definition and placement
 
@@ -67,7 +71,7 @@ RMS norm pins at the fan-in, so the same `eta` is far less stable there (at
 `mult` versus 5-6% for `add`); with `add`, scale `eta` by `1/d`, or normalize to
 unit L2 norm. Measured on `contextdelaydm1` (`--hidden 64 64 64`, mult), `eta ≈
 0.3*(1-lam)` keeps all three layers' traces bounded without `--rflo-trace-rho`;
-see the README table; a no-norm control at the same `eta` is bounded and aligned
+see the measurements below; a no-norm control at the same `eta` is bounded and aligned
 as well, so on that task the norm contributes scale invariance rather than a lower
 gain. The row sum still depends on the weights, so it is a
 trajectory-dependent condition, not a fixed hyperparameter range.
@@ -76,6 +80,37 @@ Normalization does not remove the trade-off between plasticity strength and
 stability — the modulation's contribution to a row's preactivation,
 `sum_J W_iJ M_iJ x_J ≈ (eta/(1-lam)) a_i sum_J W_iJ x_J^2`, is governed by the
 same loop gain — it makes that gain uniform across layers, rows and time.
+
+## Measurements
+
+On `contextdelaydm1` with `--hidden 64 64 64`
+(`notebooks/rflo_trace_gain.py --mp-input-norm rms --eta ETA --lam 0.99`, batch 8):
+
+| setting | row gain > 1 (per step, layers 1–3) | diagonal gain > 1 | max trace at the end | cos vs BPTT (exact / diag) |
+|---|---|---|---|---|
+| default `eta=1, lam=0.99`, no norm | 47–52 % | 10–17 % | `A` up to 1.6e5 | −0.5…1.0 / 0.03–0.06 |
+| **control:** `eta=0.003, lam=0.99`, no norm (same seed/batch) | 0 % | 0 % | 0.06–0.12 | 1.00 / 1.00 |
+| `rms, eta=0.01` (`eta/(1-lam)=1`) | 7–10 % | 0 % | 2–10 | 0.88–1.0 / 0.77–0.94 |
+| `rms, eta=0.005` (0.5) | 0.5–3 % | 0 % | 0.9–3 | 0.97–1.0 / 0.93–0.98 |
+| `rms, eta=0.003` (0.3) | 0–0.2 % | 0 % | 0.5–1.5 | 0.99–1.0 / 0.98–0.99 |
+| `rms, eta=0.015, lam=0.95` (0.3) | 0–0.2 % | 0 % | 0.8–3 | 0.94–1.0 / 0.89–0.97 |
+
+The control row (added after the merge, from the same diagnostic with the same seed
+and batch) shows that on this task the whole improvement over the default row comes
+from the smaller `eta`, not from the norm: without the norm the stream has
+`||x||**2 < d` (tanh activities plus the embedding), so at the same `eta` its loop
+gain is lower still and its traces smaller. What the norm buys is scale invariance —
+the same `eta` gives the same loop gain whatever the fan-in, activity level or
+residual-stream depth — which a single-task, no-residual diagnostic does not
+exercise; whether that matters for training has to be settled by paired runs
+(`--seed`, same `--eta`, norm on/off).
+
+So with the norm on (multiplicative MPN), `eta ≈ 0.3*(1-lambda)` keeps every layer's traces bounded
+without `--rflo-trace-rho` (the capped and uncapped diagonal variants then
+coincide), while the modulation still reaches `O(0.1)` per synapse. The condition
+depends on the weights, so a run that grows `W` substantially may re-enter the
+unstable regime; `rflo_trace_gain.py` reports the exceedance fractions for a
+saved configuration. Trace boundedness is not a convergence guarantee.
 
 ## Jacobian
 
@@ -128,7 +163,8 @@ Implementation: `_mp_input_norm_forward(x, layer_idx)` returns `(x, None)` for
 Consequences: every exactness statement above holds unchanged (re-tested with the
 flag on); `diag_mtrace`/`paired` are accepted again, since layer 0's input is the raw
 embedding output; a net with a single MP layer rejects the flag (nothing would be
-normalized); with the norm off the flag is ignored. Recorded in `net_params`,
+normalized); with the norm off the flag is ignored by the model, and the CLI rejects
+it without `--mp-input-norm rms`. Recorded in `net_params`,
 `config.json`, checkpoints and the console/figure notes; the legacy
 tag gains `-skip0`.
 
