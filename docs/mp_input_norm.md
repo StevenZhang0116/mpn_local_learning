@@ -129,7 +129,7 @@ Consequences: every exactness statement above holds unchanged (re-tested with th
 flag on); `diag_mtrace`/`paired` are accepted again, since layer 0's input is the raw
 embedding output; a net with a single MP layer rejects the flag (nothing would be
 normalized); with the norm off the flag is ignored. Recorded in `net_params`,
-`config.json`, checkpoints, the W&B config and the console/figure notes; the legacy
+`config.json`, checkpoints and the console/figure notes; the legacy
 tag gains `-skip0`.
 
 ## Implementation map

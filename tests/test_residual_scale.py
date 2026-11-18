@@ -17,7 +17,6 @@ import _bootstrap  # noqa: F401
 import mpn
 import train_common as tc
 import train_mpn
-import wandb_logging
 import test_dfa as dfa
 import test_input_modulation_trace as imt
 import test_local_readouts as heads
@@ -294,7 +293,6 @@ class TestResidualScale(unittest.TestCase):
                 saved = json.loads(Path(path).read_text())
                 self.assertEqual(saved['residual_scale'], .5)
                 self.assertEqual(saved['net_params']['residual_scale'], .5)
-                self.assertEqual(wandb_logging._base_config(cfg, 'test')['residual_scale'], .5)
                 cfg.rules_to_run = ['local_direct']
                 runs = {'local_direct': {'train': [[.1]], 'valid': [[.2]]}}
                 agg = {'local_direct': {split: {'mean': [.1], 'std': [0.]} for split in ('train', 'valid')}}

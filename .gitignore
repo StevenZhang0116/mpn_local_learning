@@ -20,8 +20,5 @@ figure_data/
 /notebooks/verify_rflo_scaling/
 /notebooks/rflo_trace_gain/
 
-# Weights & Biases local run logs (offline runs, cache, artifacts)
-wandb/
-
 # Timestamped console output
 log/

@@ -21,7 +21,6 @@ import _bootstrap  # noqa: F401
 import mpn
 import train_common as tc
 import train_mpn
-import wandb_logging
 from test_local_readouts import data, make_cfg, make_net
 
 
@@ -185,7 +184,7 @@ class TestOptimizationSurface(unittest.TestCase):
             self.assertEqual(len({base, head, schedule}), 3)
             self.assertEqual(train_mpn._cfg().run_id, schedule)
 
-    def test_cli_wiring_and_config_npz_wandb_metadata(self):
+    def test_cli_wiring_and_config_npz_metadata(self):
         with tempfile.TemporaryDirectory() as directory:
             def inspect(cfg):
                 self.assertEqual((cfg.lr, cfg.head_lr_mult, cfg.lr_schedule), (.002, 3., 'constant'))
@@ -197,8 +196,6 @@ class TestOptimizationSurface(unittest.TestCase):
                 self.assertEqual(record['head_lr_mult'], 3.)
                 self.assertEqual(record['lr_schedule'], 'constant')
                 self.assertIsNone(record['train_params']['scheduler'])
-                self.assertEqual(wandb_logging._base_config(cfg, 'test')['head_lr_mult'], 3.)
-                self.assertEqual(wandb_logging._base_config(cfg, 'test')['lr_schedule'], 'constant')
                 cfg.rules_to_run = ['local_direct']
                 runs = {'local_direct': {'train': [[.1]], 'valid': [[.2]]}}
                 agg = {'local_direct': {split: {'mean': [.1], 'std': [0.]}
@@ -234,32 +231,33 @@ class TestOptimizationSurface(unittest.TestCase):
             train_batch=lambda *args: (x, y, mask), loss_and_grad=None,
             accuracy=lambda net, out, labels, m, inputs, isvalid=False:
                 float(-((out - labels) * m).pow(2).mean()))
-        records = []
-        logger = SimpleNamespace(log_step=lambda rule, step, values: records.append((rule, step, values)))
         with tempfile.TemporaryDirectory() as directory:
             cfg.ckpt_dir = cfg.fig_dir = cfg.data_dir = directory
             log = io.StringIO()
             with contextlib.redirect_stdout(log):
-                tc.run_seed(cfg, 13, [0, 1], wandb_logger=logger)
-            self.assertIn('lr(next)', log.getvalue())
-            self.assertIn('head_W0=3.00e-03', log.getvalue())
-            self.assertIn('head0: acc', log.getvalue())
-            self.assertEqual(len(records), 8)
-            for rule, step, metrics in records:
-                self.assertEqual(metrics['lr'], .001)
-                self.assertEqual(metrics['lr/W_in'], .001)
-                self.assertEqual(metrics['lr/W_output'], .001)
-                self.assertEqual('lr/head_W0' in metrics, rule != 'bptt')
-                if rule != 'bptt':
-                    self.assertEqual(metrics['lr/head_W0'], .003)
-                    self.assertIn('train/aux0_loss', metrics)
-                    self.assertIn('train/aux0_accuracy', metrics)
+                tc.run_seed(cfg, 13, [0, 1])
+            lines = log.getvalue().splitlines()
+            # One lr(next) line per rule per recorded step; the three local rules
+            # report their head group at 3x the base rate, bptt has no active head.
+            rate_lines = [line for line in lines if 'lr(next)' in line]
+            self.assertEqual(len(rate_lines), 8)
+            for line in rate_lines:
+                self.assertIn('W_in=1.00e-03', line)
+                self.assertIn('W_output=1.00e-03', line)
+            self.assertEqual(sum('head_W0=3.00e-03' in line for line in rate_lines), 6)
+            self.assertEqual(sum('head_W0=' in line for line in rate_lines), 6)
+            self.assertEqual(sum('head0: acc' in line for line in lines), 6)
             for rule in cfg.rules_to_run:
                 path = tc.ckpt_path(cfg, rule, 13)
                 checkpoint = torch.load(path, weights_only=False)
                 self.assertEqual(checkpoint['head_lr_mult'], 3.)
                 self.assertEqual(checkpoint['lr_schedule'], 'constant')
-                self.assertEqual('head_W0' in checkpoint['learning_rates'], rule != 'bptt')
+                rates = checkpoint['learning_rates']
+                self.assertEqual(rates['W_in'], .001)
+                self.assertEqual(rates['W_output'], .001)
+                self.assertEqual('head_W0' in rates, rule != 'bptt')
+                if rule != 'bptt':
+                    self.assertEqual(rates['head_W0'], .003)
                 with contextlib.redirect_stdout(io.StringIO()):
                     loaded = train_mpn.load_net(path, device=torch.device('cpu'), dtype=torch.double)
                 self.assertEqual(loaded.learning_rule, rule)

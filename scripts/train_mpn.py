@@ -70,17 +70,8 @@ a local_readout invocation share init and training data:
     python scripts/train_mpn.py --task seqmnist --hidden 128 128 --seed 7 \
         --learning-signal local_readout
 
-Weights & Biases (https://wandb.ai): pass --wandb to log every run live. Each
-invocation becomes ONE W&B experiment named after this run's output ID (also used
-for the figure/.npz and checkpoint folder), containing len(RULES_TO_RUN) × N_RUNS
-runs — one per (rule × seed). Group/color by 'rule' in the W&B UI to use one color
-per learning rule, with each seed drawn as its own separate curve; a summary
-run also logs the aggregate mean±std figures. Off by default; wandb is only
-imported when enabled. See scripts/wandb_logging.py.
-
 Run from this directory:
     python train_mpn.py                        # deep MPN (default)
-    python train_mpn.py --wandb                # + log to Weights & Biases
     python train_mpn.py --net mpn1 --no-residual  # single MP layer, no embedding
     python train_mpn.py --net dmpn --hidden 100 --runs 3 --task delaygo
     python train_mpn.py --net dmpn --hidden 150 100   # deep MP stack (two MP layers)
@@ -309,19 +300,6 @@ SAVE_NETS = True              # save each trained network (per rule, per seed)
 
 DEVICE = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 DTYPE = torch.float32         # float32 for speed (one_task.py also runs float32)
-
-# ─── Weights & Biases (https://wandb.ai) logging (opt-in) ─────────────────────
-# When USE_WANDB is on (--wandb), each invocation opens ONE W&B run per
-# (rule × seed), all grouped under the output ID shared by the figure/.npz and
-# checkpoint folder (train_common.run_stem), which becomes the W&B
-# experiment/group. Group/color by 'rule' in the UI to see exactly K = len(
-# RULES_TO_RUN) colors, with each of the N_RUNS seeds drawn as its own separate
-# curve; a final summary run logs the aggregate mean±std figures. Off by default →
-# wandb is not imported and no W&B runs are created.
-USE_WANDB = False
-WANDB_PROJECT = "mpn_local_learning"   # W&B project the runs land in
-WANDB_ENTITY = None                    # None → your default W&B entity (user/team)
-WANDB_MODE = None                      # None → online; "offline"/"disabled" also valid
 
 RULE_LABEL = {"bptt": "BPTT", "local_diag_rflo": "diagonal RFLO",
               "local_exact_rowlocal": "exact row-local", "local_direct": "direct"}
@@ -630,8 +608,6 @@ def _cfg():
         log_every=LOG_EVERY, log_grad_align=LOG_GRAD_ALIGN, device=DEVICE, dtype=DTYPE,
         fig_dir=FIG_DIR, ckpt_dir=CKPT_DIR, data_dir=DATA_DIR, save_nets=SAVE_NETS,
         arch_tag=_arch_tag(), arch_desc=_arch_desc(),
-        use_wandb=USE_WANDB, wandb_project=WANDB_PROJECT,
-        wandb_entity=WANDB_ENTITY, wandb_mode=WANDB_MODE,
         build_params=build_params,
         net_factory=lambda np_, verbose: net_cls(np_, verbose=verbose),
         eval_outputs=forward_outputs,
@@ -870,20 +846,6 @@ def parse_arguments(argv=None):
                    help="BPTT gradient-alignment diagnostic at record steps (one extra "
                         "autograd pass per local rule per record step). Default: "
                         f"{LOG_GRAD_ALIGN}; --dfa selects off.")
-    g.add_argument("--wandb", dest="use_wandb", action="store_true", default=USE_WANDB,
-                   help="log to Weights & Biases (https://wandb.ai): one run per "
-                        "(rule × seed), all grouped under this run's output save-stem "
-                        "as the experiment name. Group/color by 'rule' in the UI for "
-                        "K=len(RULES_TO_RUN) colors, each seed a separate curve. "
-                        "Off by default.")
-    g.add_argument("--wandb-project", default=WANDB_PROJECT,
-                   help="W&B project name (default: %(default)s).")
-    g.add_argument("--wandb-entity", default=WANDB_ENTITY,
-                   help="W&B entity (user/team); default: your W&B default.")
-    g.add_argument("--wandb-mode", choices=["online", "offline", "disabled"],
-                   default=WANDB_MODE,
-                   help="W&B mode; default: online. Use 'offline' to log locally and "
-                        "`wandb sync` later (no login needed).")
 
     g = p.add_argument_group(
         "legacy options (still accepted; translated into the unified settings above)")
@@ -1046,7 +1008,6 @@ def _parse_args(argv=None):
 def main():
     global NET_TYPE, RULESET, N_RUNS, N_HIDDEN, N_DATASETS, FEEDBACK_MODE, BATCH
     global INPUT_MODE, INPUT_NORMALIZE, MP_RESIDUAL, CROSS_LAYER_STEPS, LOCAL_BIAS_MODE, RULES_TO_RUN, LOG_GRAD_ALIGN
-    global USE_WANDB, WANDB_PROJECT, WANDB_ENTITY, WANDB_MODE
     global MODULATION_MODE, MODULATION_BOUND, MODULATION_BOUNDS, MP_TYPE
     global DFA_PRESET
     global RFLO_TRACE_RHO, LAM, ETA
@@ -1092,10 +1053,6 @@ def main():
     MP_RESIDUAL = args.residual
     RESIDUAL_SCALE = args.residual_scale
     CROSS_LAYER_STEPS = args.cross_layer_steps
-    USE_WANDB = args.use_wandb
-    WANDB_PROJECT = args.wandb_project
-    WANDB_ENTITY = args.wandb_entity
-    WANDB_MODE = args.wandb_mode
     cfg = _cfg()
     # Give the console log the run ID shared by the figure / .npz / checkpoint
     # folder (log/<run-id>.log); a no-op when no tee is active (tests, imports).

@@ -428,13 +428,12 @@ class TestAdditiveSurface(unittest.TestCase):
                 cfg = train_mpn._cfg()
                 cfg.device, cfg.dtype = torch.device('cpu'), torch.float32
                 cfg.save_nets = True
-                records = []
-                logger = SimpleNamespace(log_step=lambda rule, step, values:
-                                         records.append((rule, step, values)))
-                with tempfile.TemporaryDirectory() as directory, contextlib.redirect_stdout(io.StringIO()):
+                log = io.StringIO()
+                with tempfile.TemporaryDirectory() as directory, contextlib.redirect_stdout(log):
                     cfg.ckpt_dir = cfg.fig_dir = cfg.data_dir = directory
-                    tc.run_seed(cfg, 23, [0, 1], wandb_logger=logger)
-                    self.assertEqual(len(records), 2*len(RULES))
+                    tc.run_seed(cfg, 23, [0, 1])
+                    # One recorded row (and its lr(next) line) per rule per step.
+                    self.assertEqual(log.getvalue().count('lr(next)'), 2*len(RULES))
                     for rule in RULES:
                         loaded = train_mpn.load_net(tc.ckpt_path(cfg, rule, 23),
                                                     device=torch.device('cpu'))

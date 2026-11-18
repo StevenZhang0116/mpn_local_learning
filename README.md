@@ -163,7 +163,7 @@ and the optional one-hop cross-layer correction include the corresponding branch
 gain. BPTT differentiates the same forward dynamics exactly. Heads still read
 `h_out`; their gradients are not separately scaled. This forward hyperparameter
 applies to every learning rule and is distinct from `--local-signal-alpha`
-(mixed learning signals). Checkpoints, JSON/NPZ metadata, W&B and plot labels
+(mixed learning signals). Checkpoints, JSON/NPZ metadata and plot labels
 record it; old checkpoints without the field use `1.0`.
 
 Each run writes a two-panel (train / test accuracy) figure to `figure/`, the arrays
@@ -335,8 +335,8 @@ BPTT baseline); the console's per-rule line records what each rule actually runs
 ```
 
 The same summary is stored per checkpoint as `effective_config`, and `signal_mode` is
-recorded next to `feedback_mode`/`learning_signal` in checkpoints, `config.json`, the
-`.npz` metadata and W&B. Legacy spellings still work and are translated: `--feedback
+recorded next to `feedback_mode`/`learning_signal` in checkpoints, `config.json` and the
+`.npz` metadata. Legacy spellings still work and are translated: `--feedback
 exact_spatial|layerwise_fa|direct_fa` (= `--learning-signal exact_spatial|layerwise_fa|dfa`),
 `--learning-signal global` (defers to `--feedback`), and the `--dfa` preset, which keeps
 its historical bundle (`dfa` + `match` + direct bias + rules `bptt local_exact_rowlocal
@@ -365,8 +365,7 @@ computed independently (head errors never enter the global recursion).
 Heads take part in training only; evaluation, the plotted metrics, the default
 plateau scheduler's monitor, and
 `grads["loss"]` stay the main readout's. The console prints an `aux` sub-line per
-rule with each head's train loss and accuracy (also logged to W&B as
-`train/aux{n}_*`). Head gradients are norm-clipped as a separate group so they never
+rule with each head's train loss and accuracy. Head gradients are norm-clipped as a separate group so they never
 change the main network's clipped step. `bptt` ignores the setting (its heads get no
 gradient), so the BPTT baseline is unchanged; the gradient-alignment columns exclude
 the heads. The local modes imply exact_spatial feedback, require
@@ -401,8 +400,8 @@ knobs are `--lr-patience` (training steps without a new best validation loss bef
 decay; default 30) and `--lr-factor` (multiplicative decay per plateau; default 0.95).
 The historical 30 / 0.95 decays fast on a noisy validation curve (about 1000x over
 5000 steps in the October 2026 `contextdelaydm1` runs); `--lr-patience 200` decays
-roughly seven times more slowly. Both are recorded in checkpoints, `config.json`,
-the `.npz` metadata and W&B, and appear in the legacy filename as `_pat<p>_fac<f>`
+roughly seven times more slowly. Both are recorded in checkpoints, `config.json`
+and the `.npz` metadata, and appear in the legacy filename as `_pat<p>_fac<f>`
 when non-default. `--lr-schedule constant` disables the scheduler, so validation loss
 cannot lower any rate. This schedule choice applies to **every** rule in the command, including
 BPTT; it does not change their gradient definitions. Per-module loss-driven
@@ -413,12 +412,12 @@ plateau/constant, keeping the seed and all other flags fixed. These are optimiza
 options, not a guarantee that a faster head improves task accuracy. Existing
 weight-vs-bias decay and separate main/head gradient clipping are preserved.
 
-The console's `lr(next)` line and W&B `lr/{parameter_name}` fields report the
+The console's `lr(next)` line reports the
 effective rate for each trainable matrix after scheduling (for the next update):
 `W_in`, `W`/`W1`/..., `W_output`, and active `head_W0`/... . Unused BPTT heads are
-omitted. Per-head train loss/accuracy remain in the existing console `aux` lines
-and W&B `train/aux{n}_*` fields. Requested multiplier/schedule are saved in config,
-checkpoint, plot-data and W&B metadata; checkpoints also record final effective
+omitted. Per-head train loss/accuracy remain in the existing console `aux` lines.
+Requested multiplier/schedule are saved in config,
+checkpoint and plot-data metadata; checkpoints also record final effective
 `learning_rates`. Old checkpoints still load without these optional metadata keys.
 
 `learning_signal` / `local_signal_alpha` are saved in `net_params` (checkpoints and
