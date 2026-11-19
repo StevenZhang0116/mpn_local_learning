@@ -7,15 +7,12 @@ import io
 from itertools import product
 import sys
 import unittest
-from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
 import torch
 
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / 'core'))
-sys.path.insert(0, str(ROOT / 'scripts'))
+import _bootstrap  # noqa: F401  (core/ and scripts/{training,tasks}/ on sys.path)
 import mpn
 
 

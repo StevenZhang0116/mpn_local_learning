@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # coding: utf-8
 """
-Tests for the task adapters (scripts/tasks.py) — the data/metric seam that lets
+Tests for the task adapters (scripts/tasks/tasks.py) — the data/metric seam that lets
 train_common train either the ring tasks or sequential MNIST.
 
 Checks, for seq-MNIST (both 'row' and 'pixel' modes):
@@ -31,7 +31,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-import _bootstrap  # prepends ../core + ../scripts to sys.path
+import _bootstrap  # puts core/ and scripts/{training,tasks}/ on sys.path
 import tasks
 import mpn
 import rnn

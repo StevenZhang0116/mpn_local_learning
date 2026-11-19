@@ -1,4 +1,4 @@
-"""core/gru.py + scripts/train_gru.py: BPTT against an independent torch.nn.GRUCell
+"""core/gru.py + scripts/training/train_gru.py: BPTT against an independent torch.nn.GRUCell
 autograd oracle, GRU-RFLO traces against a detached-recurrence autograd oracle
 (exactly the approximation they implement), exactness limits (W_rec = 0, T = 1),
 exact readout, feedback modes, update masks, the training-loop integration and

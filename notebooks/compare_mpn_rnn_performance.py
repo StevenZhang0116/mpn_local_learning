@@ -20,7 +20,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-import _bootstrap  # noqa: F401  -- prepends ../core + ../scripts to sys.path; exposes ROOT
+import _bootstrap  # noqa: F401  -- puts core/ and scripts/{training,tasks}/ on sys.path; exposes ROOT
 import train_mpn as tm   # RULE_LABEL / RULE_COLOR for the MPN rules
 import train_rnn as tr   # RULE_LABEL / RULE_COLOR for the RNN rules
 

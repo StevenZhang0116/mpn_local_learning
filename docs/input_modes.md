@@ -38,7 +38,7 @@ learning comparison. Keep `--cross-layer-steps 0` for the original MP update rul
 For a comparison of complete algorithm pairings, use:
 
 ```bash
-python scripts/train_mpn.py --input-mode paired --learning-signal exact_spatial --cross-layer-steps 0 --local-bias-mode direct
+python scripts/training/train_mpn.py --input-mode paired --learning-signal exact_spatial --cross-layer-steps 0 --local-bias-mode direct
 ```
 
 `paired` defaults to BPTT, diagonal RFLO, and direct when `--rules` is omitted:

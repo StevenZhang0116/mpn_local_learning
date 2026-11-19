@@ -31,8 +31,8 @@ share init and training data (the defaults are signal-independent, so nothing el
 differs between the two commands):
 
 ```bash
-python scripts/train_mpn.py --task seqmnist --hidden 128 128 --seed 7
-python scripts/train_mpn.py --task seqmnist --hidden 128 128 --seed 7 --learning-signal local_readout
+python scripts/training/train_mpn.py --task seqmnist --hidden 128 128 --seed 7
+python scripts/training/train_mpn.py --task seqmnist --hidden 128 128 --seed 7 --learning-signal local_readout
 ```
 
 ## Head learning rate and LR schedule

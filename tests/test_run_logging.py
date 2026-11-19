@@ -104,7 +104,7 @@ class TestRunLogging(unittest.TestCase):
 
         argv = ["train_mpn.py", "--dfa", "--task", "delaygo", "--steps", "1",
                 "--runs", "1", "--hidden", "4", "4"]
-        script = _bootstrap.ROOT / "scripts" / "train_mpn.py"
+        script = _bootstrap.ROOT / "scripts" / "training" / "train_mpn.py"
         stdout = io.StringIO()
         stderr = io.StringIO()
         with tempfile.TemporaryDirectory() as directory:
@@ -128,7 +128,7 @@ class TestRunLogging(unittest.TestCase):
             self.assertIn("experiment stderr", stderr.getvalue())
 
     def test_train_mpn_help_creates_no_log(self):
-        script = _bootstrap.ROOT / "scripts" / "train_mpn.py"
+        script = _bootstrap.ROOT / "scripts" / "training" / "train_mpn.py"
         for flag in ("--help", "-h"):
             stdout = io.StringIO()
             with tempfile.TemporaryDirectory() as directory:

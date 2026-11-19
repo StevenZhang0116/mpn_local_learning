@@ -54,7 +54,7 @@ import time
 import numpy as np
 import torch
 
-import _bootstrap  # prepends ../core + ../scripts to sys.path
+import _bootstrap  # puts core/ and scripts/{training,tasks}/ on sys.path
 # The reference implementation is core/mpn_archive.py; the efficiency-optimized
 # one (formerly mpn_revise) is now the default core/mpn.py. Alias them to the
 # names this test uses throughout: `mpn` = reference, `mpn_revise` = optimized.

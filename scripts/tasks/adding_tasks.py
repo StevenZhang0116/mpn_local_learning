@@ -2,7 +2,7 @@
 # coding: utf-8
 """
 The adding problem (Hochreiter & Schmidhuber 1997; Le, Jaitly & Hinton 2015),
-as a Task adapter for the mpn_local_learning training loop (see scripts/tasks.py).
+as a Task adapter for the mpn_local_learning training loop (see scripts/tasks/tasks.py).
 
 Why this task here: it is THE canonical long-range credit-assignment benchmark.
 The answer depends on two inputs that are far apart in time, so solving it needs

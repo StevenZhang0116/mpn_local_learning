@@ -33,9 +33,10 @@ Readout gradients are always exact. `--mp-type mult` (default) uses
 - `core/` — shared library: `mpn.py` (MultiPlasticNet, DeepMultiPlasticNet),
   `rnn.py` (LeakyRNN), `gru.py` (GRU with BPTT and a GRU-specific RFLO),
   `mpn_tasks.py`, `net_helpers.py`, `helper.py`, `run_logging.py`.
-- `scripts/` — `train_mpn.py`, `train_rnn.py`, `train_gru.py` (lockstep BPTT-vs-local
-  over N seeds), `train_common.py` (shared train/plot machinery), `tasks.py`,
-  `adding_tasks.py` and `associative_recall_tasks.py` (task adapters).
+- `scripts/training/` — `train_mpn.py`, `train_rnn.py`, `train_gru.py` (lockstep
+  BPTT-vs-local over N seeds) and `train_common.py` (shared train/plot machinery).
+- `scripts/tasks/` — the task adapters: `tasks.py` (registry, ring tasks, sequential
+  MNIST), `adding_tasks.py` and `associative_recall_tasks.py`.
 - `notebooks/` — standalone analysis scripts (trained-network figures, gradient and
   trace diagnostics, MPN-vs-RNN curves).
 - `tests/` — rule-correctness and integration tests; see [tests/README.md](tests/README.md).
@@ -47,7 +48,7 @@ Readout gradients are always exact. `--mp-type mult` (default) uses
 ## Usage
 
 ```bash
-cd scripts
+cd scripts/training
 python train_mpn.py --net dmpn --task delaygo --runs 3   # deep MPN: BPTT vs local
 python train_rnn.py --task delaygo --runs 3              # leaky RNN: BPTT vs RFLO
 python train_mpn.py --net dmpn --task seqmnist --runs 3  # deep MPN on sequential MNIST
@@ -56,7 +57,7 @@ python train_mpn.py --net dmpn --task adding --runs 3    # deep MPN on the addin
 python train_rnn.py --task adding --runs 3               # leaky RNN on the adding problem
 python train_gru.py --task seqmnist --runs 3             # GRU: BPTT vs GRU-RFLO, same tasks/protocol
 
-cd ..
+cd ../..
 python tests/run_all.py                                  # the whole test suite
 ```
 
@@ -68,7 +69,7 @@ Install the dependencies with `pip install -r requirements.txt`.
 stack (one width per MP layer). Every rule in a command starts from the same
 initialization and sees the same data. One invocation writes one run ID,
 `<model>_<task>_<YYYYMMDD_HHMMSS>_<hash>`, shared by `figure/`, `figure_data/`,
-`checkpoints/` and `log/`; `python scripts/train_mpn.py --help` lists every flag.
+`checkpoints/` and `log/`; `python scripts/training/train_mpn.py --help` lists every flag.
 
 ## Documentation
 

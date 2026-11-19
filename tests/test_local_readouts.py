@@ -18,7 +18,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-import _bootstrap  # noqa: F401  (core/ + scripts/ on sys.path)
+import _bootstrap  # noqa: F401  (core/ and scripts/{training,tasks}/ on sys.path)
 import mpn
 import train_common
 import train_mpn

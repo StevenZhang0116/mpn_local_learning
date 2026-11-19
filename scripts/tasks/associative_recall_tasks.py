@@ -2,7 +2,7 @@
 # coding: utf-8
 """
 Two-hop associative recall, as a Task adapter for the mpn_local_learning training
-loop (see scripts/tasks.py).
+loop (see scripts/tasks/tasks.py).
 
 Why this task here: it separates ONE memory lookup from TWO under an identical
 memory load. Every trial writes two random tables and then asks one question; the

@@ -1,38 +1,38 @@
 #!/usr/bin/env python
 # coding: utf-8
 """
-Compare BPTT vs RFLO local learning on a leaky vanilla RNN, over N runs.
+Compare BPTT vs RFLO-style local learning on a GRU, over N runs.
 
-The RNN analog of train_mpn.py. For each of N_RUNS seeds we train RULES_TO_RUN
-in lockstep:
-  - 'bptt'            — autograd through the unrolled recurrent forward
-  - 'local_diag_rflo' — RFLO (Murray & Escola 2019): forward-mode eligibility
-                        traces that drop the recurrent sensitivity term. Shares
-                        the API key with the MPN diagonal rule (see core/rnn.py).
-Same lockstep protocol as train_mpn.py (identical init / data / valid set per
-seed), same figure + .npz plot-data output. The shared machinery lives in
-train_common.py; this file only sets the RNN config and hooks.
+The GRU analog of train_rnn.py / train_mpn.py. For each of N_RUNS seeds we train
+RULES_TO_RUN in lockstep:
+  - 'bptt'            — autograd through the unrolled GRU recurrence
+  - 'local_diag_rflo' — GRU-RFLO (see core/gru.py): forward-mode per-unit
+                        eligibility traces gated by each unit's own update gate,
+                        dropping the recurrent sensitivity that enters the gates
+                        through W_rec. Exact when W_rec = 0 or T = 1; otherwise an
+                        approximation to BPTT. Readout gradients stay exact.
+Same lockstep protocol as the other scripts (identical init / data / valid set
+per seed), same figure + .npz output. The shared machinery lives in
+train_common.py; this file only sets the GRU config and hooks.
 
-Hyperparameters mirror train_mpn.py and one_task.py of the upstream MultiTaskMPN
-repository (the `# one_task.py:` comments below refer to that file).
-output_bias=False; no
-regularization. net_type='vanilla' selects the RNN in the param converter; the
-class used here is rnn.LeakyRNN.
+Hyperparameters mirror train_rnn.py (the `# one_task.py:` comments below refer to
+one_task.py of the upstream MultiTaskMPN repository). A GRU has three gate blocks, so N_HIDDEN
+defaults to 100 (about the same number of recurrent parameters as the 180-unit
+leaky RNN); pass --hidden to change it. net_type='gru'; class = gru.GRU.
 
-Under 'local_diag_rflo' the WHOLE network (input, recurrent, bias) trains by
-RFLO; under 'bptt' everything trains by exact autograd. The learning rule governs
-every layer; there is no separate per-layer control.
+Under 'local_diag_rflo' the whole recurrent block (input, recurrent, biases)
+trains by the traces; under 'bptt' everything trains by exact autograd.
 
 Run from this directory:
-    python train_rnn.py                      # BPTT vs RFLO (default)
-    python train_rnn.py --hidden 100 --runs 3 --task delaygo
+    python train_gru.py                      # BPTT vs RFLO (default)
+    python train_gru.py --hidden 64 --runs 3 --task delaygo
 """
 import argparse
 import torch
 import numpy as np 
 
-import _bootstrap  # prepends ../core + ../scripts to sys.path; exposes ROOT
-import rnn
+import _bootstrap  # puts core/ and scripts/{training,tasks}/ on sys.path; exposes ROOT
+import gru
 import tasks
 import train_common as tc
 
@@ -51,7 +51,7 @@ RNN_SIGNAL_MODES = {"exact_spatial": "exact_spatial", "layerwise_fa": "layerwise
 _FEEDBACK_TO_SIGNAL = {"exact_spatial": "exact_spatial", "exact_readout": "exact_spatial",
                        "layerwise_fa": "layerwise_fa", "direct_fa": "dfa"}
 N_RUNS = 3                    # independent seeds per rule
-N_HIDDEN = 180                # one_task.py: n_hidden = 200
+N_HIDDEN = 100                # 3 gate blocks: ~the leaky RNN (180) recurrent parameter count
 N_DATASETS = 5000             # one_task.py: n_datasets = 3000 (heavy on CPU)
 BATCH = 128                   # one_task.py: n_batches = batch_size = 128
 LR = 1e-3                     # one_task.py: lr = 1e-3
@@ -70,9 +70,9 @@ RULE_COLOR = {"bptt": "#1f77b4", "local_diag_rflo": "#d62728"}
 
 
 def build_params():
-    """(task, train, net) param dicts for a leaky vanilla RNN on one task.
-    Regularization disabled so the objective is pure masked-MSE (what RFLO is
-    derived for). net_type='vanilla' for the param converter; class = rnn.LeakyRNN."""
+    """(task, train, net) param dicts for a GRU on one task. Regularization
+    disabled so the objective is pure masked-MSE (what the traces are derived
+    for). net_type='gru'; class = gru.GRU."""
     task_params = {
         "rules": [RULESET],
         "dt": 40,
@@ -104,7 +104,7 @@ def build_params():
     }
 
     net_params = {
-        "net_type": "vanilla",
+        "net_type": "gru",
         "n_neurons": [1, N_HIDDEN, 1],   # [in, hidden, out]; in/out overwritten below
         "output_bias": False,            # one_task.py: output_bias = False
         "hidden_bias": True,
@@ -113,8 +113,6 @@ def build_params():
         "cuda": False,
         "output_matrix": "",
         "acc_measure": "angle",
-        "leaky": True,
-        "alpha": 0.8,                    # overwritten by convert_and_init to 1 - dt/tau
         "learning_rule": "bptt",         # overwritten per rule below
         "feedback_mode": FEEDBACK_MODE,
     }
@@ -122,11 +120,11 @@ def build_params():
 
 
 def _cfg():
-    """Package the current module globals + RNN-specific hooks into a RunConfig.
+    """Package the current module globals + GRU-specific hooks into a RunConfig.
     Built fresh on each call so callers/--flags can override globals before use."""
     return tc.RunConfig(
-        file_prefix="train_rnn", ckpt_prefix="rnn",
-        title=f"{RULESET} (leaky RNN): BPTT vs RFLO", header_note=" (leaky RNN)",
+        file_prefix="train_gru", ckpt_prefix="gru",
+        title=f"{RULESET} (GRU): BPTT vs RFLO", header_note=" (GRU)",
         rule_label=RULE_LABEL, rule_color=RULE_COLOR,
         seed=SEED, ruleset=RULESET, rules_to_run=RULES_TO_RUN,
         feedback_mode=FEEDBACK_MODE, n_runs=N_RUNS, n_hidden=N_HIDDEN,
@@ -135,8 +133,8 @@ def _cfg():
         log_every=LOG_EVERY, device=DEVICE, dtype=DTYPE,
         fig_dir=FIG_DIR, ckpt_dir=CKPT_DIR, data_dir=DATA_DIR, save_nets=SAVE_NETS,
         build_params=build_params,
-        net_factory=lambda np_, verbose: rnn.LeakyRNN(np_, verbose=verbose),
-        # LeakyRNN has its own no-grad forward for held-out evaluation.
+        net_factory=lambda np_, verbose: gru.GRU(np_, verbose=verbose),
+        # GRU has its own no-grad forward for held-out evaluation.
         eval_outputs=lambda net, inputs: net.forward_outputs(inputs),
         task=tasks.make_task(RULESET),
         acc_label=tasks.acc_label_for(RULESET),
@@ -154,7 +152,7 @@ def replot_from_npz(npz_path, save_to=None):
 
 def _parse_args():
     p = argparse.ArgumentParser(
-        description="Compare BPTT vs RFLO local learning on a leaky vanilla RNN.")
+        description="Compare BPTT vs RFLO-style local learning on a GRU.")
     p.add_argument("--task", default=RULESET, help="ruleset / task (default: %(default)s)")
     p.add_argument("--runs", type=int, default=N_RUNS, help="independent seeds")
     p.add_argument("--hidden", type=int, default=N_HIDDEN, help="hidden units")
@@ -162,7 +160,7 @@ def _parse_args():
     p.add_argument("--learning-signal", choices=list(RNN_SIGNAL_MODES), default=None,
                    help="hidden learning signal, same names as train_mpn: exact_spatial "
                         "(true readout weights), layerwise_fa / dfa (fixed random "
-                        "feedback; the two coincide for this single-hidden RNN). "
+                        "feedback; the two coincide for this single-hidden GRU). "
                         f"Default: {_FEEDBACK_TO_SIGNAL.get(FEEDBACK_MODE, FEEDBACK_MODE)}.")
     p.add_argument("--feedback",
                    choices=["exact_spatial", "layerwise_fa", "direct_fa", "exact_readout"],

@@ -1,9 +1,10 @@
 # tests
 
 Test / sanity-check / validation code for `mpn_local_learning`. Each file imports
-`_bootstrap` first (a copy lives here, same as `scripts/`, `notebooks/` and `utils/`),
-which adds `../core` and `../scripts` to the path so `mpn`, `rnn`, `tasks`,
-`train_mpn`, etc. import cleanly. Run a single file from this directory, or the
+`_bootstrap` first (a copy lives here, same as in `scripts/training/`,
+`scripts/tasks/`, `notebooks/` and `utils/`), which puts `core/`,
+`scripts/training/` and `scripts/tasks/` on the path so `mpn`, `rnn`, `tasks`,
+`train_mpn`, etc. import cleanly under their flat names. Run a single file from this directory, or the
 whole suite with `run_all.py` (see the end of this page).
 
 | File | What it checks |
@@ -22,7 +23,7 @@ whole suite with `run_all.py` (see the end of this page).
 | `test_input_modulation_trace.py` | Input modulation sensitivities against independent autograd graphs, BPTT limiting cases, delayed credit, nonlinear writes/masks, residuals, freezing, custom losses, CLI validation, and checkpoint reload. |
 | `test_rnn.py` | `core/rnn.py` LeakyRNN RFLO against a detached-recurrence autograd oracle under masked MSE and cross-entropy (the loss now drives the traces), exact readout, and `update_masks` applied before the readout (all-frozen limit, partial and graded masks). |
 | `test_rflo_trace_gain_analysis.py` | `notebooks/rflo_trace_gain.py`: the recorded diagonal gain equals `lam + k*W` and the exact row gain equals its row sum, the three local variants share init/data, curves and summaries have the right shapes, every gradient is taken under the task's own loss (masked MSE by default, cross-entropy for two-hop recall, where the top layer's exact row-local gradient equals BPTT's and differs from the MSE one), and the CLI writes the figure, JSON summary and `.npz` curves. |
-| `test_gru.py` | `core/gru.py` + `scripts/train_gru.py`: BPTT against an independent `torch.nn.GRUCell` autograd oracle, GRU-RFLO traces against a detached-recurrence autograd oracle, exactness at `W_rec = 0` and `T = 1`, exact readout, feedback modes, update masks, the no-bias variant, CLI/config, and a lockstep `run_seed` integration run. |
+| `test_gru.py` | `core/gru.py` + `scripts/training/train_gru.py`: BPTT against an independent `torch.nn.GRUCell` autograd oracle, GRU-RFLO traces against a detached-recurrence autograd oracle, exactness at `W_rec = 0` and `T = 1`, exact readout, feedback modes, update masks, the no-bias variant, CLI/config, and a lockstep `run_seed` integration run. |
 | `test_clean.py` | The root `clean.py` output cleaner: dry run by default, `--run` deletes only the contents of the target output folders (directories and code kept, symlinks unlinked not followed), `--keep` globs and positional folder selection, refusal outside the project root. |
 | `test_cli_signal_modes.py` | The unified `--learning-signal` axis and three-stage CLI: signal-independent defaults, legacy translation (`--dfa`, `--feedback`, `global`), order-independent conflict rejection, grouped `--help`, `signal_mode` metadata, the RNN script's matching names, the per-rule effective-configuration line, and `--eta` (one shared `eta_clamp` or per-layer `ml_params<idx>` overrides, rejection of bad lists). |
 | `test_local_bias_match.py` | Rule-matched MP bias updates: equivalence to explicit direct/exact policies, independent row-local autograd, single-layer BPTT agreement, rule switching/direct gradient calls, CLI defaults, training diagnostics, and checkpoint reload/provenance. |
@@ -32,7 +33,7 @@ whole suite with `run_all.py` (see the end of this page).
 | `test_run_logging.py` | `core/run_logging.py`: stdout/stderr mirroring and flushing, the project-relative default path, renaming the active log to the run ID, stream restoration on exceptions, capture of a `train_mpn` CLI run, and no log file for `--help`. |
 | `test_mpn_revise.py` | The optimized `core/mpn.py` against the reference `core/mpn_archive.py`, for the baseline configuration the archive implements (features added since are covered by the other files): outputs, loss and every gradient for BPTT and the three local rules on `dmpn` and `mpn1` (float64 and float32), masked updates, `return_outputs=False`, scratch-buffer reuse, pixel-MNIST alignment and a timing benchmark. Requires CUDA; run as a script. |
 | `validate_local_learning.py` | Correctness of the local-learning rules vs BPTT, as numbered tiers (1-11 and 13-17; there is no tier 12): exact row-local vs BPTT, diagonal RFLO limits and its zeroed reference, direct rule, real-task integration, deep input embedding, RNN RFLO, pre-only Hebbian writes, custom and cross-entropy losses, feedback modes, input modes, input normalization, partially frozen embedding, residual stacks and cross-layer steps. float64, tight tolerances. |
-| `test_tasks.py` | The task adapters in `scripts/tasks.py`: seq-MNIST data loading / batching / masking / metric / determinism, the adding problem, two-hop associative recall (the tables decoded from the inputs reproduce every target, trial layout, the paired and reproducible held-out set, per-query accuracy, one real cross-entropy update for BPTT and a local rule on a two-MP-layer net, the RNN and the GRU), the registry including name parsing, and an end-to-end "loss decreases" integration check for both MPN and RNN. |
+| `test_tasks.py` | The task adapters in `scripts/tasks/tasks.py`: seq-MNIST data loading / batching / masking / metric / determinism, the adding problem, two-hop associative recall (the tables decoded from the inputs reproduce every target, trial layout, the paired and reproducible held-out set, per-query accuracy, one real cross-entropy update for BPTT and a local rule on a two-MP-layer net, the RNN and the GRU), the registry including name parsing, and an end-to-end "loss decreases" integration check for both MPN and RNN. |
 
 Run everything with one command, from the repository root:
 

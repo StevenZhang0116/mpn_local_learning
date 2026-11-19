@@ -1,6 +1,6 @@
 # Training scripts, tasks and outputs
 
-Details of the training entry points (`scripts/train_mpn.py`, `train_rnn.py`,
+Details of the training entry points (`scripts/training/train_mpn.py`, `train_rnn.py`,
 `train_gru.py`). The quick-start commands are in the [README](../README.md).
 
 ## Environment
@@ -51,7 +51,7 @@ length — the central question this project studies.
 
 ## Two-hop associative recall
 
-`--task twohop` (`scripts/associative_recall_tasks.py`) separates one memory lookup
+`--task twohop` (`scripts/tasks/associative_recall_tasks.py`) separates one memory lookup
 from two under an identical memory load. Each trial draws two fresh random
 permutations, `f: A -> B` and `g: B -> C`, over `K` symbols per set:
 
@@ -99,7 +99,7 @@ the `bptt` training rule or an exact-BPTT input update.
 For example, a smaller-batch pixel-MNIST comparison with three MP layers:
 
 ```bash
-python scripts/train_mpn.py --task seqmnist_pixel --hidden 128 128 128 \
+python scripts/training/train_mpn.py --task seqmnist_pixel --hidden 128 128 128 \
   --residual --rflo-trace-rho 0.99 --lam 0.99 \
   --learning-signal exact_spatial --input-mode match --local-bias-mode direct \
   --cross-layer-steps 0 --modulation-mode hard --modulation-bound 1 \
@@ -179,6 +179,6 @@ entries, positional names limit it to some folders. `utils/clean.py` forwards to
 
 ## Adding a task
 
-To add a new task, implement a `Task` in `tasks.py` (`init_params` / `valid_batch` /
+To add a new task, implement a `Task` under `scripts/tasks/` (`init_params` / `valid_batch` /
 `train_batch` / `accuracy`) and register it in `make_task`; the models and the
 training loop don't change.

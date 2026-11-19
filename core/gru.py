@@ -1,6 +1,6 @@
 """
 Gated recurrent unit (GRU) with two learning rules, mirroring rnn.LeakyRNN so
-the same lockstep BPTT-vs-local training loop (scripts/train_common.py) and the
+the same lockstep BPTT-vs-local training loop (scripts/training/train_common.py) and the
 same tasks apply:
 
   'bptt'            — autograd through the unrolled recurrence.

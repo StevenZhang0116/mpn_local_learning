@@ -12,8 +12,8 @@ Targets (the contents of each directory; the directories themselves are kept):
     notebooks/rflo_trace_gain/             analysis outputs
     notebooks/verify_rflo_scaling/         analysis outputs
     notebooks/visualize_trained_networks/  analysis outputs
-All of them are git-ignored output folders written by scripts/train_mpn.py,
-scripts/train_rnn.py and the notebooks/*.py analysis scripts.
+All of them are git-ignored output folders written by scripts/training/train_mpn.py,
+scripts/training/train_rnn.py and the notebooks/*.py analysis scripts.
 
 This is destructive, so it is a DRY RUN unless --run is given: without --run it
 only prints what would be deleted. It is anchored to the directory this file
@@ -54,7 +54,7 @@ TARGET_DIRS = {
 def is_project_root(root):
     """Guard against running a stray copy of this file somewhere else."""
     root = Path(root)
-    return (root / "scripts" / "train_mpn.py").is_file() and (root / "core" / "mpn.py").is_file()
+    return (root / "scripts" / "training" / "train_mpn.py").is_file() and (root / "core" / "mpn.py").is_file()
 
 
 def iter_entries(directory):

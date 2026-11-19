@@ -52,7 +52,7 @@ Defaults are signal-independent: rules bptt+local_direct+local_diag_rflo, input
 mode match (bptt = full BPTT, local runs fully local), direct bias updates, no
 cross-layer correction, alignment diagnostic on. Switching only --learning-signal
 therefore changes only the signal. Example:
-    python scripts/train_mpn.py --learning-signal dfa --hidden 64 64 --task delaygo --steps 500
+    python scripts/training/train_mpn.py --learning-signal dfa --hidden 64 64 --task delaygo --steps 500
 --dfa is kept as the LEGACY preset (direct_fa + match + direct bias + rules
 bptt/row-local/diagonal + alignment off); --feedback and --learning-signal global
 are legacy spellings translated into the unified mode. Explicitly conflicting
@@ -68,8 +68,8 @@ cross-layer-steps 0 and cannot splice a BPTT input gradient; if the module
 defaults were changed to 'exact' / 1 they switch to 'match' / 0 unless set
 explicitly. bptt ignores the setting. Pair it with --seed so an exact_spatial and
 a local_readout invocation share init and training data:
-    python scripts/train_mpn.py --task seqmnist --hidden 128 128 --seed 7
-    python scripts/train_mpn.py --task seqmnist --hidden 128 128 --seed 7 \
+    python scripts/training/train_mpn.py --task seqmnist --hidden 128 128 --seed 7
+    python scripts/training/train_mpn.py --task seqmnist --hidden 128 128 --seed 7 \
         --learning-signal local_readout
 
 Run from this directory:
@@ -95,7 +95,7 @@ import uuid
 import torch
 import numpy as np 
 
-import _bootstrap  # prepends ../core + ../scripts to sys.path; exposes ROOT
+import _bootstrap  # puts core/ and scripts/{training,tasks}/ on sys.path; exposes ROOT
 import mpn         # core/mpn.py — the efficiency-optimized implementation
 import tasks
 import train_common as tc

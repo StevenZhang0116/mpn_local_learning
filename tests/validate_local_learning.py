@@ -34,7 +34,7 @@ Run from this directory (mpn_local_learning/tests):  python validate_local_learn
 import numpy as np
 import torch
 
-import _bootstrap  # prepends ../core + ../scripts to sys.path; exposes ROOT
+import _bootstrap  # puts core/ and scripts/{training,tasks}/ on sys.path; exposes ROOT
 import mpn
 
 

@@ -16,9 +16,9 @@ import clean  # noqa: E402
 
 def make_fake_root(tmp):
     root = Path(tmp) / "proj"
-    (root / "scripts").mkdir(parents=True)
+    (root / "scripts" / "training").mkdir(parents=True)
     (root / "core").mkdir()
-    (root / "scripts" / "train_mpn.py").write_text("# code\n")
+    (root / "scripts" / "training" / "train_mpn.py").write_text("# code\n")
     (root / "core" / "mpn.py").write_text("# code\n")
     for rel in clean.TARGET_DIRS.values():
         (root / rel).mkdir(parents=True)
@@ -76,7 +76,7 @@ class TestClean(unittest.TestCase):
             # code untouched, including the symlink targets
             self.assertTrue(outside.is_file())
             self.assertEqual(outside.read_text(), "do not delete")
-            self.assertTrue((root / "scripts" / "train_mpn.py").is_file())
+            self.assertTrue((root / "scripts" / "training" / "train_mpn.py").is_file())
             self.assertTrue((root / "core" / "mpn.py").is_file())
 
     def test_keep_and_dir_selection(self):
@@ -104,7 +104,7 @@ class TestClean(unittest.TestCase):
                 clean.plan(root, dirs=["scripts"])
             with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                 clean.main(["scripts", "--run"], root=root)
-            self.assertTrue((root / "scripts" / "train_mpn.py").is_file())
+            self.assertTrue((root / "scripts" / "training" / "train_mpn.py").is_file())
 
     def test_real_project_root_is_recognized_and_wrapper_forwards(self):
         self.assertTrue(clean.is_project_root(_bootstrap.ROOT))

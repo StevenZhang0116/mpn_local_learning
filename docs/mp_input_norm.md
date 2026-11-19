@@ -179,7 +179,7 @@ tag gains `-skip0`.
   `_forward_local_stack(return_norm=True)`, `_same_time_boundary_signals(norm=...)`,
   `_cross_layer_correction(..., x_in, prev_xin, prev_norm=...)`, the local loop
   and the custom-loss pre-pass.
-* `scripts/train_mpn.py`, `scripts/train_common.py`: CLI, `net_params`, metadata,
+* `scripts/training/train_mpn.py`, `scripts/training/train_common.py`: CLI, `net_params`, metadata,
   notes. `notebooks/rflo_trace_gain.py`: `--mp-input-norm / --mp-input-norm-skip-first /
   --eta / --lam`.
 * `tests/test_mp_input_norm.py`: see `tests/README.md`.

@@ -1,6 +1,6 @@
 # Plasticity and architecture settings
 
-Forward-dynamics options of `scripts/train_mpn.py`. Each one changes the network
+Forward-dynamics options of `scripts/training/train_mpn.py`. Each one changes the network
 that every rule trains, so paired comparisons must share it. The per-step RMS
 normalization of MP-layer inputs has its own page: [mp_input_norm.md](mp_input_norm.md).
 
@@ -16,7 +16,7 @@ still apply). BPTT remains full main-loss BPTT under `--input-mode match`.
 For example, from the repository root:
 
 ```bash
-python scripts/train_mpn.py --mp-type add --task contextdelaydm1 \
+python scripts/training/train_mpn.py --mp-type add --task contextdelaydm1 \
   --hidden 128 128 128 --no-residual --learning-signal local_readout \
   --rules local_direct local_diag_rflo local_exact_rowlocal bptt \
   --input-mode match --local-bias-mode match --cross-layer-steps 0 \
