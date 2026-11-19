@@ -18,7 +18,9 @@ A Task provides four hooks (everything run_seed needs to touch the data/metric):
       the held-out set, generated ONCE per seed and shared across rules.
   train_batch(task_params, train_params, batch, device, dtype) -> (inputs, labels,
       mask) one training batch (generated once per step, fed to every rule).
-  accuracy(net, output, labels, mask, inputs, isvalid) -> float scalar accuracy.
+  accuracy(net, output, labels, mask, inputs, isvalid) -> float scalar accuracy
+      (the nonlinear-system tasks return a skill relative to a linear filter
+      instead: 1 is exact, 0 or below is no better than the filter).
 
 All tensors are (B, T, ·). The mask is a float 'cost' mask (B, T, n_out) — the
 loss/eligibility machinery already multiplies by it, so a task that only scores
@@ -26,10 +28,12 @@ its final step just sets the mask to 1 there and 0 elsewhere.
 
 A Task also declares its OBJECTIVE via a `loss_and_grad` attribute (the
 (loss, dL/d output) contract of mpn.masked_mse_loss_and_output_grad):
-    None  -> the net's default masked MSE (ring / adding). Passing None keeps the
-             net on its module-local fast path (the local rules' single-pass
-             masked-MSE branch), so the default tasks are byte-for-byte unchanged.
-    fn    -> a task-specific loss (seq-MNIST uses masked cross-entropy on logits).
+    None  -> the net's default masked MSE (ring / adding / nonlinear system).
+             Passing None keeps the net on its module-local fast path (the local
+             rules' single-pass masked-MSE branch), so the default tasks are
+             byte-for-byte unchanged.
+    fn    -> a task-specific loss (seq-MNIST and two-hop recall use masked
+             cross-entropy on logits).
              Any non-default loss routes the local rules through their two-pass
              path (forward once for outputs, then loss_and_grad for grad_output).
 The objective is per-task by design; different tasks need not share one loss.
@@ -39,6 +43,8 @@ The objective is per-task by design; different tasks need not share one loss.
     'seqmnist_pixel'   -> SeqMNISTTask(mode='pixel')  784 steps of 1 pixel
     'adding[_L..][_m..]' -> AddingProblemTask         the adding problem
     'twohop[_K..][_d..]' -> TwoHopRecallTask          two-hop associative recall
+    'wh_mid' / 'wh_out'[_a..][_b..][_g..][_T..] -> NonlinearSystemTask
+                                                      nonlinear system identification
     anything else      -> MultiTaskAdapter()          the ring tasks (unchanged)
 """
 import os
@@ -51,6 +57,7 @@ import torch
 import mpn_tasks
 from adding_tasks import AddingProblemTask
 from associative_recall_tasks import TwoHopRecallTask
+from nonlinear_system_tasks import NonlinearSystemTask, VARIANTS as WH_VARIANTS
 from mpn import masked_cross_entropy_loss_and_grad
 
 
@@ -272,11 +279,47 @@ def _twohop_task(ruleset):
     return TwoHopRecallTask(n_symbols=values.get("k", 4), delay=values.get("d", 4))
 
 
+def is_wh(ruleset):
+    """True if the RULESET string names a nonlinear-system (wh_mid / wh_out) variant."""
+    return str(ruleset).lower().split("_")[0] == "wh"
+
+
+def _wh_task(ruleset):
+    """Build a NonlinearSystemTask from the RULESET string. 'wh_mid' and 'wh_out'
+    use the defaults (alpha=0.6, beta=0.9, gain=6, 64 steps). Optional fragments,
+    in any order, change one value each: 'a<percent>' the fast memory's alpha,
+    'b<percent>' the slow memory's beta, 'g<gain>' the gain and 'T<steps>' the
+    sequence length, with 'p' as the decimal point. 'wh_mid_b95_g2p5_T32' ->
+    beta=0.95, gain=2.5, 32 steps."""
+    usage = ("use wh_mid or wh_out, optionally followed by _a<percent>, _b<percent>, "
+             "_g<gain> and _T<steps> ('p' is the decimal point), e.g. wh_mid_b95_g2p5_T32")
+    parts = str(ruleset).lower().split("_")
+    if len(parts) < 2 or parts[1] not in WH_VARIANTS:
+        raise ValueError(f"cannot parse nonlinear-system task name {ruleset!r}; {usage}")
+    values = {}
+    for fragment in parts[2:]:
+        m = re.fullmatch(r"([abgt])(\d+(?:p\d+)?)", fragment)
+        if m is None or m.group(1) in values or (m.group(1) == "t" and "p" in m.group(2)):
+            raise ValueError(f"cannot parse nonlinear-system task name {ruleset!r}; {usage}")
+        values[m.group(1)] = float(m.group(2).replace("p", "."))
+    kwargs = {}
+    if "a" in values:
+        kwargs["alpha"] = values["a"] / 100.0
+    if "b" in values:
+        kwargs["beta"] = values["b"] / 100.0
+    if "g" in values:
+        kwargs["gain"] = values["g"]
+    if "t" in values:
+        kwargs["seq_len"] = int(values["t"])
+    return NonlinearSystemTask(variant=parts[1], **kwargs)
+
+
 def make_task(ruleset):
     """Map a RULESET string to a Task:
       'seqmnist' / 'seqmnist_pixel' -> SeqMNISTTask (row / pixel)
       'adding' (or 'adding_L<len>_m<marks>') -> AddingProblemTask
       'twohop' (or 'twohop_K<symbols>_d<delay>') -> TwoHopRecallTask
+      'wh_mid' / 'wh_out' (or e.g. 'wh_mid_b95_g2p5_T32') -> NonlinearSystemTask
       anything else                 -> multitask ring-task pipeline (unchanged)."""
     key = str(ruleset).lower()
     if key in ("seqmnist", "smnist", "mnist"):
@@ -287,6 +330,8 @@ def make_task(ruleset):
         return _adding_task(key)
     if is_twohop(key):
         return _twohop_task(key)
+    if is_wh(key):
+        return _wh_task(key)
     return MultiTaskAdapter()
 
 

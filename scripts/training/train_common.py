@@ -140,12 +140,14 @@ class RunConfig:
     # (e.g. "arch=[20, 200, 150, 100, 3]"). Empty → the suffix falls back to
     # "hidden={n_hidden}" as before.
     arch_desc: str = ""
-    # y-axis label for the plotted panels (task-dependent: accuracy label for the
-    # ring tasks / seq-MNIST, loss label for the adding problem).
+    # y-axis label for the plotted panels (task-dependent: an accuracy label for the
+    # ring tasks, seq-MNIST and two-hop recall; a loss label for the adding problem
+    # and the nonlinear-system tasks).
     acc_label: str = "angle accuracy (%)"
     # Which curve the figure shows: 'accuracy' (percent, 0-110 y) or 'loss'
-    # (masked-MSE, log-y). Regression tasks like the adding problem use 'loss'
-    # because accuracy is uninformative there. Accuracy is always logged either way.
+    # (masked-MSE, log-y). The regression tasks use 'loss': accuracy is uninformative
+    # for the adding problem, and the nonlinear-system tasks' accuracy hook returns a
+    # skill score that can be negative. The accuracy hook is logged either way.
     metric: str = "accuracy"
     # At each recorded step, also log the per-weight-matrix cosine similarity
     # between every non-BPTT rule's gradient and the TRUE BPTT gradient at the same

@@ -19,7 +19,10 @@ And an integration check:
 The adding problem and two-hop associative recall get the same kind of checks
 (for two-hop: the tables decoded from the inputs reproduce every target, the
 held-out set is paired and reproducible, and one real update runs for BPTT and a
-local rule on a two-MP-layer net, the RNN and the GRU).
+local rule on a two-MP-layer net, the RNN and the GRU). The nonlinear-system
+tasks (wh_mid / wh_out) are checked against the two recurrences by hand and
+against an independent convolution, for causality, for the pairing of the two
+variants, and for the linear (FIR) baseline that accuracy() is measured against.
 
 Run from this directory (mpn_local_learning/tests):  python test_tasks.py
 """
@@ -283,6 +286,127 @@ def test_twohop_task():
           only_one["one_hop"] == 1.0 and math.isnan(only_one["two_hop"]))
 
 
+def test_wh_task():
+    print("── NonlinearSystemTask (wh_mid / wh_out) ──")
+    from nonlinear_system_tasks import (NonlinearSystemTask, wh_system, lagged_inputs,
+                                        fit_fir, fir_predict)
+
+    # The two recurrences by hand on two steps (alpha = beta = 0.5, gain = 1): the
+    # same two inputs in either order. 'out' is linear up to the final tanh, so the
+    # order does not matter; 'mid' saturates before it accumulates, so it does.
+    x2 = np.array([[2.0, 0.0], [0.0, 2.0]])
+    y_mid, s2 = wh_system(x2, "mid", 0.5, 0.5, 1.0)
+    y_out, _ = wh_system(x2, "out", 0.5, 0.5, 1.0)
+    check("fast state by hand", np.allclose(s2, [[1.0, 0.5], [0.0, 1.0]], atol=1e-12))
+    check("wh_out: the last target is tanh(0.5) for both input orders",
+          np.allclose(y_out[:, 1], math.tanh(0.5), atol=1e-12), f"{y_out[:, 1]}")
+    by_hand = [0.25 * math.tanh(1.0) + 0.5 * math.tanh(0.5), 0.5 * math.tanh(1.0)]
+    check("wh_mid: the last targets are 0.4215 and 0.3808",
+          np.allclose(y_mid[:, 1], by_hand, atol=1e-12)
+          and np.allclose(y_mid[:, 1], [0.4215, 0.3808], atol=5e-5), f"{y_mid[:, 1]}")
+
+    # Independent implementation: each memory is a convolution with its impulse
+    # response, (1 - p) * p^n.
+    rng = np.random.RandomState(0)
+    alpha, beta, gain, T = 0.6, 0.9, 1.5, 40
+    x = rng.standard_normal((6, T))
+    n = np.arange(T)
+    h_fast, h_slow = (1 - alpha) * alpha ** n, (1 - beta) * beta ** n
+
+    def conv(h, v):
+        return np.stack([np.convolve(row, h)[:T] for row in v])
+
+    y_mid, s = wh_system(x, "mid", alpha, beta, gain)
+    y_out, s_out = wh_system(x, "out", alpha, beta, gain)
+    check("fast state = input convolved with the fast impulse response",
+          np.allclose(s, conv(h_fast, x), atol=1e-12) and np.array_equal(s, s_out))
+    check("wh_mid = slow filter of tanh(gain * fast state)",
+          np.allclose(y_mid, conv(h_slow, np.tanh(gain * s)), atol=1e-12))
+    check("wh_out = tanh(gain * slow filter of the fast state)",
+          np.allclose(np.arctanh(y_out) / gain, conv(h_slow, s), atol=1e-10))
+    small_mid, _ = wh_system(x, "mid", alpha, beta, 1e-3)
+    small_out, _ = wh_system(x, "out", alpha, beta, 1e-3)
+    linear_gap = float(np.abs(small_mid - small_out).max() / np.abs(small_out).max())
+    default_gap = float(np.abs(wh_system(x, "mid")[0] - wh_system(x, "out")[0]).max())
+    check("the variants coincide in the linear limit and differ at the default gain",
+          linear_gap < 1e-5 and default_gap > 0.1,
+          f"relative gap {linear_gap:.1e} at gain 1e-3, absolute gap {default_gap:.2f} at gain 6")
+
+    # Causality: a change at step k leaves every earlier target alone.
+    k = 17
+    x_late = x.copy()
+    x_late[:, k:] += 1.0
+    for variant in ("mid", "out"):
+        y0, _ = wh_system(x, variant)
+        y1, _ = wh_system(x_late, variant)
+        check(f"wh_{variant}: targets before a change are untouched, the one at it moves",
+              np.array_equal(y0[:, :k], y1[:, :k]) and bool(np.all(y0[:, k] != y1[:, k])))
+
+    # Task hooks: widths, recorded setup, batch layout.
+    mid, out = NonlinearSystemTask("mid"), NonlinearSystemTask("out")
+    check("defaults", (mid.alpha, mid.beta, mid.gain, mid.seq_len, mid.fir_order)
+          == (0.6, 0.9, 6.0, 64, 64) and mid.feat_dim == 1 and mid.n_output == 1)
+    tp, trp, npar = mid.init_params({"dt": 40}, {"valid_n_batch": 96}, {"n_neurons": [5, 20, 7]})
+    tp_out, _, _ = out.init_params({"dt": 40}, {"valid_n_batch": 96}, {"n_neurons": [5, 20, 7]})
+    check("init_params net widths", npar["n_neurons"] == [1, 20, 1] and npar["prefs"] is None,
+          f"n_neurons={npar['n_neurons']}")
+    check("init_params records the system",
+          (tp["variant"], tp["alpha"], tp["beta"], tp["gain"], tp["seq_len"], tp["valid_seed"],
+           tp["fir_order"], tp["fir_n"], tp["fir_seed"]) == ("mid", 0.6, 0.9, 6.0, 64, 1234, 64, 512, 4321)
+          and tp_out["variant"] == "out")
+
+    np.random.seed(3); xb, yb, mb = mid.train_batch(tp, trp, 8, "cpu", torch.float32)
+    np.random.seed(3); xo, yo, _ = out.train_batch(tp_out, trp, 8, "cpu", torch.float32)
+    np.random.seed(3); xr, yr, _ = mid.train_batch(tp, trp, 8, "cpu", torch.float32)
+    check("train batch shape", tuple(xb.shape) == tuple(yb.shape) == tuple(mb.shape) == (8, 64, 1),
+          f"x={tuple(xb.shape)} y={tuple(yb.shape)} mask={tuple(mb.shape)}")
+    check("every step is scored", bool((mb == 1).all()))
+    check("targets match the recurrence on the batch inputs",
+          np.allclose(yb[..., 0].numpy(), wh_system(xb[..., 0].numpy(), "mid")[0], atol=1e-5))
+    check("train batch deterministic per np-seed", torch.equal(xb, xr) and torch.equal(yb, yr))
+    check("same seed: the two variants see the same inputs and different targets",
+          torch.equal(xb, xo) and not torch.allclose(yb, yo, atol=1e-2))
+
+    # Held-out set: fixed, independent of the training RNG, shared by the variants.
+    v1 = mid.valid_batch(tp, trp, "cpu", torch.float32)
+    np.random.seed(11); np.random.standard_normal(5)
+    v2 = NonlinearSystemTask("mid").valid_batch(tp, trp, "cpu", torch.float32)
+    vo = out.valid_batch(tp_out, trp, "cpu", torch.float32)
+    check("valid batch has valid_n_batch trials", tuple(v1[0].shape) == (96, 64, 1))
+    check("valid batch fixed / reproducible", torch.equal(v1[0], v2[0]) and torch.equal(v1[1], v2[1]))
+    check("valid batch: same waveforms for both variants", torch.equal(v1[0], vo[0])
+          and not torch.allclose(v1[1], vo[1], atol=1e-2))
+    other = mid.valid_batch({**tp, "valid_seed": 99}, trp, "cpu", torch.float32)
+    check("valid_seed selects the held-out set", not torch.equal(v1[0], other[0]))
+
+    # Linear baseline: reproducible, fitted on its own data, and the zero of accuracy().
+    w, c = mid.fir_coefficients()
+    w2, c2 = NonlinearSystemTask("mid").fir_coefficients()
+    check("FIR fit reproducible", np.array_equal(w, w2) and c == c2 and w.shape == (64,))
+    check("lagged inputs hold x_{t-k}, zero before the trial",
+          np.array_equal(lagged_inputs(x2, 2), [[[2, 0], [0, 2]], [[0, 0], [2, 0]]]))
+    xv, yv = v1[0][..., 0].numpy().astype(np.float64), v1[1][..., 0].numpy().astype(np.float64)
+    check("torch and numpy FIR predictions agree",
+          np.allclose(mid.fir_predict(v1[0].double())[..., 0].numpy(), fir_predict(xv, w, c), atol=1e-10)
+          and tuple(mid.fir_predict(v1[0]).shape) == (96, 64, 1)
+          and tuple(mid.fir_predict(v1[0][..., 0]).shape) == (96, 64))
+    for task, params, v in ((mid, tp, v1), (out, tp_out, vo)):
+        mse = float(((task.fir_predict(v[0].double()) - v[1].double()) ** 2).mean())
+        r2 = 1.0 - params["fir_valid_mse"] / float(v[1].double().var(unbiased=False))
+        check(f"wh_{task.variant}: recorded fir_valid_mse is the FIR error on the held-out set",
+              abs(params["fir_valid_mse"] - mse) < 1e-6 * mse, f"{params['fir_valid_mse']:.4e} vs {mse:.4e}")
+        check(f"wh_{task.variant}: the linear filter explains about 90 % of the variance",
+              0.85 < r2 < 0.95, f"R^2 = {r2:.3f}")
+        x_in, y_true, m = v
+        check(f"wh_{task.variant}: accuracy(exact) = 1, accuracy(FIR prediction) = 0, accuracy(zero) < 0",
+              task.accuracy(None, y_true.clone(), y_true, m, x_in) == 1.0
+              and abs(task.accuracy(None, task.fir_predict(x_in), y_true, m, x_in)) < 1e-6
+              and task.accuracy(None, torch.zeros_like(y_true), y_true, m, x_in) < -1.0)
+    short = NonlinearSystemTask("mid", seq_len=16)
+    check("FIR order is capped at the sequence length",
+          short.fir_order == 16 and short.fir_coefficients()[0].shape == (16,))
+
+
 def test_registry():
     print("── registry (make_task / acc_label_for) ──")
     check("seqmnist -> SeqMNISTTask row",
@@ -316,6 +440,26 @@ def test_registry():
     check("acc_label / metric twohop",
           tasks.acc_label_for("twohop") == "classification accuracy (%)"
           and tasks.metric_for("twohop") == "accuracy")
+    wh = tasks.make_task("wh_mid")
+    check("wh_mid -> NonlinearSystemTask (alpha=0.6, beta=0.9, gain=6, T=64)",
+          isinstance(wh, tasks.NonlinearSystemTask)
+          and (wh.variant, wh.alpha, wh.beta, wh.gain, wh.seq_len) == ("mid", 0.6, 0.9, 6.0, 64))
+    check("wh_out -> the 'out' variant", tasks.make_task("wh_out").variant == "out")
+    parsed = tasks.make_task("wh_mid_b95_g2p5_T32_a50")
+    check("wh_mid_b95_g2p5_T32_a50 parses beta/gain/length/alpha",
+          (parsed.variant, parsed.alpha, parsed.beta, parsed.gain, parsed.seq_len)
+          == ("mid", 0.5, 0.95, 2.5, 32))
+    check("wh_out_b97p5 reads 'p' as the decimal point", tasks.make_task("wh_out_b97p5").beta == 0.975)
+    for bad in ("wh", "wh_foo", "wh_mid_x3", "wh_mid_b", "wh_mid_b95_b90", "wh_mid_T3p5",
+                "wh_mid_b100", "wh_mid_g0", "wh_mid_T1"):
+        try:
+            tasks.make_task(bad)
+            rejected = False
+        except ValueError:
+            rejected = True
+        check(f"malformed name {bad} is rejected", rejected)
+    check("acc_label / metric wh", tasks.acc_label_for("wh_mid") == "MSE loss"
+          and tasks.metric_for("wh_out") == "loss")
     check("ring task -> MultiTaskAdapter",
           isinstance(tasks.make_task("delaygo"), tasks.MultiTaskAdapter))
     check("acc_label seqmnist", tasks.acc_label_for("seqmnist") == "classification accuracy (%)")
@@ -398,6 +542,13 @@ def test_integration_adding():
     _integration_for("adding", t, t.n_output, steps=40)
 
 
+def test_integration_wh():
+    print("── integration: loss decreases on wh_mid / wh_out (both nets, both rules) ──")
+    for name in ("wh_mid_T24", "wh_out_T24"):
+        t = tasks.make_task(name)
+        _integration_for(name, t, t.n_output, steps=40)
+
+
 def test_integration_twohop():
     print("── integration: one real update on two-hop recall (cross-entropy) ──")
     t = tasks.make_task("twohop")
@@ -444,9 +595,11 @@ if __name__ == "__main__":
     check_seqmnist_task("pixel", 784, 1)
     test_adding_task()
     test_twohop_task()
+    test_wh_task()
     test_registry()
     test_integration_seqmnist()
     test_integration_adding()
+    test_integration_wh()
     test_integration_twohop()
     print("=" * 68)
     print(f"{'ALL TASK TESTS PASSED' if FAIL == 0 else f'{FAIL} CHECK(S) FAILED'}  "

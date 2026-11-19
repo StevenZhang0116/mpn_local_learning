@@ -27,6 +27,10 @@ device`. `torch.cuda.get_arch_list()` shows what a build supports; it must conta
 - `twohop` → two-hop associative recall (4 symbols per set, 4 blank steps before
   the query); `twohop_K<symbols>_d<delay>` changes either, e.g. `twohop_K8_d6`.
   See [Two-hop associative recall](#two-hop-associative-recall) below.
+- `wh_mid` / `wh_out` → nonlinear system identification, the two halves of a paired
+  control; `_a<percent>`, `_b<percent>`, `_g<gain>` and `_T<steps>` change the
+  system, e.g. `wh_mid_b95_g2p5_T32`.
+  See [Nonlinear system identification](#nonlinear-system-identification) below.
 
 All tasks run for all three models and both BPTT and local learning. `train_gru.py`
 trains a GRU (`core/gru.py`, PyTorch gate layout r/z/n) with the same lockstep
@@ -44,7 +48,8 @@ optimize the same objective. Before October 2026 the RNN's RFLO always used the 
 error while reporting the task loss, so earlier `train_rnn.py` seq-MNIST RFLO curves
 optimized MSE and are not comparable with new ones. Sequential MNIST
 and two-hop recall use cross-entropy at the final step; ring tasks use masked MSE
-at their scored times, and the adding problem uses final-step MSE. The task supplies the same
+at their scored times, the adding problem uses final-step MSE, and the
+nonlinear-system tasks use MSE at every step. The task supplies the same
 objective to all learning rules. The adding problem is a long-range
 credit-assignment benchmark: its BPTT-vs-local gap should widen with sequence
 length — the central question this project studies.
@@ -86,6 +91,57 @@ which the two kinds weigh equally: solving one-hop while guessing two-hop gives
 `0.5 + 0.5/K`, 62.5 % at `K = 4`. `TwoHopRecallTask.query_accuracy(output, labels,
 inputs)` returns the two accuracies separately; it is not called by the training
 loop, so apply it to a saved checkpoint's outputs on the held-out batch.
+
+## Nonlinear system identification
+
+`--task wh_mid` and `--task wh_out` (`scripts/tasks/nonlinear_system_tasks.py`) ask the
+network to imitate a hidden system online. Each trial is a fresh white-noise
+waveform `x_t ~ N(0, 1)`, one scalar per step; the network sees only `x_t` and
+predicts `y_t` at every step. The system has a fast memory, a slow memory and one
+saturating nonlinearity, and starts each trial at zero:
+
+```
+fast memory   s_t = alpha * s_{t-1} + (1 - alpha) * x_t
+
+wh_mid        y_t = beta * y_{t-1} + (1 - beta) * tanh(gain * s_t)
+wh_out        r_t = beta * r_{t-1} + (1 - beta) * s_t,    y_t = tanh(gain * r_t)
+```
+
+The two tasks are a paired control: the same waveforms (for the same seed and
+architecture), the same two memories and the same supervision; only the place of
+the nonlinearity moves. In `wh_out` the two memories merge into one linear filter
+and the nonlinearity is applied once, at the output. In `wh_mid` the slow memory
+accumulates a signal that has already been transformed, so a large input counts
+no more than a moderate one.
+
+| Name fragment | Sets | Default |
+|---|---|---|
+| `_a<percent>` | `alpha`, the fast memory | 0.6 (`_a60`) |
+| `_b<percent>` | `beta`, the slow memory | 0.9 (`_b90`) |
+| `_g<gain>` | `gain`, the input scale of the `tanh` | 6 |
+| `_T<steps>` | sequence length | 64 |
+
+`p` is the decimal point (`_g2p5`, `_b97p5`); the fragments go in any order after
+`wh_mid` or `wh_out`.
+
+The loss is the MSE over all steps, and the training loop plots it. The console's
+accuracy columns show the skill relative to the best causal linear filter,
+`1 - MSE_model / MSE_FIR`, on the same batch: 0 is as good as a linear filter, 1
+is exact, and a network worse than the linear filter scores below 0 (an untrained
+one far below). At the defaults a linear filter already explains about 90 % of the
+target variance in both tasks, so the skill, not the raw MSE or R², says how much
+of the nonlinear part was learned. The filter (`fir_order` lags plus an intercept)
+is fitted by least squares on `fir_n` sequences from `fir_seed`, independent of the
+training and held-out data. Its held-out MSE is saved as
+`task_params.fir_valid_mse`, next to `variant`, `alpha`, `beta`, `gain`, `seq_len`
+and `valid_seed`, so `1 - valid_MSE / fir_valid_mse` turns a saved validation
+curve into the skill.
+
+At `gain = 6` the two tasks have the same linear baseline but not the same
+saturation: the `tanh` argument has a standard deviation of about 3.0 in `wh_mid`
+and 1.25 in `wh_out`. `wh_mid_g2p5` matches the argument scale of the default
+`wh_out` instead. `NonlinearSystemTask.targets(x)` also returns the fast state
+`s_t`, which the training loop does not use.
 
 ## Batch size and long sequences
 

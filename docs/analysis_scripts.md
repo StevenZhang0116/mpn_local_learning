@@ -196,8 +196,8 @@ trace entry over time for the three variants, and each variant's gradient cosine
 BPTT. CPU is fine; it is a single-batch diagnostic, not a training run.
 
 `--task` accepts any training task, and every gradient is taken under that task's own
-objective, as in training: masked MSE for the ring tasks and the adding problem,
-final-step cross-entropy for `seqmnist` and `twohop`. The summary's `loss` field and
+objective, as in training: masked MSE for the ring tasks, the adding problem and
+`wh_mid` / `wh_out`, final-step cross-entropy for `seqmnist` and `twohop`. The summary's `loss` field and
 the cosine panel's title name it. The loop gains and the traces do not depend on the
 loss; the gradient cosines and norms do. Before November 2026 the script always used
 masked MSE, so cosines it reported for `seqmnist` did not describe the trained

@@ -8,7 +8,7 @@ the project root (the ``mpn_local_learning`` directory, recognized by
   scripts/training/  the training entry points (``train_mpn``, ``train_rnn``,
                      ``train_gru``) and their shared loop (``train_common``)
   scripts/tasks/     the task adapters (``tasks``, ``adding_tasks``,
-                     ``associative_recall_tasks``)
+                     ``associative_recall_tasks``, ``nonlinear_system_tasks``)
 
 so every module keeps its flat name (``import train_mpn``, ``import tasks``)
 wherever the importing file lives. It also exposes ``ROOT`` so output dirs

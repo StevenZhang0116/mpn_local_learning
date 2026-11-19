@@ -26,9 +26,10 @@ with or without --mp-input-norm rms, all three variants stay bounded and aligned
 --mp-input-norm-skip-first take the same values as train_mpn.py.
 
 Every gradient here is taken under the TASK'S OWN objective, as in training:
-masked MSE for the ring tasks and the adding problem, final-step cross-entropy
-for seqmnist and twohop (the summary's `loss` field names it). The loop gains and
-the traces do not depend on the loss; the gradient cosines and norms do.
+masked MSE for the ring tasks, the adding problem and wh_mid / wh_out, final-step
+cross-entropy for seqmnist and twohop (the summary's `loss` field names it). The
+loop gains and the traces do not depend on the loss; the gradient cosines and
+norms do.
 
 Run from the project root, e.g.
     python notebooks/rflo_trace_gain.py --task contextdelaydm1 --hidden 128 128 128
