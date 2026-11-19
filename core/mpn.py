@@ -571,17 +571,17 @@ class MultiPlasticLayer(BaseNetworkFunctions):
 
     # Advance the 4-D trace P in place (no P-sized temporary). False selects the
     # reference out-of-place arithmetic, which is also what runs whenever autograd
-    # tracks the operands or a smooth write is combined with an update mask.
+    # is recording or a smooth write is combined with an update mask.
     exact_trace_inplace = True
 
-    def _exact_trace_inplace_ok(self, *operands):
-        """The temporary-free P arithmetic applies: switched on, P is not part of
-        an autograd graph, and this operation would not be recorded either (an
-        in-place write would invalidate a recorded graph). Parameters such as W
-        keep requires_grad under no_grad, hence the is_grad_enabled test."""
-        if not self.exact_trace_inplace or self.P.requires_grad:
-            return False
-        return not (torch.is_grad_enabled() and any(t.requires_grad for t in operands))
+    def _exact_trace_inplace_ok(self):
+        """The temporary-free P arithmetic applies: switched on, autograd is off
+        (the local passes run under no_grad), and P is not already part of a graph.
+        With autograd on, the reference path runs whatever the operands are: an
+        in-place write would invalidate any graph that saved the previous P, and a
+        per-operand test is easy to leave incomplete (the update mask, the gate)."""
+        return (self.exact_trace_inplace and not torch.is_grad_enabled()
+                and not self.P.requires_grad)
 
     def _advance_exact_trace(self, x, E, eta, lam, update_mask):
         """P^I_{iJ} <- lam_{iJ} P^I_{iJ} + a eta_{iJ} x_J E^I_i, shared by the fused
@@ -598,11 +598,12 @@ class MultiPlasticLayer(BaseNetworkFunctions):
         A hard/linear write mixes new and old BEFORE its gate, so its update mask m
         folds into the two factors: decay = m lam + (1-m), write = m a eta x. A
         smooth (scaled_tanh) write mixes AFTER the gate and needs the old P, so
-        that combination keeps the reference path."""
+        that combination keeps the reference path; so does every call made with
+        autograd on or with the switch off (_exact_trace_inplace_ok)."""
         a = self._assoc  # 0 for hebb_pre → dM/dW = 0, the trace stays zero
         P = self.P
         smooth_masked = self.m_act == 'scaled_tanh' and update_mask is not None
-        if smooth_masked or not self._exact_trace_inplace_ok(E, x, eta, lam):
+        if smooth_masked or not self._exact_trace_inplace_ok():
             outerP = torch.einsum('BiI,BJ->BiIJ', E, x)            # x_J E^I_i
             P_new = lam[None, :, None, :] * P + a * eta[None, :, None, :] * outerP
             self.P = self._prepare_local_trace('P', P_new, P, update_mask)
@@ -618,7 +619,7 @@ class MultiPlasticLayer(BaseNetworkFunctions):
     def _gate_local_trace(self, name, trace, gate):
         """trace * gate; in place for the 4-D P (the caller owns it: it is either
         the live trace just advanced in place or a freshly built one)."""
-        if name == 'P' and self._exact_trace_inplace_ok(gate):
+        if name == 'P' and self._exact_trace_inplace_ok():
             return trace.mul_(gate)
         return trace * gate
 
