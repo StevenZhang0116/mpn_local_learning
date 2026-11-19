@@ -25,6 +25,11 @@ with or without --mp-input-norm rms, all three variants stay bounded and aligned
 (docs/mp_input_norm.md, "Measurements"). --eta / --lam / --mp-input-norm /
 --mp-input-norm-skip-first take the same values as train_mpn.py.
 
+Every gradient here is taken under the TASK'S OWN objective, as in training:
+masked MSE for the ring tasks and the adding problem, final-step cross-entropy
+for seqmnist and twohop (the summary's `loss` field names it). The loop gains and
+the traces do not depend on the loss; the gradient cosines and norms do.
+
 Run from the project root, e.g.
     python notebooks/rflo_trace_gain.py --task contextdelaydm1 --hidden 128 128 128
     python notebooks/rflo_trace_gain.py --task adding_L200 --batch 16 --rho 0.99
@@ -80,14 +85,29 @@ def build(task_name, widths, rule, rho, seed, batch, residual=False, device="cpu
     return net, (x, y, mask)
 
 
+def task_loss(task_name):
+    """(loss_kw, name) for a task, following train_common.run_seed: a task whose
+    loss_and_grad is None uses the net's default masked MSE (empty kwargs keep the
+    local rules on their single-pass path); any other task passes its own loss to
+    every gradient call."""
+    fn = getattr(tasks.make_task(task_name), "loss_and_grad", None)
+    if fn is None:
+        return {}, "masked_mse"
+    name = fn.__name__
+    for suffix in ("_loss_and_output_grad", "_loss_and_grad"):
+        name = name[:-len(suffix)] if name.endswith(suffix) else name
+    return {"loss_and_grad": fn}, name
+
+
 def _lam_scalar(lam):
     """lam arrives as the (i, I) expansion; the train configs use a scalar lambda."""
     return lam[:, :1]
 
 
-def record_diag(net, x, y, mask):
+def record_diag(net, x, y, mask, **loss_kw):
     """Run the diagonal RFLO pass once, recording per layer and step the diagonal
-    gain, the exact row gain, their fractions above 1, and max|A|."""
+    gain, the exact row gain, their fractions above 1, and max|A|. loss_kw: see
+    task_loss() (empty for the default masked MSE)."""
     rec = [dict(frac_diag=[], frac_row=[], maxA=[], diag_gain=[], row_gain=[])
            for _ in net.mp_layers]
     originals = []
@@ -111,7 +131,7 @@ def record_diag(net, x, y, mask):
         layer.step_fn_for = (lambda mode, _s=spy, _o=orig_sel: _s if mode == "diag" else _o(mode))
         originals.append((layer, orig_sel))
     try:
-        grads = net.local_diag_rflo_gradients(x, y, mask)
+        grads = net.local_diag_rflo_gradients(x, y, mask, **loss_kw)
     finally:
         for layer, orig_sel in originals:
             layer.step_fn_for = orig_sel
@@ -123,9 +143,10 @@ def record_diag(net, x, y, mask):
     return grads, rec
 
 
-def record_exact(net, x, y, mask):
+def record_exact(net, x, y, mask, **loss_kw):
     """Run the exact row-local pass once, recording per layer and step max|P| and
-    max|diag(P)| (the entries the diagonal trace A approximates)."""
+    max|diag(P)| (the entries the diagonal trace A approximates). loss_kw: see
+    task_loss()."""
     rec = [dict(maxP=[], maxPdiag=[]) for _ in net.mp_layers]
     originals = []
     for n, layer in enumerate(net.mp_layers):
@@ -140,7 +161,7 @@ def record_exact(net, x, y, mask):
         layer.step_fn_for = (lambda mode, _s=spy, _o=orig_sel: _s if mode == "exact" else _o(mode))
         originals.append((layer, orig_sel))
     try:
-        grads = net.local_gradients(x, y, mask)
+        grads = net.local_gradients(x, y, mask, **loss_kw)
     finally:
         for layer, orig_sel in originals:
             layer.step_fn_for = orig_sel
@@ -153,19 +174,20 @@ def record_exact(net, x, y, mask):
 def analyze(task_name, widths=(128, 128, 128), batch=16, seed=0, rho=0.99, residual=False,
             device="cpu", dtype=torch.float32, overrides=None):
     """All measurements for one task/batch: three local variants on identical
-    init and data, plus the BPTT reference. Returns a JSON-safe summary and the
-    per-step curves. overrides: see build()."""
+    init and data, plus the BPTT reference, all under the task's own loss. Returns
+    a JSON-safe summary and the per-step curves. overrides: see build()."""
     L = len(widths)
+    loss_kw, loss_name = task_loss(task_name)
     net_exact, (x, y, mask) = build(task_name, widths, "local_exact_rowlocal", None, seed, batch, residual, device, dtype, overrides=overrides)
     net_diag, _ = build(task_name, widths, "local_diag_rflo", None, seed, batch, residual, device, dtype, overrides=overrides)
     net_cap, _ = build(task_name, widths, "local_diag_rflo", rho, seed, batch, residual, device, dtype, overrides=overrides)
     for other in (net_diag, net_cap):          # same init by construction (same seed); assert it
         for k, p in net_exact._trainable_params().items():
             assert torch.equal(other._trainable_params()[k], p), k
-    g_exact, rec_exact = record_exact(net_exact, x, y, mask)
-    g_diag, rec_diag = record_diag(net_diag, x, y, mask)
-    g_cap, rec_cap = record_diag(net_cap, x, y, mask)
-    ref = net_exact.bptt_gradients(x, y, mask)
+    g_exact, rec_exact = record_exact(net_exact, x, y, mask, **loss_kw)
+    g_diag, rec_diag = record_diag(net_diag, x, y, mask, **loss_kw)
+    g_cap, rec_cap = record_diag(net_cap, x, y, mask, **loss_kw)
+    ref = net_exact.bptt_gradients(x, y, mask, **loss_kw)
     keys = ["W" if n == 0 else f"W{n}" for n in range(L)]
     cos = {name: tc.cosine_alignment(g, ref, keys)
            for name, g in (("exact", g_exact), ("diag", g_diag), ("capped", g_cap))}
@@ -188,7 +210,7 @@ def analyze(task_name, widths=(128, 128, 128), batch=16, seed=0, rho=0.99, resid
             grad_norm={name: norms[name][keys[n]] for name in norms},
         ))
     summary = dict(task=task_name, T=int(T), batch=int(batch), widths=[int(w) for w in widths], seed=seed,
-                   rho=rho, residual=residual, dtype=str(dtype),
+                   rho=rho, residual=residual, dtype=str(dtype), loss=loss_name,
                    mp_input_norm=net_exact.mp_input_norm,
                    mp_input_norm_skip_first=bool(getattr(net_exact, "mp_input_norm_skip_first", False)),
                    eta=float(net_exact.mp_layers[0].eta.mean()), lam=float(net_exact.mp_layers[0].lam.mean()),
@@ -278,7 +300,8 @@ def plot(summary, curves, path):
         ax.set_xticklabels([t for t, *_ in names], fontsize=8, color=MUTED)
         ax.set_ylim(min(0, min(vals) - 0.1), 1.25)
         ax.axhline(0, color=GRID, lw=0.8)
-        ax.set_title("gradient cosine with BPTT (this batch)" if n == 0 else "", color=TEXT, fontsize=9)
+        ax.set_title(f"gradient cosine with BPTT ({summary['loss'].replace('_', ' ')}, this batch)"
+                     if n == 0 else "", color=TEXT, fontsize=9)
         _style(ax)
         ax.grid(False, axis="x")
     fig.suptitle(f"{summary['task']}: diagonal-RFLO trace gain vs the exact row-local trace  "
@@ -312,7 +335,7 @@ def run(task_name, widths, batch, seed, rho, residual, output_dir=None, device="
         json.dump(tc._json_safe(summary), fh, indent=2)
     np.savez(out / f"{tag}_curves.npz", **{k: v for k, v in curves.items() if k not in ("diag_gain", "row_gain", "keys")},
              keys=np.asarray(curves["keys"]))
-    print(f"Saved figure: {fig_path}")
+    print(f"Saved figure: {fig_path}   (gradients under {summary['loss']})")
     for lay in summary["layers"]:
         print(f"  {lay['key']:3s} gain>1: row {100 * lay['frac_row_gain_gt1']:.1f}% diag {100 * lay['frac_diag_gain_gt1']:.1f}% | "
               f"max|A| end: no cap {lay['maxA_uncapped']['end']:.2e} cap {lay['maxA_capped']['end']:.2e} | "

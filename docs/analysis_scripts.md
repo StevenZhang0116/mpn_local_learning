@@ -195,6 +195,14 @@ per MP layer, the ECDFs of both gains, the fraction above 1 per step, the larges
 trace entry over time for the three variants, and each variant's gradient cosine with
 BPTT. CPU is fine; it is a single-batch diagnostic, not a training run.
 
+`--task` accepts any training task, and every gradient is taken under that task's own
+objective, as in training: masked MSE for the ring tasks and the adding problem,
+final-step cross-entropy for `seqmnist` and `twohop`. The summary's `loss` field and
+the cosine panel's title name it. The loop gains and the traces do not depend on the
+loss; the gradient cosines and norms do. Before November 2026 the script always used
+masked MSE, so cosines it reported for `seqmnist` did not describe the trained
+objective.
+
 ## Test RFLO scaling in a single MP layer
 
 ```bash
