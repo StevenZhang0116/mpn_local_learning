@@ -34,8 +34,8 @@ Readout gradients are always exact. `--mp-type mult` (default) uses
   `rnn.py` (LeakyRNN), `gru.py` (GRU with BPTT and a GRU-specific RFLO),
   `mpn_tasks.py`, `net_helpers.py`, `helper.py`, `run_logging.py`.
 - `scripts/` — `train_mpn.py`, `train_rnn.py`, `train_gru.py` (lockstep BPTT-vs-local
-  over N seeds), `train_common.py` (shared train/plot machinery), `tasks.py` and
-  `adding_tasks.py` (task adapters).
+  over N seeds), `train_common.py` (shared train/plot machinery), `tasks.py`,
+  `adding_tasks.py` and `associative_recall_tasks.py` (task adapters).
 - `notebooks/` — standalone analysis scripts (trained-network figures, gradient and
   trace diagnostics, MPN-vs-RNN curves).
 - `tests/` — rule-correctness and integration tests; see [tests/README.md](tests/README.md).
@@ -63,7 +63,8 @@ python tests/run_all.py                                  # the whole test suite
 Install the dependencies with `pip install -r requirements.txt`.
 
 `--task` takes a ring-task name (`delaygo`, `contextdelaydm1`, …), `seqmnist` /
-`seqmnist_pixel`, or `adding` / `adding_L<len>_m<marks>`. `--hidden` sets the MP
+`seqmnist_pixel`, `adding` / `adding_L<len>_m<marks>`, or `twohop` /
+`twohop_K<symbols>_d<delay>`. `--hidden` sets the MP
 stack (one width per MP layer). Every rule in a command starts from the same
 initialization and sees the same data. One invocation writes one run ID,
 `<model>_<task>_<YYYYMMDD_HHMMSS>_<hash>`, shared by `figure/`, `figure_data/`,

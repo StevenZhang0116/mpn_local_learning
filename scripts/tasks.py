@@ -37,6 +37,8 @@ The objective is per-task by design; different tasks need not share one loss.
 `make_task(ruleset)` maps the RULESET string to the right Task:
     'seqmnist'         -> SeqMNISTTask(mode='row')    28 steps of 28 pixels
     'seqmnist_pixel'   -> SeqMNISTTask(mode='pixel')  784 steps of 1 pixel
+    'adding[_L..][_m..]' -> AddingProblemTask         the adding problem
+    'twohop[_K..][_d..]' -> TwoHopRecallTask          two-hop associative recall
     anything else      -> MultiTaskAdapter()          the ring tasks (unchanged)
 """
 import os
@@ -48,6 +50,7 @@ import torch
 
 import mpn_tasks
 from adding_tasks import AddingProblemTask
+from associative_recall_tasks import TwoHopRecallTask
 from mpn import masked_cross_entropy_loss_and_grad
 
 
@@ -247,10 +250,33 @@ def _adding_task(ruleset):
     return AddingProblemTask(seq_len=seq_len, n_marks=n_marks)
 
 
+def is_twohop(ruleset):
+    """True if the RULESET string names a two-hop recall variant."""
+    return str(ruleset).lower().split("_")[0] == "twohop"
+
+
+def _twohop_task(ruleset):
+    """Build a TwoHopRecallTask from the RULESET string. Bare 'twohop' uses the
+    defaults (4 symbols per set, 4 blank steps before the query); 'twohop_K8_d6'
+    -> n_symbols=8, delay=6 (the 'K<symbols>' and 'd<delay>' fragments are both
+    optional, any order)."""
+    fragments = str(ruleset).lower().split("_")[1:]
+    values = {}
+    for fragment in fragments:
+        m = re.fullmatch(r"([kd])(\d+)", fragment)
+        if m is None or m.group(1) in values:
+            raise ValueError(f"cannot parse two-hop task name {ruleset!r}; "
+                             "use twohop, twohop_K<symbols>, twohop_d<delay> "
+                             "or twohop_K<symbols>_d<delay>")
+        values[m.group(1)] = int(m.group(2))
+    return TwoHopRecallTask(n_symbols=values.get("k", 4), delay=values.get("d", 4))
+
+
 def make_task(ruleset):
     """Map a RULESET string to a Task:
       'seqmnist' / 'seqmnist_pixel' -> SeqMNISTTask (row / pixel)
       'adding' (or 'adding_L<len>_m<marks>') -> AddingProblemTask
+      'twohop' (or 'twohop_K<symbols>_d<delay>') -> TwoHopRecallTask
       anything else                 -> multitask ring-task pipeline (unchanged)."""
     key = str(ruleset).lower()
     if key in ("seqmnist", "smnist", "mnist"):
@@ -259,6 +285,8 @@ def make_task(ruleset):
         return SeqMNISTTask(mode="pixel")
     if is_adding(key):
         return _adding_task(key)
+    if is_twohop(key):
+        return _twohop_task(key)
     return MultiTaskAdapter()
 
 

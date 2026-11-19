@@ -23,7 +23,10 @@ device`. `torch.cuda.get_arch_list()` shows what a build supports; it must conta
 - `seqmnist` (28 rows × 28 px) or `seqmnist_pixel` (784 × 1 px) → sequential MNIST
   (reads the raw idx files directly, no torchvision);
 - `adding` → the adding problem (seq_len=200, 2 marks); `adding_L<len>_m<marks>`
-  sweeps the sequence length / mark count, e.g. `adding_L500_m3`.
+  sweeps the sequence length / mark count, e.g. `adding_L500_m3`;
+- `twohop` → two-hop associative recall (4 symbols per set, 4 blank steps before
+  the query); `twohop_K<symbols>_d<delay>` changes either, e.g. `twohop_K8_d6`.
+  See [Two-hop associative recall](#two-hop-associative-recall) below.
 
 All tasks run for all three models and both BPTT and local learning. `train_gru.py`
 trains a GRU (`core/gru.py`, PyTorch gate layout r/z/n) with the same lockstep
@@ -40,11 +43,49 @@ loss (seq-MNIST's cross-entropy) through a forward-only pre-pass, so RFLO and BP
 optimize the same objective. Before October 2026 the RNN's RFLO always used the MSE
 error while reporting the task loss, so earlier `train_rnn.py` seq-MNIST RFLO curves
 optimized MSE and are not comparable with new ones. Sequential MNIST
-uses cross-entropy at the final step; ring tasks use masked MSE at their scored
-times, and the adding problem uses final-step MSE. The task supplies the same
+and two-hop recall use cross-entropy at the final step; ring tasks use masked MSE
+at their scored times, and the adding problem uses final-step MSE. The task supplies the same
 objective to all learning rules. The adding problem is a long-range
 credit-assignment benchmark: its BPTT-vs-local gap should widen with sequence
 length — the central question this project studies.
+
+## Two-hop associative recall
+
+`--task twohop` (`scripts/associative_recall_tasks.py`) separates one memory lookup
+from two under an identical memory load. Each trial draws two fresh random
+permutations, `f: A -> B` and `g: B -> C`, over `K` symbols per set:
+
+| Steps | Input |
+|---|---|
+| `0 .. K-1` | the `K` pairs `(A_a, B_f(a))`, in random order |
+| `K .. 2K-1` | the `K` pairs `(B_b, C_g(b))`, in random order |
+| next `delay` steps | blank |
+| final step | the query: one symbol |
+
+| Query | Final input | Answer |
+|---|---|---|
+| one-hop | `B_b` | `C_g(b)` |
+| two-hop | `A_a`, with `b = f(a)` | the same `C_g(f(a))` |
+
+The input has one channel per symbol (`3K` in all): a pair step lights two, the
+query one. The output is a `K`-way classification scored with cross-entropy on the
+final step only, so chance is `1/K`. The `A -> B` table always comes first: with
+the opposite order a network could look `C` up while the `(A, B)` pair is shown and
+store it under the key `A`, which would turn the two-hop query into a single lookup.
+
+Training trials are two-hop with probability 0.5. The held-out set is fixed
+(`task_params.valid_seed`, default 1234) and paired: each stored history is asked
+once per query kind, with the same queried symbol and the same answer. The first
+half of the batch holds the one-hop trials and the second half the two-hop trials
+of the same histories, so a difference between the two halves is a difference in
+the number of lookups and nothing else. `K`, the delay and the two-hop probability
+are saved in `task_params` (`n_symbols`, `delay`, `p_two_hop`).
+
+The training loop logs and plots the accuracy over the whole held-out set, in
+which the two kinds weigh equally: solving one-hop while guessing two-hop gives
+`0.5 + 0.5/K`, 62.5 % at `K = 4`. `TwoHopRecallTask.query_accuracy(output, labels,
+inputs)` returns the two accuracies separately; it is not called by the training
+loop, so apply it to a saved checkpoint's outputs on the held-out batch.
 
 ## Batch size and long sequences
 
