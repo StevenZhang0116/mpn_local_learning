@@ -27,7 +27,10 @@ What is optimized (vs mpn_archive.py), all result-preserving:
     - local_direct / local_diag_rflo FUSE eligibility+grad+trace into
       local_grad_step_fast WITHOUT materializing the (B,i,I) E tensor:
       direct contracts ℓ·φ'·(1+M)·x directly; diag reuses factor=1+M+W·A for
-      both grad_W and the A-update. exact still builds E/P (algorithmic).
+      both grad_W and the A-update. exact still builds E/P (algorithmic), but
+      advances the (B,i,I,J) trace P IN PLACE: one scaling along J plus one
+      rank-one term, no P-sized temporary (_advance_exact_trace; same values up
+      to rounding; exact_trace_inplace=False keeps the out-of-place arithmetic).
     - update_M_matrix_local_fast skips the general activation/update branches
       in the local config (mult, linear m_act, Hebbian updates); optional bounds
       and frozen plastic states share their derivative gates with local traces.
@@ -482,6 +485,7 @@ class MultiPlasticLayer(BaseNetworkFunctions):
         Q is None when local_bias_mode='direct'; 'match' selects exact here.
         """
         dev, dt = self.W.device, self.W.dtype
+        self.P = None   # release the previous sequence's trace before allocating the next
         self.P = torch.zeros(B, self.n_output, self.n_input, self.n_input, device=dev, dtype=dt)
         self._local_trace_name = 'P'
         self._local_traces_pending = False
@@ -557,16 +561,66 @@ class MultiPlasticLayer(BaseNetworkFunctions):
 
         Call AFTER compute_exact_rowlocal_eligibility, in step with
         update_M_matrix. update_mask (B,) freezes traces for inactive batch rows.
+        P is normally advanced IN PLACE (see _advance_exact_trace for the
+        exceptions), so a caller that needs the previous trace must clone it first.
         eta_lam: optional precomputed (eta, lam) from _eta_lam_full() — eta/lam are
         constant during an unroll, so the loop hoists this out (identical values)."""
         eta, lam = eta_lam if eta_lam is not None else self._eta_lam_full()  # each (i, J)
-        a = self._assoc  # 0 for hebb_pre → dM/dW = dM/db = 0, traces stay zero
-
-        outerP = torch.einsum('BiI,BJ->BiIJ', E, x)            # x_J E^I_i
-        P_new = lam[None, :, None, :] * self.P + a * eta[None, :, None, :] * outerP
-
-        self.P = self._prepare_local_trace('P', P_new, self.P, update_mask)
+        self._advance_exact_trace(x, E, eta, lam, update_mask)
         self._advance_local_bias_trace(x, R, eta, lam, update_mask)
+
+    # Advance the 4-D trace P in place (no P-sized temporary). False selects the
+    # reference out-of-place arithmetic, which is also what runs whenever autograd
+    # tracks the operands or a smooth write is combined with an update mask.
+    exact_trace_inplace = True
+
+    def _exact_trace_inplace_ok(self, *operands):
+        """The temporary-free P arithmetic applies: switched on, P is not part of
+        an autograd graph, and this operation would not be recorded either (an
+        in-place write would invalidate a recorded graph). Parameters such as W
+        keep requires_grad under no_grad, hence the is_grad_enabled test."""
+        if not self.exact_trace_inplace or self.P.requires_grad:
+            return False
+        return not (torch.is_grad_enabled() and any(t.requires_grad for t in operands))
+
+    def _advance_exact_trace(self, x, E, eta, lam, update_mask):
+        """P^I_{iJ} <- lam_{iJ} P^I_{iJ} + a eta_{iJ} x_J E^I_i, shared by the fused
+        step and update_exact_rowlocal_traces. The write gate is applied later by
+        _finalize_local_traces (it needs this step's M write).
+
+        P is (B, i, I, J): the decay and the write factor depend on the STATE index
+        J only, so the update is one scaling along J plus one rank-one term per
+        (batch, row): P.mul_(decay).addcmul_(E, write). Nothing P-sized is
+        allocated; the reference path allocates four P-sized tensors per step
+        (x_J E^I_i, the two products and their sum, which becomes the new P).
+        Both give the same trace up to rounding.
+
+        A hard/linear write mixes new and old BEFORE its gate, so its update mask m
+        folds into the two factors: decay = m lam + (1-m), write = m a eta x. A
+        smooth (scaled_tanh) write mixes AFTER the gate and needs the old P, so
+        that combination keeps the reference path."""
+        a = self._assoc  # 0 for hebb_pre → dM/dW = 0, the trace stays zero
+        P = self.P
+        smooth_masked = self.m_act == 'scaled_tanh' and update_mask is not None
+        if smooth_masked or not self._exact_trace_inplace_ok(E, x, eta, lam):
+            outerP = torch.einsum('BiI,BJ->BiIJ', E, x)            # x_J E^I_i
+            P_new = lam[None, :, None, :] * P + a * eta[None, :, None, :] * outerP
+            self.P = self._prepare_local_trace('P', P_new, P, update_mask)
+            return
+        decay = lam.unsqueeze(0)                                   # (1, i, J)
+        write = (a * eta).unsqueeze(0) * x.unsqueeze(1)            # (B, i, J)
+        if update_mask is not None:
+            m = update_mask.view(-1, 1, 1).to(dtype=P.dtype, device=P.device)
+            decay = m * decay + (1.0 - m)                          # (B, i, J)
+            write = m * write
+        P.mul_(decay.unsqueeze(2)).addcmul_(E.unsqueeze(-1), write.unsqueeze(2))
+
+    def _gate_local_trace(self, name, trace, gate):
+        """trace * gate; in place for the 4-D P (the caller owns it: it is either
+        the live trace just advanced in place or a freshly built one)."""
+        if name == 'P' and self._exact_trace_inplace_ok(gate):
+            return trace.mul_(gate)
+        return trace * gate
 
     # ─── Diagonal / same-synapse RFLO approximation ──────────────────────────
     # Replaces the exact fourth-order trace P^I_{iJ} (B,post,pre,pre) with a
@@ -804,7 +858,7 @@ class MultiPlasticLayer(BaseNetworkFunctions):
             frozen = getattr(self, '_plasticity_freeze_mask', None)
             for name in names:
                 gate = write_gate.unsqueeze(-2) if name == 'P' else write_gate
-                advanced = getattr(self, name) * gate
+                advanced = self._gate_local_trace(name, getattr(self, name), gate)
                 if name in self._smooth_trace_previous:
                     old, mask = self._smooth_trace_previous[name]
                     mask_fn = self._apply_update_mask_4d if name == 'P' else self._apply_update_mask_3d
@@ -819,9 +873,9 @@ class MultiPlasticLayer(BaseNetworkFunctions):
             self._local_traces_pending = False
             return
         if write_gate is not None:
-            trace = getattr(self, self._local_trace_name)
-            gate = write_gate.unsqueeze(-2) if self._local_trace_name == 'P' else write_gate
-            setattr(self, self._local_trace_name, trace * gate)
+            name = self._local_trace_name
+            gate = write_gate.unsqueeze(-2) if name == 'P' else write_gate
+            setattr(self, name, self._gate_local_trace(name, getattr(self, name), gate))
             if self.Q is not None:
                 self.Q = self.Q * write_gate
         self._local_traces_pending = False
@@ -868,16 +922,12 @@ class MultiPlasticLayer(BaseNetworkFunctions):
 
     def _local_step_exact(self, x, phi_prime, ell, eta, lam, update_mask=None):
         """Exact row-local: E is still built (the full P trace update needs it),
-        but eta/lam are reused and the P/Q update is done inline."""
-        a = self._assoc
+        eta/lam are reused, and P is advanced in place (_advance_exact_trace)."""
         E, R = self.compute_exact_rowlocal_eligibility(x, phi_prime)
         grad_W_t = torch.einsum('Bi,BiI->iI', ell, E)
         grad_b_t = torch.einsum('Bi,Bi->i', ell, R)
 
-        P_prev = self.P
-        outerP = torch.einsum('BiI,BJ->BiIJ', E, x)
-        P_new = lam[None, :, None, :] * P_prev + a * eta[None, :, None, :] * outerP
-        self.P = self._prepare_local_trace('P', P_new, P_prev, update_mask)
+        self._advance_exact_trace(x, E, eta, lam, update_mask)
         self._advance_local_bias_trace(x, R, eta, lam, update_mask)
         return grad_W_t, grad_b_t
 
