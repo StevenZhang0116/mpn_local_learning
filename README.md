@@ -37,7 +37,8 @@ Readout gradients are always exact. `--mp-type mult` (default) uses
   BPTT-vs-local over N seeds) and `train_common.py` (shared train/plot machinery).
 - `scripts/tasks/` — the task adapters: `tasks.py` (registry, ring tasks, sequential
   MNIST), `adding_tasks.py`, `associative_recall_tasks.py` and
-  `nonlinear_system_tasks.py`.
+  `nonlinear_system_tasks.py`; `illustrations/` holds the scripts that draw a task
+  and the figures they write.
 - `notebooks/` — standalone analysis scripts (trained-network figures, gradient and
   trace diagnostics, MPN-vs-RNN curves).
 - `tests/` — rule-correctness and integration tests; see [tests/README.md](tests/README.md).

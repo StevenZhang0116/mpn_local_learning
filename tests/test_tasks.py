@@ -23,6 +23,8 @@ local rule on a two-MP-layer net, the RNN and the GRU). The nonlinear-system
 tasks (wh_mid / wh_out) are checked against the two recurrences by hand and
 against an independent convolution, for causality, for the pairing of the two
 variants, and for the linear (FIR) baseline that accuracy() is measured against.
+The two-hop illustration script (scripts/tasks/illustrations) is checked for the
+example it draws and for writing its figure.
 
 Run from this directory (mpn_local_learning/tests):  python test_tasks.py
 """
@@ -284,6 +286,39 @@ def test_twohop_task():
     only_one = t.query_accuracy(yv[:n], yv[:n], xv[:n])
     check("query_accuracy gives nan for an absent kind",
           only_one["one_hop"] == 1.0 and math.isnan(only_one["two_hop"]))
+
+
+def test_twohop_illustration():
+    """scripts/tasks/illustrations/plot_twohop_task.py: the example it draws is one
+    stored history asked both ways, and the script writes its figure."""
+    import importlib.util
+    import tempfile
+    path = _bootstrap.ROOT / "scripts" / "tasks" / "illustrations" / "plot_twohop_task.py"
+    spec = importlib.util.spec_from_file_location("plot_twohop_task", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    K, delay = 4, 4
+    trial = module.example_trial(K, delay, seed=8)
+    one, two = trial["one_hop"], trial["two_hop"]
+    a, b, c = trial["a"], trial["b"], trial["c"]
+    check("illustration: the two trials share every step except the query",
+          one.shape == (2 * K + delay + 1, 3 * K) and np.array_equal(one[:-1], two[:-1])
+          and not np.array_equal(one[-1], two[-1]))
+    check("illustration: the route it draws is the stored one (b = f[a], c = g[b])",
+          trial["f"][a] == b and trial["g"][b] == c)
+    check("illustration: the queries are B_b (one-hop) and A_a (two-hop)",
+          np.flatnonzero(one[-1]).tolist() == [K + b] and np.flatnonzero(two[-1]).tolist() == [a])
+    check("illustration: the outlined steps show the two pairs the answer depends on",
+          np.flatnonzero(one[trial["step_ab"]]).tolist() == [a, K + b]
+          and np.flatnonzero(one[trial["step_bc"]]).tolist() == [K + b, 2 * K + c])
+    check("illustration: default output names",
+          module.default_output(4, 4).name == "twohop_task.png"
+          and module.default_output(8, 15).name == "twohop_task_K8_d15.png"
+          and module.default_output(4, 4).parent == path.parent)
+    with tempfile.TemporaryDirectory() as directory:
+        written = module.main(["--output", os.path.join(directory, "twohop.png")])
+        check("illustration: the script writes its figure", os.path.getsize(written) > 10_000)
 
 
 def test_wh_task():
@@ -595,6 +630,7 @@ if __name__ == "__main__":
     check_seqmnist_task("pixel", 784, 1)
     test_adding_task()
     test_twohop_task()
+    test_twohop_illustration()
     test_wh_task()
     test_registry()
     test_integration_seqmnist()

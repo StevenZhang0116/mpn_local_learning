@@ -72,6 +72,13 @@ permutations, `f: A -> B` and `g: B -> C`, over `K` symbols per set:
 | one-hop | `B_b` | `C_g(b)` |
 | two-hop | `A_a`, with `b = f(a)` | the same `C_g(f(a))` |
 
+![One stored history asked as a one-hop and as a two-hop query: the two tables with
+the route to the answer, and the input the network sees](../scripts/tasks/illustrations/twohop_task.png)
+
+The figure shows one history (`K = 4`, delay 4) asked both ways. It is drawn from
+the task's own generator by `scripts/tasks/illustrations/plot_twohop_task.py`;
+`--symbols 8 --delay 15` draws the `twohop_K8_d15` layout instead.
+
 The input has one channel per symbol (`3K` in all): a pair step lights two, the
 query one. The output is a `K`-way classification scored with cross-entropy on the
 final step only, so chance is `1/K`. The `A -> B` table always comes first: with
