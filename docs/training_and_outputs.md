@@ -143,6 +143,25 @@ and 1.25 in `wh_out`. `wh_mid_g2p5` matches the argument scale of the default
 `wh_out` instead. `NonlinearSystemTask.targets(x)` also returns the fast state
 `s_t`, which the training loop does not use.
 
+## Activation function
+
+`train_mpn.py --activation {tanh,relu,softplus,sigmoid,linear}` sets the activation
+of the input embedding and of every MP layer; the readout stays linear. The default
+`tanh` is the previous computation. All rules in a command use the same activation:
+BPTT differentiates it by autograd, and the local rules use its derivative, so every
+exactness statement (the top MP layer under `exact_spatial`, `--cross-layer-steps 1`
+at `T=2`, `local_diag_rflo` = `local_exact_rowlocal` under `top1_abs` routing) holds
+for each choice. At a pre-activation of exactly 0, `relu` has derivative 0 in both.
+
+The choice is saved as `activation` in `config.json`, in every checkpoint and in the
+`.npz` metadata, and `load_net` restores it. When it is not `tanh` it also appears in
+the console header and the figure title.
+
+With `relu` the activities are non-negative and unbounded, so the Hebbian write
+`eta * h * x^T` is non-negative and can be much larger than with `tanh`; `--eta` and
+`--lam` values tuned for `tanh` may need to change. `train_rnn.py` and `train_gru.py`
+do not take this flag and keep `tanh`.
+
 ## Batch size and long sequences
 
 For long sequences, `train_mpn.py --batch-size 16` reduces the number of trials

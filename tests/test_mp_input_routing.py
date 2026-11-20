@@ -1,4 +1,5 @@
-"""Signed top-1 routing at MP boundaries, including its spatial and temporal VJPs."""
+"""Signed top-k routing at MP boundaries (top1_abs and top<k>_abs), including its
+spatial and temporal VJPs."""
 import contextlib
 import copy
 import io
@@ -179,6 +180,141 @@ class TestInputRouting(unittest.TestCase):
             cfg = train_mpn._cfg()
             self.assertEqual(cfg.mp_input_routing, 'top1_abs')
             self.assertIn('_routing-top1_abs', train_common.param_tag(cfg))
+
+
+class TestTopKRouting(unittest.TestCase):
+    """top<k>_abs for k > 1: the same read / write / backward machinery as top1_abs,
+    without the diagonal-trace equivalence."""
+
+    def test_routing_names(self):
+        self.assertIsNone(mpn.mp_input_routing_k('dense'))
+        self.assertEqual(mpn.mp_input_routing_k('top1_abs'), 1)
+        self.assertEqual(mpn.mp_input_routing_k('top12_abs'), 12)
+        for bad in ('top0_abs', 'top_abs', 'topk_abs', 'top1', 'top-1_abs', 'top01_abs',
+                    'TOP1_ABS', 'top1.5_abs', 'top2_abs ', '', None, 1):
+            with self.subTest(name=bad):
+                with self.assertRaises(ValueError):
+                    mpn.mp_input_routing_k(bad)
+        # A net refuses an unknown name when it is built, the CLI before that.
+        with self.assertRaises(ValueError):
+            script_rule_gradients('wh_mid_T12', 'top0_abs', 'exact', 0)
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+            train_mpn._parse_args(['--mp-input-routing', 'top0_abs'])
+        args = train_mpn._parse_args(['--mp-input-routing', 'top3_abs'])
+        with patch.object(train_mpn, 'MP_INPUT_ROUTING', args.mp_input_routing):
+            self.assertEqual(train_mpn.build_params()[2]['mp_input_routing'], 'top3_abs')
+            self.assertIn('_routing-top3_abs', train_common.param_tag(train_mpn._cfg()))
+
+    def test_top_k_winners_ties_zero_and_rms_backward(self):
+        x = torch.tensor([[1., -1., 1., .5], [0., 0., 0., 0.], [.2, -.5, 2., -3.], [4., 0., 0., 0.]],
+                         dtype=torch.double, requires_grad=True)
+        # Among equal magnitudes the lower index wins, on every device.
+        winners = [[0, 1], [0, 1], [3, 2], [0, 1]]
+        for device in ['cpu'] + (['cuda'] if torch.cuda.is_available() else []):
+            self.assertEqual(mpn._top_abs_indices(x.detach().to(device), 2).tolist(), winners)
+            self.assertEqual(mpn._top_abs_indices(x.detach().to(device), 1).tolist(),
+                             [[0], [0], [3], [0]])
+        mask = torch.tensor([[1., 1., 0., 0.], [1., 1., 0., 0.], [0., 0., 1., 1.], [1., 1., 0., 0.]],
+                            dtype=x.dtype)
+        upstream = torch.tensor([[1., 2., 3., 4.]], dtype=torch.double).expand_as(x)
+        for norm in ('none', 'rms'):
+            net = build_deep([4, 4, 2], norm=norm, embed=False)
+            net.mp_input_routing = 'top2_abs'
+            value, context = net._prepare_mp_input(x, layer_idx=0)
+            self.assertEqual(context.winners.tolist(), winners)
+            normalized = x if norm == 'none' else x / (
+                x.square().mean(-1, keepdim=True) + net.mp_input_norm_eps).sqrt()
+            expected = mask * normalized
+            torch.testing.assert_close(value, expected)
+            expected_grad, = torch.autograd.grad(expected, x, upstream)
+            torch.testing.assert_close(net._mp_input_backward(upstream, context), expected_grad)
+            auto_grad, = torch.autograd.grad(value, x, upstream)
+            torch.testing.assert_close(auto_grad, expected_grad)
+
+    def test_k_at_least_the_width_is_dense(self):
+        net = build_single(3, 5, 2, norm='none')
+        x = torch.randn(4, 3, dtype=torch.double)
+        for routing in ('top3_abs', 'top7_abs'):
+            net.mp_input_routing = routing
+            output, context = net._prepare_mp_input(x, layer_idx=0)
+            self.assertIs(output, x)
+            self.assertIsNone(context)
+        # Both MP layers of the script-built net read 6 components.
+        dense = script_rule_gradients('wh_mid_T12', 'dense', 'exact', 1)
+        whole = script_rule_gradients('wh_mid_T12', 'top6_abs', 'exact', 1)
+        fewer = script_rule_gradients('wh_mid_T12', 'top5_abs', 'exact', 1)
+        for rule in (0, 1):
+            for name in dense[rule]:
+                self.assertTrue(torch.equal(whole[rule][name], dense[rule][name]), name)
+            self.assertGreater(rel(fewer[rule]['mp_layer1.W'], dense[rule]['mp_layer1.W']), 1e-3)
+
+    def test_single_layer_reads_writes_and_evaluates_top_k(self):
+        net = build_single(4, 5, 2, norm='none')
+        net.mp_input_routing = 'top2_abs'
+        x, y, mask = make_data(5, 7, 4, 2)
+        keep = torch.zeros_like(x).scatter_(-1, x.abs().topk(2, dim=-1).indices, 1.0)
+        dense = build_single(4, 5, 2, norm='none')
+        dense.load_state_dict(net.state_dict())
+        ref = dense.bptt_gradients(x * keep, y, mask)
+        # Row-local is exact for a single MP layer; BPTT differentiates the routing itself.
+        row = net.local_gradients(x, y, mask)
+        bptt = net.bptt_gradients(x, y, mask)
+        for key in ref:
+            torch.testing.assert_close(row[key], ref[key], rtol=1e-10, atol=1e-12)
+            torch.testing.assert_close(bptt[key], ref[key], rtol=1e-10, atol=1e-12)
+        torch.testing.assert_close(train_mpn.forward_outputs(net, x), ref['outputs'])
+        # Two components active at once couple, so the diagonal trace is approximate.
+        diag = net.local_diag_rflo_gradients(x, y, mask)
+        self.assertGreater(rel(diag['W'], row['W']), 1e-3)
+        net.reset_state(B=len(x))
+        dense.reset_state(B=len(x))
+        for t in range(x.shape[1]):
+            out, _ = net.network_step(x[:, t])
+            ref_out, _ = dense.network_step((x * keep)[:, t])
+            torch.testing.assert_close(out, ref_out)
+            torch.testing.assert_close(net.mp_layer.M, dense.mp_layer.M)
+
+    def test_deep_top_k_keeps_exactness_but_not_the_diagonal_equivalence(self):
+        x, y, mask = make_data(8, 7, 5, 3)
+        for cross in (0, 1):
+            for norm in ('none', 'rms'):
+                with self.subTest(cross=cross, norm=norm):
+                    net = build_deep([5, 6, 6, 3], norm=norm, residual=True, cross=cross)
+                    net.mp_input_routing = 'top2_abs'
+                    ref = net.bptt_gradients(x, y, mask)
+                    diag = net.local_diag_rflo_gradients(x, y, mask)
+                    row = net.local_gradients(x, y, mask)
+                    # The top MP layer's row-local gradient is still BPTT's.
+                    for key in ('W1', 'b1'):
+                        torch.testing.assert_close(row[key], ref[key], rtol=1e-10, atol=1e-12)
+                    for layer in net.mp_layers:
+                        diag_P = torch.diag_embed(layer.P.diagonal(dim1=-2, dim2=-1))
+                        self.assertGreater((layer.P - diag_P).abs().max().item(), 1e-6)
+                    for key in mp_keys(net, bias=False):
+                        self.assertGreater(rel(diag[key], row[key]), 1e-3, key)
+                    torch.testing.assert_close(train_mpn.forward_outputs(net, x), row['outputs'])
+
+    def test_one_hop_uses_previous_winners_with_residual_and_rms(self):
+        # At T=2 one cross-layer step makes row-local exact for every MP layer, so
+        # this checks the routed backward maps at t and at t-1 against autograd.
+        x, y, mask = make_data(16, 2, 5, 3, seed=13)
+        net = build_deep([5, 6, 6, 6, 3], norm='rms', residual=True, cross=1,
+                         embed=False, seed=9)
+        net.mp_input_routing = 'top2_abs'
+        ref = net.bptt_gradients(x, y, mask)
+        row = net.local_gradients(x, y, mask)
+        for key in mp_keys(net):
+            torch.testing.assert_close(row[key], ref[key], rtol=1e-10, atol=1e-12)
+        net.cross_layer_steps = 0
+        truncated = net.local_gradients(x, y, mask)
+        self.assertGreater((truncated['W'] - ref['W']).norm().item(), 1e-6)
+
+    def test_training_script_rules_differ_for_k_above_one(self):
+        for task_name in ('twohop_K4_d2', 'wh_mid_T12'):
+            with self.subTest(task=task_name):
+                diag, row, _ = script_rule_gradients(task_name, 'top2_abs', 'exact', 1)
+                for name in ('mp_layer1.W', 'mp_layer2.W'):
+                    self.assertGreater(rel(diag[name], row[name]), 1e-3, name)
 
 
 if __name__ == '__main__':

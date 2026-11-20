@@ -110,7 +110,8 @@ the cap is disabled).
 ## Residual branch scaling (`--residual-scale`)
 
 To scale residual MP branches, add `--residual --residual-scale 0.5`.
-Each equal-width block then computes `h_out = h_in + 0.5 * a`, where `a = tanh(z)`.
+Each equal-width block then computes `h_out = h_in + 0.5 * a`, where `a` is the block's
+activation (`tanh(z)` by default, see `--activation`).
 The fixed, nonnegative scale defaults to `1.0`; the identity path has unit gain.
 Unequal-width blocks keep `h_out = a` and the existing disabled-skip warning.
 Non-default scales require residuals to be enabled. Scale `0` is supported as an

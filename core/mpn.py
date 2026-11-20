@@ -13,7 +13,8 @@ That comparison covers only the BASELINE the archive implements. Everything adde
 since the refactor exists only in this file and is checked against independent
 autograd oracles by the other tests instead: local rules on more than one MP layer,
 the feedback and learning-signal modes, the input modes, additive MP layers, residual
-scaling, MP-input normalization, scaled-tanh writes and the RFLO trace-gain cap.
+scaling, MP-input normalization and top-k routing, scaled-tanh writes and the RFLO
+trace-gain cap.
 
 What is optimized (vs mpn_archive.py), all result-preserving:
   Forward / BPTT
@@ -58,6 +59,7 @@ from torch.nn.init import orthogonal_
 import math
 import numpy as np
 import copy
+import re
 import time
 from typing import NamedTuple, Optional
 
@@ -632,7 +634,8 @@ class MultiPlasticLayer(BaseNetworkFunctions):
     # Intentionally an approximation to BPTT; omitted terms can matter more
     # with longer sequences or stronger plasticity.
     # With rflo_trace_rho=None, one-sparse inputs keep every off-diagonal P zero.
-    # This includes scalar inputs and per-step top1_abs routing.
+    # This includes scalar inputs and per-step top1_abs routing, but not
+    # top<k>_abs with k > 1: components active at the same step couple.
 
     def reset_diag_rflo_state(self, B=1):
         """Allocate the diagonal-RFLO traces (zeroed).
@@ -1177,13 +1180,39 @@ class MultiPlasticLayer(BaseNetworkFunctions):
 
         return pre_act, db
 
-def _keep_winner(x, winner):
-    """Keep the signed value at one chosen index along the feature dimension."""
-    return torch.zeros_like(x).scatter_(-1, winner, x.gather(-1, winner))
+_TOP_K_ROUTING = re.compile(r"top([1-9]\d*)_abs")
+
+
+def mp_input_routing_k(routing):
+    """How many presynaptic components an MP layer keeps under `routing`: None for
+    'dense' (all of them), k for 'top<k>_abs' with k >= 1 ('top1_abs', 'top4_abs').
+    Any other name raises ValueError."""
+    if routing == 'dense':
+        return None
+    match = _TOP_K_ROUTING.fullmatch(routing) if isinstance(routing, str) else None
+    if match is None:
+        raise ValueError("mp_input_routing must be 'dense' or 'top<k>_abs' with k >= 1 "
+                         f"(e.g. 'top1_abs', 'top4_abs'), got {routing!r}")
+    return int(match.group(1))
+
+
+def _top_abs_indices(x, k):
+    """Indices (..., k) of the k largest-magnitude components along the feature
+    dimension. Among equal magnitudes the lower index wins."""
+    if k == 1:
+        return x.abs().argmax(dim=-1, keepdim=True)
+    # Ascending stable sort of -|x|: equal magnitudes keep their index order.
+    return torch.sort(-x.abs(), dim=-1, stable=True).indices[..., :k]
+
+
+def _keep_winners(x, winners):
+    """Keep the signed values at the chosen indices (..., k) along the feature
+    dimension and zero the rest."""
+    return torch.zeros_like(x).scatter_(-1, winners, x.gather(-1, winners))
 
 
 class _MPInputJacobian(NamedTuple):
-    winner: Optional[torch.Tensor]
+    winners: Optional[torch.Tensor]
     normalized: Optional[torch.Tensor]
     rms: Optional[torch.Tensor]
 
@@ -1308,9 +1337,11 @@ class MultiPlasticNetBase(BaseNetwork):
         # the branch entering the MP block is normalized. Learning signals that
         # travel from x_hat back to the stream are mapped through the transpose
         # Jacobian  J^T g = (g - x_hat * <g, x_hat>/d) / r  (see _mp_input_norm_backward).
+        # Routing, applied after the norm: 'dense' keeps x_hat whole, 'top<k>_abs'
+        # keeps its k largest-magnitude components at each step (_prepare_mp_input).
+        # The name is read at every step, so it can be changed on a built net.
         self.mp_input_routing = net_params.get('mp_input_routing', 'dense')
-        if self.mp_input_routing not in ('dense', 'top1_abs'):
-            raise ValueError("mp_input_routing must be 'dense' or 'top1_abs'")
+        mp_input_routing_k(self.mp_input_routing)   # rejects any other name
         self.mp_input_norm = net_params.get('mp_input_norm', 'none') or 'none'
         if self.mp_input_norm not in ('none', 'rms'):
             raise ValueError("mp_input_norm must be 'none' or 'rms'")
@@ -1362,13 +1393,16 @@ class MultiPlasticNetBase(BaseNetwork):
 
     def _prepare_mp_input(self, x, layer_idx):
         """Apply RMS then routing along the last axis (step or full sequence).
-        Cache the selected index for the manual VJP, even on ties and all-zero inputs.
+        'top<k>_abs' keeps the k largest-magnitude components; an input with k or
+        fewer components is left whole. Cache the selected indices for the manual
+        VJP, even on ties and all-zero inputs.
         """
         normalized, rms = self._mp_input_norm_forward(x, layer_idx)
-        if self.mp_input_routing == 'top1_abs' and x.size(-1) > 1:
-            winner = normalized.abs().argmax(dim=-1, keepdim=True)
-            context = _MPInputJacobian(winner, normalized if rms is not None else None, rms)
-            return _keep_winner(normalized, winner), context
+        k = mp_input_routing_k(self.mp_input_routing)
+        if k is not None and x.size(-1) > k:
+            winners = _top_abs_indices(normalized, k)
+            context = _MPInputJacobian(winners, normalized if rms is not None else None, rms)
+            return _keep_winners(normalized, winners), context
         context = _MPInputJacobian(None, normalized, rms) if rms is not None else None
         return normalized, context
 
@@ -1376,8 +1410,8 @@ class MultiPlasticNetBase(BaseNetwork):
         """Map an MP branch signal back to the residual stream at the same step."""
         if context is None:
             return grad
-        if context.winner is not None:
-            grad = _keep_winner(grad, context.winner)
+        if context.winners is not None:
+            grad = _keep_winners(grad, context.winners)
         return self._mp_input_norm_backward(grad, context.normalized, context.rms)
 
     def _mp_input_norm_backward(self, g, x_hat, r):
@@ -2320,7 +2354,7 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
         return any(self._embed_grad_flags())
 
     def _input_mtrace_step(self, trace, features, embed_prime, x, post,
-                           phi_prime, signal, eta, lam, winner=None):
+                           phi_prime, signal, eta, lam, winners=None):
         """Advance a diagonal-column input sensitivity, before the M write.
 
         trace[b,i,j,k] approximates dM0[b,i,j]/dU[j,k]; derivatives of
@@ -2329,7 +2363,7 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
         optionally a constant 1 for the input bias. No parameter gradients are
         propagated through optimizer steps: weights are fixed during the unroll.
 
-        D[j,k] = phi_embed'[j] * features[k], gated by the winner for routed MP inputs.
+        D[j,k] = phi_embed'[j] * features[k], gated by the winners for routed MP inputs.
         C[i,j,k] = phi0'[i] W0[i,j] ((1+M0[i,j]) D[j,k] + x[j] trace[i,j,k])
         Additive: C = phi0' * ((W0+M0)*D + x*trace).
         raw_trace = lam*trace + eta*(post[i]*D[j,k] + x[j]*C[i,j,k])
@@ -2343,7 +2377,7 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
         """
         layer = self.mp_layers[0]
         # Gate the derivative of the MP input before expanding over embedding features.
-        branch_prime = _keep_winner(embed_prime, winner) if winner is not None else embed_prime
+        branch_prime = _keep_winners(embed_prime, winners) if winners is not None else embed_prime
         direct = branch_prime.unsqueeze(-1) * features.unsqueeze(1)
         if layer.mp_type == 'mult':
             # Keep the legacy operation order for multiplicative checkpoints.
@@ -2357,7 +2391,7 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
         gradient = torch.einsum('bi,bijk->jk', self._branch_scales[0] * signal, eligibility)
         if self._residual_at[0]:
             # The skip consumes the embedding before routing.
-            stream_direct = direct if winner is None else embed_prime.unsqueeze(-1) * features.unsqueeze(1)
+            stream_direct = direct if winners is None else embed_prime.unsqueeze(-1) * features.unsqueeze(1)
             gradient = gradient + torch.einsum('bj,bjk->jk', signal, stream_direct)
         raw_trace = lam[None, :, :, None] * trace
         if layer.m_update_type == 'hebb_assoc':
@@ -3032,7 +3066,7 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
                 grad_t, proposed_input_trace = self._input_mtrace_step(
                     input_trace, features, self.act_fn_p(embed_pre), x_in[0], post0,
                     phi_p[0], ell_h[1], *eta_lam[0],
-                    winner=norm[0][1].winner if norm[0][1] is not None else None)
+                    winners=norm[0][1].winners if norm[0][1] is not None else None)
                 grad_input += grad_t
             elif embed:
                 ga_seq[t] = ell_h[0] * self.act_fn_p(embed_pre)
@@ -3175,9 +3209,10 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
         """Diagonal RFLO eligibility per MP layer + same-time inter-layer learning
         signals + the selected local input rule. Dropping off-synapse plastic
         sensitivities generally approximates even the top layer's eligibility.
-        With one-sparse inputs and no RFLO gain cap, the diagonal MP weight
-        eligibility equals row-local. Cross-layer temporal credit and bias
-        eligibility still follow their configured rules."""
+        With one-sparse inputs (top1_abs routing, not top<k>_abs with k > 1) and no
+        RFLO gain cap, the diagonal MP weight eligibility equals row-local.
+        Cross-layer temporal credit and bias eligibility still follow their
+        configured rules."""
         return self._local_sequence_gradients(inputs, labels, masks, 'diag', **kwargs)
 
     def local_direct_gradients(self, inputs, labels, masks, **kwargs):

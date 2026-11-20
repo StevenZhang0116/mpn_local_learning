@@ -189,7 +189,6 @@ INPUT_NORM_SAMPLE = 2048      # #trials sampled to estimate the fixed input stat
 # Incompatible with --input-mode diag_mtrace/paired unless layer 0 is skipped (below).
 # 'none' (default) is the previous computation byte for byte. --mp-input-norm /
 # --mp-input-norm-eps on CLI.
-MP_INPUT_ROUTING = "dense"    # dense | top1_abs, after any per-layer RMS norm
 MP_INPUT_NORM = "none"        # none | rms
 MP_INPUT_NORM_EPS = 1e-5
 # With the norm on, leave MP layer 0's input (the embedding output; the raw input for
@@ -199,6 +198,21 @@ MP_INPUT_NORM_EPS = 1e-5
 # 0's transpose Jacobian is then the identity, and --input-mode diag_mtrace/paired
 # are accepted again. Needs --net dmpn with >= 2 MP layers. --mp-input-norm-skip-first.
 MP_INPUT_NORM_SKIP_FIRST = False
+# Activation of the input embedding and of every MP layer (the readout is linear).
+# BPTT differentiates it by autograd; the local rules use its hand-written
+# derivative (net_helpers.get_activation_function), and the two agree everywhere,
+# including at 0 for relu. "tanh" (default) is the previous computation. With relu
+# the activities are non-negative and unbounded. --activation on CLI.
+ACTIVATIONS = ("tanh", "relu", "softplus", "sigmoid", "linear")
+ACTIVATION = "tanh"
+# Presynaptic routing in every MP layer, after any per-layer RMS norm: "dense" (all
+# components) or "top<k>_abs" (the k largest-magnitude ones per sample and step,
+# e.g. top1_abs, top4_abs; a layer whose input has k or fewer components stays
+# dense). The forward read, the Hebbian write and the eligibility use the routed
+# vector; the residual skip carries the full stream. With top1_abs (and no RFLO
+# gain cap) local_diag_rflo's MP weight eligibility equals local_exact_rowlocal's;
+# k > 1 does not have that property. --mp-input-routing on CLI.
+MP_INPUT_ROUTING = "dense"
 # Identity skip around each MP block: h_{n+1} = h_n + RESIDUAL_SCALE * act(z_n)
 # (dmpn only). A same-time, parameter-free, memoryless op — it stays fully local (the
 # local rules gain the residual's identity Jacobian term in the inter-layer signal;
@@ -411,7 +425,7 @@ def build_params():
         "n_neurons": [1, *widths, 1],
         "output_bias": False,            # one_task.py: output_bias = False
         "loss_type": "MSE",
-        "activation": "tanh",
+        "activation": ACTIVATION,
         "cuda": False,
         "output_matrix": "",
         "acc_measure": "angle",
@@ -579,6 +593,7 @@ def _cfg():
         seed=SEED, ruleset=RULESET, rules_to_run=RULES_TO_RUN,
         feedback_mode=FEEDBACK_MODE,
         input_normalize=INPUT_NORMALIZE, input_norm_sample=INPUT_NORM_SAMPLE,
+        activation=ACTIVATION,
         mp_input_routing=MP_INPUT_ROUTING,
         mp_input_norm=MP_INPUT_NORM, mp_input_norm_eps=MP_INPUT_NORM_EPS,
         mp_input_norm_skip_first=MP_INPUT_NORM_SKIP_FIRST,
@@ -672,10 +687,17 @@ def parse_arguments(argv=None):
                         "and applied identically to every rule + validation). "
                         "Conditions all rules equally by removing a scale artifact. "
                         "Use --no-input-normalize to force off. Default: %(default)s.")
-    g.add_argument("--mp-input-routing", choices=["dense", "top1_abs"], default=MP_INPUT_ROUTING,
-                   help="presynaptic routing in every MP layer. top1_abs keeps the signed "
-                        "largest-magnitude component per sample and time step after any RMS norm "
-                        "(first index on ties). The residual skip carries the original stream.")
+    g.add_argument("--activation", choices=list(ACTIVATIONS), default=ACTIVATION,
+                   help="activation of the input embedding and of every MP layer (the readout "
+                        "is linear). Every rule uses the same one: BPTT by autograd, the local "
+                        "rules through its derivative. Default: %(default)s.")
+    g.add_argument("--mp-input-routing", default=MP_INPUT_ROUTING, metavar="{dense,top<k>_abs}",
+                   help="presynaptic routing in every MP layer. top<k>_abs (top1_abs, top4_abs, "
+                        "...) keeps the k signed largest-magnitude components per sample and time "
+                        "step after any RMS norm (lower index on ties) and zeroes the rest; a "
+                        "layer whose input has k or fewer components is left dense. The residual "
+                        "skip carries the original stream. Only top1_abs makes local_diag_rflo's "
+                        "MP weight eligibility equal local_exact_rowlocal's. Default: %(default)s.")
     g.add_argument("--mp-input-norm", choices=["none", "rms"], default=MP_INPUT_NORM,
                    help="per-step RMS normalization of every MP layer's presynaptic input "
                         "(x_hat = x / sqrt(mean(x^2) + eps), so ||x_hat||^2 equals the fan-in "
@@ -928,6 +950,11 @@ def validate_config(p, args):
     if args.input_mode == 'paired' and 'local_exact_rowlocal' in args.rules:
         p.error("--input-mode paired does not support local_exact_rowlocal; "
                 "use match or an explicit input mode")
+    try:
+        mpn.mp_input_routing_k(args.mp_input_routing)
+    except ValueError:
+        p.error(f"--mp-input-routing must be dense or top<k>_abs with k >= 1 "
+                f"(e.g. top1_abs, top4_abs), got {args.mp_input_routing!r}")
     if (args.mp_input_norm != 'none' and not args.mp_input_norm_skip_first
             and args.input_mode in ('diag_mtrace', 'paired')):
         p.error(f"--mp-input-norm {args.mp_input_norm} is not supported with --input-mode "
@@ -1004,7 +1031,7 @@ def main():
     global SEED, LEARNING_SIGNAL, LOCAL_SIGNAL_ALPHA
     global LR, HEAD_LR_MULT, LR_SCHEDULE, LR_PATIENCE, LR_FACTOR
     global RESIDUAL_SCALE
-    global MP_INPUT_ROUTING, MP_INPUT_NORM, MP_INPUT_NORM_EPS, MP_INPUT_NORM_SKIP_FIRST
+    global ACTIVATION, MP_INPUT_ROUTING, MP_INPUT_NORM, MP_INPUT_NORM_EPS, MP_INPUT_NORM_SKIP_FIRST
     args = _parse_args()
     DFA_PRESET = args.dfa
     NET_TYPE = args.net
@@ -1037,6 +1064,7 @@ def main():
     RULES_TO_RUN = args.rules
     LOG_GRAD_ALIGN = args.grad_align
     INPUT_NORMALIZE = args.input_normalize
+    ACTIVATION = args.activation
     MP_INPUT_ROUTING = args.mp_input_routing
     MP_INPUT_NORM = args.mp_input_norm
     MP_INPUT_NORM_EPS = args.mp_input_norm_eps

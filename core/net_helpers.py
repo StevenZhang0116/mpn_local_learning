@@ -135,7 +135,10 @@ def rand_weight_init(n_inputs, n_outputs=None, init_type='gaussian', cell_types=
 
 
 def relu_fn(x):
-    return torch.maximum(x, torch.zeros_like(x))
+    # torch.relu, not torch.maximum(x, 0): autograd splits a tie in maximum evenly,
+    # so its derivative at exactly 0 would be 0.5 while relu_fn_p (which the local
+    # rules use) gives 0. The forward values are identical.
+    return torch.relu(x)
 def relu_fn_np(x):
     return np.maximum(x, np.zeros_like(x))
 def relu_fn_p(x):
@@ -209,7 +212,7 @@ def softplus_fn_p(x):
 
 def get_activation_function(act_fn):
     """ Returns pytorch version, numpy version, and pytorch derivative functions """
-    if act_fn == 'ReLU':
+    if act_fn in ('ReLU', 'relu'):
         return relu_fn, relu_fn_np, relu_fn_p
     elif act_fn == 'sigmoid':
         return sigmoid, sigmoid_np, sigmoid_p

@@ -173,9 +173,9 @@ tag gains `-skip0`.
 * `mpn.MultiPlasticNetBase`: config parsing (incl. `mp_input_norm_skip_first`),
   `_mp_input_norm_forward(x, layer_idx)`,
   `_mp_input_norm_backward`, and `_prepare_mp_input` (steps and sequences).
-  With `--mp-input-routing top1_abs`, selection follows normalization. Skipping
+  With `--mp-input-routing top<k>_abs`, selection follows normalization. Skipping
   the first layer's normalization still routes its input. Local backprojection
-  applies the winner mask before the RMS transpose Jacobian.
+  applies the winners' mask before the RMS transpose Jacobian.
 * `mpn.MultiPlasticNet`: `forward`, `network_step`, `bptt_gradients`,
   `_prepass_output_grad`, `_local_sequence_gradients` consume `x_hat`.
 * `mpn.DeepMultiPlasticNet`: `_forward_stack` (returns the consumed inputs),

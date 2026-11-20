@@ -68,26 +68,35 @@ Install the dependencies with `pip install -r requirements.txt`.
 `seqmnist_pixel`, `adding` / `adding_L<len>_m<marks>`, `twohop` /
 `twohop_K<symbols>_d<delay>`, or `wh_mid` / `wh_out` (nonlinear system
 identification). `--hidden` sets the MP
-stack (one width per MP layer). Every rule in a command starts from the same
+stack (one width per MP layer). `--activation` sets the activation of the input
+embedding and the MP layers (`tanh` by default; `relu`, `softplus`, `sigmoid`,
+`linear`). Every rule in a command starts from the same
 initialization and sees the same data. One invocation writes one run ID,
 `<model>_<task>_<YYYYMMDD_HHMMSS>_<hash>`, shared by `figure/`, `figure_data/`,
 `checkpoints/` and `log/`; `python scripts/training/train_mpn.py --help` lists every flag.
 
-### One active input per MP layer
+### Sparse MP-layer inputs (top-k routing)
 
-With `--mp-input-routing top1_abs`, each MP layer selects the largest absolute
-input per sample and time step, after any MP-input RMS normalization. It keeps
-the signed value, chooses the first index on ties, and uses the same vector for
-the forward read, Hebbian write and eligibility. Residual skips carry the full
-stream. The default is `--mp-input-routing dense`.
+With `--mp-input-routing top<k>_abs` (`top1_abs`, `top4_abs`, …), each MP layer
+keeps the `k` largest absolute components of its input per sample and time step,
+after any MP-input RMS normalization, and zeroes the rest. It keeps the signed
+values, prefers the lower index on ties, and uses the same vector for the forward
+read, Hebbian write and eligibility. Residual skips carry the full stream. A layer
+whose input has `k` or fewer components is left dense. The default is
+`--mp-input-routing dense`.
 
-This provides a control for temporal credit assignment in deep MPNs. Starting
+`top1_abs` provides a control for temporal credit assignment in deep MPNs. Starting
 from zero sensitivity, a Hebbian write can update only the winning diagonal
 entry of each row's weight trace. With the RFLO gain cap disabled (default),
 `local_diag_rflo` therefore gives the same **within-layer MP weight eligibility**
 as `local_exact_rowlocal`, using one trace value per synapse. Use
 `--local-bias-mode exact` to match their bias updates too. Lower-layer gradients
 can still differ from BPTT through the plastic states of higher layers.
+
+With `k > 1` the components active at the same step couple, the weight trace gains
+off-diagonal entries, and `local_diag_rflo` is an approximation again. `k` is then
+a dial between the regime where the diagonal trace is exact (`k = 1`) and the dense
+network (`k` at least the layer width).
 
 ```bash
 python scripts/training/train_mpn.py --net dmpn --task wh_mid --hidden 16 16 \
