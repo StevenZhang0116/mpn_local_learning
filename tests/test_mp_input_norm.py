@@ -437,8 +437,8 @@ class TestSkipFirstLayer(unittest.TestCase):
                                    rtol=1e-12, atol=1e-12)
         # Layer 0's signal mapping is the identity; an upper layer's is not.
         g = torch.randn(3, 6, dtype=torch.float64)
-        self.assertIs(net._mp_input_norm_backward(g, *norm[0]), g)
-        self.assertGreater(rel(net._mp_input_norm_backward(g, *norm[1]), g), 1e-3)
+        self.assertIs(net._mp_input_backward(g, norm[0][1]), g)
+        self.assertGreater(rel(net._mp_input_backward(g, norm[1][1]), g), 1e-3)
         # Validation forward runs the same network.
         lab = torch.randn(3, 2, 3, dtype=torch.float64); msk = torch.ones_like(lab)
         b = build_deep([5, 6, 6, 6, 3], rule='bptt', residual=True, seed=31, skip_first=True)

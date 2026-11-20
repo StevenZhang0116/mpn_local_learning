@@ -73,6 +73,28 @@ initialization and sees the same data. One invocation writes one run ID,
 `<model>_<task>_<YYYYMMDD_HHMMSS>_<hash>`, shared by `figure/`, `figure_data/`,
 `checkpoints/` and `log/`; `python scripts/training/train_mpn.py --help` lists every flag.
 
+### One active input per MP layer
+
+With `--mp-input-routing top1_abs`, each MP layer selects the largest absolute
+input per sample and time step, after any MP-input RMS normalization. It keeps
+the signed value, chooses the first index on ties, and uses the same vector for
+the forward read, Hebbian write and eligibility. Residual skips carry the full
+stream. The default is `--mp-input-routing dense`.
+
+This provides a control for temporal credit assignment in deep MPNs. Starting
+from zero sensitivity, a Hebbian write can update only the winning diagonal
+entry of each row's weight trace. With the RFLO gain cap disabled (default),
+`local_diag_rflo` therefore gives the same **within-layer MP weight eligibility**
+as `local_exact_rowlocal`, using one trace value per synapse. Use
+`--local-bias-mode exact` to match their bias updates too. Lower-layer gradients
+can still differ from BPTT through the plastic states of higher layers.
+
+```bash
+python scripts/training/train_mpn.py --net dmpn --task wh_mid --hidden 16 16 \
+  --mp-input-routing top1_abs --local-bias-mode exact --learning-signal exact_spatial \
+  --rules local_diag_rflo local_exact_rowlocal bptt --cross-layer-steps 0 --seed 27
+```
+
 ## Documentation
 
 | Topic | File |
