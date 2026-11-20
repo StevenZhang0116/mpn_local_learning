@@ -89,8 +89,9 @@ whose input has `k` or fewer components is left dense. The default is
 from zero sensitivity, a Hebbian write can update only the winning diagonal
 entry of each row's weight trace. With the RFLO gain cap disabled (default),
 `local_diag_rflo` therefore gives the same **within-layer MP weight eligibility**
-as `local_exact_rowlocal`, using one trace value per synapse. Use
-`--local-bias-mode exact` to match their bias updates too. Lower-layer gradients
+as `local_exact_rowlocal`, using one trace value per synapse. Their bias updates
+match too under the default `--local-bias-mode exact` (not under `match` or
+`direct`). Lower-layer gradients
 can still differ from BPTT through the plastic states of higher layers.
 
 With `k > 1` the components active at the same step couple, the weight trace gains

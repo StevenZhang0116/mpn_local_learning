@@ -49,7 +49,8 @@ independent so one flag changes one thing:
   --input-mode       HOW the input embedding is trained (match / exact / three_factor /
                      diag_mtrace / paired) — see INPUT_MODE below.
 Defaults are signal-independent: rules bptt+local_direct+local_diag_rflo, input
-mode match (bptt = full BPTT, local runs fully local), direct bias updates, no
+mode match (bptt = full BPTT, local runs fully local), exact bias traces for the
+trace-based rules (local_direct always updates biases directly), no
 cross-layer correction, alignment diagnostic on. Switching only --learning-signal
 therefore changes only the signal. Example:
     python scripts/training/train_mpn.py --learning-signal dfa --hidden 64 64 --task delaygo --steps 500
@@ -57,7 +58,8 @@ therefore changes only the signal. Example:
 bptt/row-local/diagonal + alignment off); --feedback and --learning-signal global
 are legacy spellings translated into the unified mode. Explicitly conflicting
 flags are rejected rather than resolved by argument order. --local-bias-mode exact
-retains exact bias traces (needed for the row-local rule's top-layer bias exactness).
+(the default) keeps exact bias traces for both trace-based rules (needed for the
+row-local rule's top-layer bias exactness); match and direct select cheaper ones.
 
 Use --learning-signal local_readout for per-layer LOCAL READOUT heads (dmpn,
 multi-MP-layer): every non-top MP layer gets an auxiliary linear head trained on
@@ -113,8 +115,8 @@ RULESET = "contextdelaydm1"           # single task to train on
 NET_TYPE = "dmpn"
 # Rules to compare (--rules). Default changed 2026-10 from
 # [bptt, local_exact_rowlocal, local_diag_rflo, local_direct] to the three rules the
-# project's comparisons use; add local_exact_rowlocal explicitly (with
-# --local-bias-mode exact for its bias exactness) when you want it.
+# project's comparisons use; add local_exact_rowlocal explicitly when you want it
+# (its bias trace is exact under the default --local-bias-mode exact).
 RULES_TO_RUN = ["bptt", "local_direct", "local_diag_rflo"]
 # Hidden learning-signal feedback. 'exact_spatial' = exact same-time spatial
 # gradient (weight transport; top plastic layer exact vs BPTT under
@@ -144,12 +146,13 @@ INPUT_MODE = "match"
 # MP bias eligibility for the row-local / diagonal rules ('direct' = phi' only, no
 # bias trace; 'exact' = the row-local bias trace; 'match' = each rule's own level of
 # locality: direct for diagonal RFLO, exact for row-local). local_direct always
-# uses direct and bptt always uses autograd. Default 'match' (changed 2026-10 from
-# 'exact' via 'direct'): identical to 'direct' for the default rule set, and the
-# row-local rule keeps its bias trace whenever it is added. Pass an explicit
-# 'direct' or 'exact' when every trace-based rule must share ONE bias policy (the
-# --dfa preset selects direct).
-LOCAL_BIAS_MODE = "match"
+# uses direct and bptt always uses autograd. Default 'exact' (2026-11-20; it was
+# 'exact' until 2026-10, then 'direct', then 'match'): both trace-based rules keep
+# the exact bias trace, so under top1_abs routing local_diag_rflo equals
+# local_exact_rowlocal on biases as well as weights. With 'match', diagonal RFLO
+# drops its bias trace (the default of the runs made between 2026-10 and
+# 2026-11-20). The --dfa preset selects direct.
+LOCAL_BIAS_MODE = "exact"
 RFLO_TRACE_RHO = None  # optional cap on the MP-weight diagonal trace recurrence gain
 LAM = None  # optional fixed modulation decay; None retains dt / m_time_scale setup
 # Optional fixed Hebbian write rate eta: written to ml_params['eta_clamp'], which also

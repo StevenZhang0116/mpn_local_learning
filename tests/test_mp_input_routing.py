@@ -131,8 +131,8 @@ class TestInputRouting(unittest.TestCase):
                     for name in row:
                         torch.testing.assert_close(diag[name], row[name], rtol=1e-10, atol=1e-12)
                 with self.subTest(task=task_name, cross=cross, bias='match'):
-                    # The CLI default: diagonal RFLO resolves to the direct bias
-                    # rule, so the MP biases differ and nothing else does.
+                    # --local-bias-mode match: diagonal RFLO resolves to the direct
+                    # bias rule, so the MP biases differ and nothing else does.
                     diag, row, modes = script_rule_gradients(task_name, 'top1_abs', 'match', cross)
                     self.assertEqual(modes, [['direct', 'direct'], ['exact', 'exact']])
                     for name in row:

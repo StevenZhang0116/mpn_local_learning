@@ -32,41 +32,47 @@ full-BPTT baseline; the per-rule line below labels it `algorithm=hybrid`.
 ## Defaults
 
 Defaults are signal-independent, so switching `--learning-signal` alone changes only the
-signal. They changed in October 2026; old runs used the previous column:
+signal. They changed in October 2026; old runs used the previous column. The
+`--local-bias-mode` default changed once more, on 2026-11-20:
 
 | Setting | Previous default | Current default |
 |---|---|---|
 | `--rules` | `bptt local_exact_rowlocal local_diag_rflo local_direct` | `bptt local_direct local_diag_rflo` |
 | `--input-mode` | `exact` (local runs spliced a BPTT embedding gradient: a hybrid) | `match` (bptt = full BPTT, local runs fully local) |
-| `--local-bias-mode` | `exact` | `match` (each rule's own bias update: direct for diagonal RFLO, exact for row-local; pass `direct` or `exact` to force one shared policy) |
+| `--local-bias-mode` | `exact` until October 2026, then `match` until 2026-11-20 | `exact` (both trace-based rules keep the exact bias trace; `match` gives each rule its own bias update, `direct` drops the trace for both) |
 | `--cross-layer-steps` | `1` | `0` |
 | `--grad-align` | on | on (unchanged) |
 
 ## MP bias updates (`--local-bias-mode`)
 
-`--local-bias-mode match` selects the MP bias update separately for each rule:
+`--local-bias-mode` sets how the two trace-based local rules update the MP biases:
 
-| Rule | Effective bias update under `match` |
-|---|---|
-| `local_direct` | direct, instantaneous |
-| `local_diag_rflo` | direct, no bias trace |
-| `local_exact_rowlocal` | exact row-local bias trace |
-| `bptt` | full autograd gradient (no local bias trace) |
+| Rule | `exact` (default) | `match` | `direct` |
+|---|---|---|---|
+| `local_direct` | direct, instantaneous | direct, instantaneous | direct, instantaneous |
+| `local_diag_rflo` | exact row-local bias trace | direct, no bias trace | direct, no bias trace |
+| `local_exact_rowlocal` | exact row-local bias trace | exact row-local bias trace | direct, no bias trace |
+| `bptt` | full autograd gradient | full autograd gradient | full autograd gradient |
 
-`match` is the default: for the default rule set it is identical to `direct`
-(diagonal RFLO resolves to direct), and the row-local rule keeps its bias trace
-whenever it is added. Explicit `exact` or `direct` applies one shared policy to both
-trace-based local rules (the `--dfa` preset selects `direct`); `local_direct` and BPTT
-always keep their native bias updates. `match` only changes MP bias eligibility, independently of the learning
-signal and input mode. In particular, `--input-mode match` still uses three-factor
-embedding updates for every local rule: matching the bias does not make a local
-network a full-BPTT baseline. For the four-rule comparison, use
-`--rules local_direct local_diag_rflo local_exact_rowlocal bptt --local-bias-mode match`.
-The requested policy stays in checkpoint/config `net_params`, while checkpoints
-also record `resolved_local_bias_modes` (one value per MP layer: `direct`, `exact`,
-or `autograd` for BPTT); the console's per-rule summary prints the effective bias
-mode. Resolution happens again when
-switching rules or directly calling another rule's gradient method.
+`exact` is the default: both trace-based rules keep the exact row-local bias trace,
+so under `top1_abs` routing `local_diag_rflo` equals `local_exact_rowlocal` on biases
+as well as weights. `match` gives each rule its own level of locality, and `direct`
+drops the bias trace for both. `local_direct` and BPTT always keep their native bias
+updates, and the `--dfa` preset selects `direct`.
+
+Runs made between October 2026 and 2026-11-20 without the flag used `match`, under
+which diagonal RFLO has no bias trace; pass `--local-bias-mode match` to reproduce
+them. For the default rule set (`bptt local_direct local_diag_rflo`) `match` is
+identical to `direct`.
+
+The setting only changes MP bias eligibility, independently of the learning signal
+and input mode. In particular, `--input-mode match` still uses three-factor
+embedding updates for every local rule: an exact bias trace does not make a local
+network a full-BPTT baseline. The requested policy stays in checkpoint/config
+`net_params`, while checkpoints also record `resolved_local_bias_modes` (one value
+per MP layer: `direct`, `exact`, or `autograd` for BPTT); the console's per-rule
+summary prints the effective bias mode. Resolution happens again when switching
+rules or directly calling another rule's gradient method.
 
 ## Supported combinations
 
@@ -86,7 +92,7 @@ BPTT baseline); the console's per-rule line records what each rule actually runs
 ```text
   bptt: input_mode=match, resolved_input_mode=exact, mp_update=full BPTT (feedback/bias/heads unused)
   local_direct: input_mode=match, resolved_input_mode=three_factor, signal=dfa, feedback=direct_fa, bias=direct (rule-fixed), heads=none
-  local_diag_rflo: input_mode=match, resolved_input_mode=three_factor, signal=dfa, feedback=direct_fa, bias=direct, rho=0.99, heads=none
+  local_diag_rflo: input_mode=match, resolved_input_mode=three_factor, signal=dfa, feedback=direct_fa, bias=exact, rho=0.99, heads=none
 ```
 
 The same summary is stored per checkpoint as `effective_config`, and `signal_mode` is

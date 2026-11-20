@@ -46,7 +46,7 @@ class TestLocalBiasMatch(unittest.TestCase):
         self.assertEqual(args.local_bias_mode, 'match')
         self.assertEqual(args.input_mode, 'match')
         self.assertFalse(args.residual)
-        self.assertEqual(tm._parse_args([]).local_bias_mode, 'match')
+        self.assertEqual(tm._parse_args([]).local_bias_mode, 'exact')
         self.assertEqual(tm._parse_args(['--dfa']).local_bias_mode, 'direct')
         self.assertEqual(tm._parse_args(['--local-bias-mode', 'direct']).local_bias_mode, 'direct')
         self.assertEqual(tm._parse_args(['--dfa', '--local-bias-mode', 'match']).local_bias_mode,
