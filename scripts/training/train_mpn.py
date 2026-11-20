@@ -189,6 +189,7 @@ INPUT_NORM_SAMPLE = 2048      # #trials sampled to estimate the fixed input stat
 # Incompatible with --input-mode diag_mtrace/paired unless layer 0 is skipped (below).
 # 'none' (default) is the previous computation byte for byte. --mp-input-norm /
 # --mp-input-norm-eps on CLI.
+MP_INPUT_ROUTING = "dense"    # dense | top1_abs, after any per-layer RMS norm
 MP_INPUT_NORM = "none"        # none | rms
 MP_INPUT_NORM_EPS = 1e-5
 # With the norm on, leave MP layer 0's input (the embedding output; the raw input for
@@ -417,6 +418,7 @@ def build_params():
         "learning_rule": "bptt",         # overwritten per rule below
         "feedback_mode": FEEDBACK_MODE,
         "input_normalize": INPUT_NORMALIZE,  # fixed per-feature input standardization
+        "mp_input_routing": MP_INPUT_ROUTING,
         "mp_input_norm": MP_INPUT_NORM,      # per-step RMS norm of each MP layer's input
         "mp_input_norm_eps": MP_INPUT_NORM_EPS,
         "mp_input_norm_skip_first": MP_INPUT_NORM_SKIP_FIRST,  # layer 0 raw, layers 1.. normalized
@@ -500,11 +502,8 @@ def forward_outputs(net, inputs):
             out, _, _ = net.network_step(inputs[:, t, :], seq_idx=t)
             outs.append(out)
     else:  # MultiPlasticNet (single MP layer, no embedding)
-        # The layer, its Hebbian write and its traces consumed the optionally
-        # RMS-normalized input during training (mp_input_norm, applied once to the
-        # sequence exactly as bptt_gradients does); evaluate the SAME network.
-        # Identity unless the norm is on.
-        inputs = net._mp_input_norm_seq(inputs)
+        # Apply the same per-layer normalization and routing used in training.
+        inputs, _ = net._prepare_mp_input(inputs, layer_idx=0)
         for t in range(T):
             x_t = inputs[:, t, :]
             hidden_pre, _ = net.mp_layer(x_t)
@@ -580,6 +579,7 @@ def _cfg():
         seed=SEED, ruleset=RULESET, rules_to_run=RULES_TO_RUN,
         feedback_mode=FEEDBACK_MODE,
         input_normalize=INPUT_NORMALIZE, input_norm_sample=INPUT_NORM_SAMPLE,
+        mp_input_routing=MP_INPUT_ROUTING,
         mp_input_norm=MP_INPUT_NORM, mp_input_norm_eps=MP_INPUT_NORM_EPS,
         mp_input_norm_skip_first=MP_INPUT_NORM_SKIP_FIRST,
         mp_residual=_mp_residual(), residual_scale=RESIDUAL_SCALE,
@@ -672,6 +672,10 @@ def parse_arguments(argv=None):
                         "and applied identically to every rule + validation). "
                         "Conditions all rules equally by removing a scale artifact. "
                         "Use --no-input-normalize to force off. Default: %(default)s.")
+    g.add_argument("--mp-input-routing", choices=["dense", "top1_abs"], default=MP_INPUT_ROUTING,
+                   help="presynaptic routing in every MP layer. top1_abs keeps the signed "
+                        "largest-magnitude component per sample and time step after any RMS norm "
+                        "(first index on ties). The residual skip carries the original stream.")
     g.add_argument("--mp-input-norm", choices=["none", "rms"], default=MP_INPUT_NORM,
                    help="per-step RMS normalization of every MP layer's presynaptic input "
                         "(x_hat = x / sqrt(mean(x^2) + eps), so ||x_hat||^2 equals the fan-in "
@@ -1000,7 +1004,7 @@ def main():
     global SEED, LEARNING_SIGNAL, LOCAL_SIGNAL_ALPHA
     global LR, HEAD_LR_MULT, LR_SCHEDULE, LR_PATIENCE, LR_FACTOR
     global RESIDUAL_SCALE
-    global MP_INPUT_NORM, MP_INPUT_NORM_EPS, MP_INPUT_NORM_SKIP_FIRST
+    global MP_INPUT_ROUTING, MP_INPUT_NORM, MP_INPUT_NORM_EPS, MP_INPUT_NORM_SKIP_FIRST
     args = _parse_args()
     DFA_PRESET = args.dfa
     NET_TYPE = args.net
@@ -1033,6 +1037,7 @@ def main():
     RULES_TO_RUN = args.rules
     LOG_GRAD_ALIGN = args.grad_align
     INPUT_NORMALIZE = args.input_normalize
+    MP_INPUT_ROUTING = args.mp_input_routing
     MP_INPUT_NORM = args.mp_input_norm
     MP_INPUT_NORM_EPS = args.mp_input_norm_eps
     MP_INPUT_NORM_SKIP_FIRST = args.mp_input_norm_skip_first

@@ -155,6 +155,7 @@ class RunConfig:
     # diagnostic). Costs one extra BPTT pass per local rule per recorded step
     # (record steps only, not every step), timed OUTSIDE the fwd/bwd/opt readout.
     log_grad_align: bool = True
+    mp_input_routing: str = "dense"
 
 
 # ─── Path helpers (read the passed cfg, i.e. the caller's live globals) ───────
@@ -166,6 +167,8 @@ def param_tag(cfg):
            f"_lr{cfg.lr:.0e}_{cfg.feedback_mode}")
     if getattr(cfg, "input_normalize", False):
         tag += "_inorm"
+    if getattr(cfg, "mp_input_routing", "dense") != "dense":
+        tag += f"_routing-{cfg.mp_input_routing}"
     if getattr(cfg, "mp_input_norm", "none") != "none":
         tag += f"_mpnorm-{cfg.mp_input_norm}"
         if getattr(cfg, "mp_input_norm_skip_first", False):
@@ -770,6 +773,7 @@ def run_seed(cfg, seed, record_steps):
                     getattr(nets[rule], "input_mode", cfg.input_mode),
                     getattr(nets[rule], "_has_trainable_embed", lambda: False)()),
                 "input_normalize": cfg.input_normalize,
+                "mp_input_routing": getattr(cfg, "mp_input_routing", "dense"),
                 "mp_input_norm": getattr(cfg, "mp_input_norm", "none"),
                 "mp_input_norm_skip_first": getattr(cfg, "mp_input_norm_skip_first", False),
                 "mp_residual": cfg.mp_residual,
@@ -893,6 +897,7 @@ def save_plot_data(cfg, record_steps, runs, agg, path=None,
         "head_lr_mult": cfg.head_lr_mult, "lr_schedule": cfg.lr_schedule,
         "lr_patience": getattr(cfg, "lr_patience", 30), "lr_factor": getattr(cfg, "lr_factor", 0.95),
         "feedback_mode": cfg.feedback_mode, "input_normalize": cfg.input_normalize,
+        "mp_input_routing": getattr(cfg, "mp_input_routing", "dense"),
         "mp_input_norm": getattr(cfg, "mp_input_norm", "none"),
         "mp_input_norm_skip_first": getattr(cfg, "mp_input_norm_skip_first", False),
         "mp_input_norm_eps": getattr(cfg, "mp_input_norm_eps", 1e-5),
@@ -997,6 +1002,7 @@ def save_config(cfg, path=None):
             "uses_dfa_by_rule": dfa_by_rule,
             "input_normalize": cfg.input_normalize,
             "input_norm_sample": cfg.input_norm_sample,
+            "mp_input_routing": getattr(cfg, "mp_input_routing", "dense"),
             "mp_input_norm": getattr(cfg, "mp_input_norm", "none"),
             "mp_input_norm_skip_first": getattr(cfg, "mp_input_norm_skip_first", False),
             "mp_input_norm_eps": getattr(cfg, "mp_input_norm_eps", 1e-5),
@@ -1074,6 +1080,7 @@ def run_experiment(cfg):
           f"{f'  signal: {cfg.signal_mode}' if getattr(cfg, 'signal_mode', '') else ''}"
           f"  feedback: {cfg.feedback_mode}"
           f"{'  (input norm ON)' if getattr(cfg, 'input_normalize', False) else ''}"
+          f"{f'  (MP-input routing: {cfg.mp_input_routing})' if getattr(cfg, 'mp_input_routing', 'dense') != 'dense' else ''}"
           f"{f'  (MP-input norm: {cfg.mp_input_norm}' + (', layer 0 un-normalized' if getattr(cfg, 'mp_input_norm_skip_first', False) else '') + ')' if getattr(cfg, 'mp_input_norm', 'none') != 'none' else ''}"
           f"{f'  (residual scale={cfg.residual_scale:g})' if getattr(cfg, 'mp_residual', False) else ''}"
           f"{f'  (cross-layer x{cfg.cross_layer_steps})' if getattr(cfg, 'cross_layer_steps', 0) else ''}"
@@ -1127,6 +1134,8 @@ def run_experiment(cfg):
     # Append notes to the figure title only when the feature is on / non-default, so
     # existing (norm-off, match) figure titles are unchanged.
     inorm_note = ", input norm" if getattr(cfg, "input_normalize", False) else ""
+    routing_note = (f", MP-input {cfg.mp_input_routing} routing"
+                    if getattr(cfg, "mp_input_routing", "dense") != "dense" else "")
     mpnorm_note = (f", MP-input {cfg.mp_input_norm} norm"
                    + (" (layer 0 un-normalized)" if getattr(cfg, "mp_input_norm_skip_first", False) else "")
                    if getattr(cfg, "mp_input_norm", "none") != "none" else "")
@@ -1140,7 +1149,7 @@ def run_experiment(cfg):
                    else f", signal={cfg.learning_signal}"
                    + (f" (alpha={cfg.local_signal_alpha:g})" if cfg.learning_signal == "mixed" else ""))
     plot(cfg, record_steps, agg, cfg.rules_to_run,
-         f"(mean ± std over {cfg.n_runs} runs, {arch_suffix(cfg)}{inorm_note}{mpnorm_note}{resid_note}{xl_note}{inmode_note}{signal_note})",
+         f"(mean ± std over {cfg.n_runs} runs, {arch_suffix(cfg)}{inorm_note}{mpnorm_note}{routing_note}{resid_note}{xl_note}{inmode_note}{signal_note})",
          fig_path(cfg))
 
     # Gradient-alignment-vs-BPTT figure (only when the diagnostic produced data).

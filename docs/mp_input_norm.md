@@ -158,7 +158,7 @@ layers' inputs are activities whose scale carries no task information, which is
 where the loop-gain argument applies.
 
 Implementation: `_mp_input_norm_forward(x, layer_idx)` returns `(x, None)` for
-`layer_idx == 0`, so layer 0's entry in `norm` is `(h[0], None)` and
+`layer_idx == 0`, so under dense routing layer 0's entry in `norm` is `(h[0], None)` and
 `_mp_input_norm_backward` is the identity there; no other code path changes.
 Consequences: every exactness statement above holds unchanged (re-tested with the
 flag on); `diag_mtrace`/`paired` are accepted again, since layer 0's input is the raw
@@ -172,7 +172,10 @@ tag gains `-skip0`.
 
 * `mpn.MultiPlasticNetBase`: config parsing (incl. `mp_input_norm_skip_first`),
   `_mp_input_norm_forward(x, layer_idx)`,
-  `_mp_input_norm_backward`, `_mp_input_norm_seq`.
+  `_mp_input_norm_backward`, and `_prepare_mp_input` (steps and sequences).
+  With `--mp-input-routing top1_abs`, selection follows normalization. Skipping
+  the first layer's normalization still routes its input. Local backprojection
+  applies the winner mask before the RMS transpose Jacobian.
 * `mpn.MultiPlasticNet`: `forward`, `network_step`, `bptt_gradients`,
   `_prepass_output_grad`, `_local_sequence_gradients` consume `x_hat`.
 * `mpn.DeepMultiPlasticNet`: `_forward_stack` (returns the consumed inputs),

@@ -59,6 +59,7 @@ import math
 import numpy as np
 import copy
 import time
+from typing import NamedTuple, Optional
 
 from net_helpers import BaseNetwork, BaseNetworkFunctions
 from net_helpers import rand_weight_init, get_activation_function
@@ -630,8 +631,8 @@ class MultiPlasticLayer(BaseNetworkFunctions):
     # is exact by default. local_bias_mode='direct' instead uses R=phi' with no Q.
     # Intentionally an approximation to BPTT; omitted terms can matter more
     # with longer sequences or stronger plasticity.
-    # With rflo_trace_rho=None, n_input == 1 has no off-diagonal terms to drop.
-    # Capping the recurrence introduces an additional approximation even then.
+    # With rflo_trace_rho=None, one-sparse inputs keep every off-diagonal P zero.
+    # This includes scalar inputs and per-step top1_abs routing.
 
     def reset_diag_rflo_state(self, B=1):
         """Allocate the diagonal-RFLO traces (zeroed).
@@ -1176,12 +1177,26 @@ class MultiPlasticLayer(BaseNetworkFunctions):
 
         return pre_act, db
 
+def _keep_winner(x, winner):
+    """Keep the signed value at one chosen index along the feature dimension."""
+    return torch.zeros_like(x).scatter_(-1, winner, x.gather(-1, winner))
+
+
+class _MPInputJacobian(NamedTuple):
+    winner: Optional[torch.Tensor]
+    normalized: Optional[torch.Tensor]
+    rms: Optional[torch.Tensor]
+
+
 class MultiPlasticNetBase(BaseNetwork):
     """
     Base network for the multiplastic network. Initializes things like the output
     layers and activation functions that are mostly shared across all types of
     MPNs, no matter the connections that lead from input to output.
     """
+
+    # Whole-module checkpoints saved before routing was added use dense inputs.
+    mp_input_routing = 'dense'
 
     @property
     def resolved_local_bias_modes(self):
@@ -1280,9 +1295,9 @@ class MultiPlasticNetBase(BaseNetwork):
         # Independent of input_normalize (which fixes the RAW input's per-feature
         # scale once). mp_input_norm='rms' rescales the PRESYNAPTIC vector that every
         # MP layer consumes, at every time step and for every layer (layers 1..L-1
-        # only under mp_input_norm_skip_first, parsed below):
+        # only under mp_input_norm_skip_first, parsed below), before optional routing:
         #     x_hat = x / r,   r = sqrt(mean_J x_J^2 + eps),   ||x_hat||^2 ≈ d_in.
-        # The forward W(1+M)x_hat, the Hebbian write eta*a*x_hatᵀ and all eligibility
+        # With dense routing, the forward W(1+M)x_hat, Hebbian write and all eligibility
         # traces use the SAME x_hat, so the plastic loop gain of a row,
         # eta*phi'*sum_J W_iJ x_hat_J^2, is decoupled from the fan-in, the depth of
         # the residual stream and the input magnitude at that step. It is
@@ -1293,6 +1308,9 @@ class MultiPlasticNetBase(BaseNetwork):
         # the branch entering the MP block is normalized. Learning signals that
         # travel from x_hat back to the stream are mapped through the transpose
         # Jacobian  J^T g = (g - x_hat * <g, x_hat>/d) / r  (see _mp_input_norm_backward).
+        self.mp_input_routing = net_params.get('mp_input_routing', 'dense')
+        if self.mp_input_routing not in ('dense', 'top1_abs'):
+            raise ValueError("mp_input_routing must be 'dense' or 'top1_abs'")
         self.mp_input_norm = net_params.get('mp_input_norm', 'none') or 'none'
         if self.mp_input_norm not in ('none', 'rms'):
             raise ValueError("mp_input_norm must be 'none' or 'rms'")
@@ -1322,7 +1340,7 @@ class MultiPlasticNetBase(BaseNetwork):
         for mp_layer in self.mp_layers:
             mp_layer.reset_state(B=B)
 
-    # ── MP-input RMS normalization helpers (see __init__) ────────────────────
+    # ── Presynaptic input transforms (see __init__) ────────────────────
     @property
     def _mp_norm_active(self):
         return getattr(self, 'mp_input_norm', 'none') != 'none'
@@ -1342,13 +1360,25 @@ class MultiPlasticNetBase(BaseNetwork):
         r = torch.sqrt(x.square().mean(dim=-1, keepdim=True) + self.mp_input_norm_eps)
         return x / r, r
 
-    def _mp_input_norm_seq(self, inputs):
-        """Sequence form of _mp_input_norm_forward for a single MP layer fed by the
-        raw (standardized) input: (B, T, d) -> normalized (B, T, d). Identity when
-        mp_input_norm is 'none'. Used by MultiPlasticNet, whose only MP layer (layer
-        0) has nothing trainable below it, so no Jacobian transpose is ever needed;
-        that net rejects mp_input_norm_skip_first, which would leave it un-normalized."""
-        return self._mp_input_norm_forward(inputs, layer_idx=0)[0]
+    def _prepare_mp_input(self, x, layer_idx):
+        """Apply RMS then routing along the last axis (step or full sequence).
+        Cache the selected index for the manual VJP, even on ties and all-zero inputs.
+        """
+        normalized, rms = self._mp_input_norm_forward(x, layer_idx)
+        if self.mp_input_routing == 'top1_abs' and x.size(-1) > 1:
+            winner = normalized.abs().argmax(dim=-1, keepdim=True)
+            context = _MPInputJacobian(winner, normalized if rms is not None else None, rms)
+            return _keep_winner(normalized, winner), context
+        context = _MPInputJacobian(None, normalized, rms) if rms is not None else None
+        return normalized, context
+
+    def _mp_input_backward(self, grad, context):
+        """Map an MP branch signal back to the residual stream at the same step."""
+        if context is None:
+            return grad
+        if context.winner is not None:
+            grad = _keep_winner(grad, context.winner)
+        return self._mp_input_norm_backward(grad, context.normalized, context.rms)
 
     def _mp_input_norm_backward(self, g, x_hat, r):
         """Transpose-Jacobian of x_hat = x / r applied to a covector g at x_hat:
@@ -1508,11 +1538,11 @@ class MultiPlasticNet(MultiPlasticNetBase):
 
     def forward(self, inputs, run_mode='minimal', verbose=False):
 
-        # Per-step MP-input normalization (identity unless mp_input_norm is on).
-        # x is what the MP layer consumes and what the Hebbian write must use.
-        x, _ = self._mp_input_norm_forward(inputs, layer_idx=0)
+        x, _ = self._prepare_mp_input(inputs, layer_idx=0)
+        return self._forward_mp_input(x, run_mode)
 
-        # Returns pre-activation
+    def _forward_mp_input(self, x, run_mode):
+        # x is already prepared for both reading and writing the MP state.
         hidden_pre, db_mp = self.mp_layer(x, run_mode=run_mode)
 
         hidden = self.act_fn(hidden_pre)
@@ -1541,12 +1571,8 @@ class MultiPlasticNet(MultiPlasticNetBase):
 
         assert len(current_input.shape) == 2
 
-        output, current_hidden, db = self.forward(current_input, run_mode=run_mode, verbose=verbose)
-
-        # M is updated internally when this is called.
-        # The write uses the same (optionally RMS-normalized) presynaptic vector the
-        # forward consumed; identity unless mp_input_norm is on.
-        x_in, _ = self._mp_input_norm_forward(current_input, layer_idx=0)
+        x_in, _ = self._prepare_mp_input(current_input, layer_idx=0)
+        output, current_hidden, db = self._forward_mp_input(x_in, run_mode)
         self.mp_layer.update_M_matrix(x_in, current_hidden)
 
         return output, db
@@ -1575,7 +1601,7 @@ class MultiPlasticNet(MultiPlasticNetBase):
             torch.cuda.synchronize()
         _t0 = time.perf_counter()
         inputs = self._standardize_input(inputs)   # fixed norm (identity unless on)
-        inputs = self._mp_input_norm_seq(inputs)   # per-step RMS norm (identity unless on)
+        inputs, _ = self._prepare_mp_input(inputs, layer_idx=0)
         self.reset_state(B=B)
         outs = []
         for t in range(T):
@@ -1669,7 +1695,7 @@ class MultiPlasticNet(MultiPlasticNetBase):
         # single MP layer and nothing trainable below it, x_hat is simply the input
         # sequence the layer, its write and its traces all consume.
         inputs = self._standardize_input(inputs)
-        inputs = self._mp_input_norm_seq(inputs)
+        inputs, _ = self._prepare_mp_input(inputs, layer_idx=0)
 
         # Custom loss: a forward-only pre-pass supplies grad_output_seq (dL/d
         # outputs) and the loss from the SUPPLIED loss_and_grad, so the returned
@@ -2178,7 +2204,7 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
         layer_input = x  # read-only downstream (never mutated in-place) → no clone
 
         mpl_activities = [x,] # residual stream h[n] at every boundary (h[0] = x)
-        mp_inputs = []        # what MP layer n actually consumed: h[n] or its RMS-normalized form
+        mp_inputs = []        # inputs actually consumed after any normalization and routing
         block_activities = []
 
         db = {} if run_mode in ('track_states',) else None
@@ -2189,7 +2215,7 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
             # Hebbian write) consumes the optionally normalized x_in; the identity
             # skip below carries the UN-normalized stream (pre-norm placement).
             layer_input_old = layer_input
-            x_in, _ = self._mp_input_norm_forward(layer_input, layer_idx=mpl_idx)
+            x_in, _ = self._prepare_mp_input(layer_input, layer_idx=mpl_idx)
             mp_inputs.append(x_in)
             hidden_pre, db_mp = mp_layer(x_in, run_mode=run_mode)
 
@@ -2211,7 +2237,7 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
                 db['M{}'.format(mp_layer.mp_layer_name)] = db_mp['M']
                 db['b{}'.format(mp_layer.mp_layer_name)] = db_mp['b']
                 db['input{}'.format(mp_layer.mp_layer_name)] = layer_input_old.detach()
-                if self._mp_norm_active:
+                if self._mp_norm_active or self.mp_input_routing != 'dense':
                     db['mp_input{}'.format(mp_layer.mp_layer_name)] = x_in.detach()
 
         if run_mode in ('debug',):
@@ -2251,7 +2277,7 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
             # The write uses raw a_n, not the scaled residual increment. Retaining
             # it explicitly avoids cancellation and division by a possibly zero gain.
             # The presynaptic factor is what the layer consumed (the stream, or its
-            # RMS-normalized form when mp_input_norm is on).
+            # normalized/routed form when those options are on).
             pre = mp_inputs[mpl_idx]
             post = block_activities[mpl_idx]
             _ = mp_layer.update_M_matrix(pre, post)
@@ -2294,7 +2320,7 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
         return any(self._embed_grad_flags())
 
     def _input_mtrace_step(self, trace, features, embed_prime, x, post,
-                           phi_prime, signal, eta, lam):
+                           phi_prime, signal, eta, lam, winner=None):
         """Advance a diagonal-column input sensitivity, before the M write.
 
         trace[b,i,j,k] approximates dM0[b,i,j]/dU[j,k]; derivatives of
@@ -2303,20 +2329,22 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
         optionally a constant 1 for the input bias. No parameter gradients are
         propagated through optimizer steps: weights are fixed during the unroll.
 
-        D[j,k] = phi_embed'[j] * features[k]
+        D[j,k] = phi_embed'[j] * features[k], gated by the winner for routed MP inputs.
         C[i,j,k] = phi0'[i] W0[i,j] ((1+M0[i,j]) D[j,k] + x[j] trace[i,j,k])
         Additive: C = phi0' * ((W0+M0)*D + x*trace).
         raw_trace = lam*trace + eta*(post[i]*D[j,k] + x[j]*C[i,j,k])
 
         C is the raw first MP block activation's sensitivity. Its branch scale
-        multiplies C only in the gradient; the identity adds D there. Neither
+        multiplies C only in the gradient; the identity adds the ungated D there. Neither
         scaling nor the identity path enters the Hebbian post sensitivity C.
         For hebb_pre, replace post by its constant and omit the x*C term.
         The caller finalizes raw_trace AFTER M0's write using its actual gate.
         Storage is O(batch * first_MP_width * embed_width * feature_count).
         """
         layer = self.mp_layers[0]
-        direct = embed_prime.unsqueeze(-1) * features.unsqueeze(1)
+        # Gate the derivative of the MP input before expanding over embedding features.
+        branch_prime = _keep_winner(embed_prime, winner) if winner is not None else embed_prime
+        direct = branch_prime.unsqueeze(-1) * features.unsqueeze(1)
         if layer.mp_type == 'mult':
             # Keep the legacy operation order for multiplicative checkpoints.
             eligibility = (phi_prime[:, :, None, None] * layer.W[None, :, :, None]
@@ -2328,7 +2356,9 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
                 + x[:, None, :, None] * trace)
         gradient = torch.einsum('bi,bijk->jk', self._branch_scales[0] * signal, eligibility)
         if self._residual_at[0]:
-            gradient = gradient + torch.einsum('bj,bjk->jk', signal, direct)
+            # The skip consumes the embedding before routing.
+            stream_direct = direct if winner is None else embed_prime.unsqueeze(-1) * features.unsqueeze(1)
+            gradient = gradient + torch.einsum('bj,bjk->jk', signal, stream_direct)
         raw_trace = lam[None, :, :, None] * trace
         if layer.m_update_type == 'hebb_assoc':
             source = (post[:, :, None, None] * direct.unsqueeze(1)
@@ -2373,16 +2403,10 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
             output    readout(h[L])
         embed_pre is the embedding PRE-activation (for the embedding grad) or None.
         With return_blocks=True, append the raw block activations for M writes.
-        With return_norm=True, append `norm`, a per-layer list of (x_in, r):
-            x_in[n]   the presynaptic vector MP layer n CONSUMED — h[n] itself, or
-                      its RMS-normalized form when mp_input_norm is on (layer 0
-                      stays h[0] under mp_input_norm_skip_first)
-            r[n]      the per-sample RMS divisor (B,1), or None when the norm is off
-                      (and for n == 0 under mp_input_norm_skip_first)
-        x_in is what the Hebbian write and every eligibility trace of layer n must
-        use; (x_in, r) is what _mp_input_norm_backward needs to carry a learning
-        signal from x_in back to the stream h[n]. h[.] always holds the UN-normalized
-        residual stream. Every mp(...) call consumes that layer's own M_{t-1};
+        With return_norm=True, append per-layer (x_in, context) pairs. x_in is the
+        optionally normalized and routed input shared by the MP read, Hebbian write
+        and eligibility traces. The context maps branch signals back to the original
+        stream h[n] and is None for the identity transform. Each MP reads M_{t-1};
         nothing is advanced.
         """
         if self.input_layer_active:
@@ -2398,8 +2422,8 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
         blocks = []
         norm = []
         for n, mp in enumerate(self.mp_layers):
-            x_in, r_n = self._mp_input_norm_forward(h[-1], layer_idx=n)   # identity unless norm is on
-            norm.append((x_in, r_n))
+            x_in, context = self._prepare_mp_input(h[-1], layer_idx=n)
+            norm.append((x_in, context))
             z_n, _ = mp(x_in)               # uses this layer's M_{t-1}
             phi_p.append(self.act_fn_p(z_n))
             z.append(z_n)
@@ -2421,15 +2445,10 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
                                     head_errors=None, norm=None):
         """Same-time layer-boundary learning signals using the frozen M_{t-1}.
 
-        norm: the per-layer (x_in, r) list from _forward_local_stack(return_norm=True).
-        Required whenever mp_input_norm is on: a backprojection through W_eff^{(n)}
-        (or B_inter[n]) lands on the NORMALIZED input x_in[n], so it is mapped to the
-        stream h[n] through the transpose Jacobian of the norm
-        (_mp_input_norm_backward) BEFORE the identity-skip term — which lives on the
-        un-normalized stream — is added. An entry (x, None) makes that map the
-        identity (layer 0 under mp_input_norm_skip_first). direct_fa projects
-        straight onto the stream and is unaffected. With the norm off, norm may be
-        omitted.
+        norm holds per-layer (x_in, context) pairs. A backprojection through W_eff
+        or B_inter lands at x_in. Apply the routing mask, then the RMS transpose
+        Jacobian, before adding the identity skip. direct_fa projects onto the
+        stream directly. The pairs may be omitted for an untransformed input.
 
         head_errors (local readout heads; see _LEARNING_SIGNALS): the per-head
         output errors e_n = dL_n/dq^(n) for n = 0..L-2, or None (global signal).
@@ -2482,8 +2501,8 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
         """
         L = len(self.mp_layers)
         ell_h = [None] * (L + 1)
-        if self._mp_norm_active and norm is None:
-            raise RuntimeError("mp_input_norm is on: pass the per-layer (x_in, r) list "
+        if (self._mp_norm_active or self.mp_input_routing != 'dense') and norm is None:
+            raise RuntimeError("MP input transform is on: pass the per-layer input context list "
                                "from _forward_local_stack(return_norm=True) as norm")
         if norm is None:
             norm = [(None, None)] * L
@@ -2513,9 +2532,8 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
                     ell_h[n] = delta_n @ getattr(self, self._B_inter_names[n])
                 else:
                     ell_h[n] = self.mp_layers[n].backproject_through_modulated_weights_fast(delta_n)
-                # The weight-path signal lives at the (possibly normalized) MP input;
-                # map it to the stream through the norm's transpose Jacobian.
-                ell_h[n] = self._mp_input_norm_backward(ell_h[n], *norm[n])
+                # Pull the branch signal back through routing and normalization.
+                ell_h[n] = self._mp_input_backward(ell_h[n], norm[n][1])
                 # Identity-skip Jacobian term adds ell_h[n+1] straight
                 # through (equal widths guaranteed by _residual_at[n]).
                 if self._residual_at[n]:
@@ -2533,7 +2551,7 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
                 ell_h[0] = delta_0 @ getattr(self, self._B_inter_names[0])
             else:
                 ell_h[0] = self.mp_layers[0].backproject_through_modulated_weights_fast(delta_0)
-            ell_h[0] = self._mp_input_norm_backward(ell_h[0], *norm[0])
+            ell_h[0] = self._mp_input_backward(ell_h[0], norm[0][1])
             # Embedding→layer-0 identity skip → add ell_h[1] through unscaled.
             if self._residual_at[0]:
                 ell_h[0] = ell_h[0] + ell_h[1]
@@ -2579,20 +2597,20 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
         factor is the same constant 1/sqrt(n_output) used by the forward write,
         and the POST source is zero.
 
-        MP-INPUT NORM. x_in[m] / prev_xin[m] are the (possibly RMS-normalized)
+        MP INPUT. x_in[m] / prev_xin[m] are the optionally normalized and routed
         presynaptic vectors layer m consumed at t / t-1 — identical to the stream
-        when the norm is off. The write at t-1 was eta*a[m]_{t-1}*x_in[m]_{t-1}ᵀ and
+        for a dense, unnormalized input. The write at t-1 was eta*a[m]_{t-1}*x_in[m]_{t-1}ᵀ and
         the read at t is W_eff[m]_t x_in[m]_t, so the PRE factor uses x_in[m]_t and
         the POST bracket uses prev_xin[m]; both brackets then live at x_in[m]_{t-1}
-        and are mapped to the stream h[m]_{t-1} through the norm's transpose
+        and are mapped to the stream h[m]_{t-1} through the input transform's transpose
         Jacobian at t-1 (prev_norm[m]). The downward sweep applies the same
         transpose after each W_eff[q]_{t-1} backprojection and before adding the
         identity-skip term, mirroring _same_time_boundary_signals one step back."""
         layers = self.mp_layers
         L = len(layers)
-        if self._mp_norm_active and prev_norm is None:
-            raise RuntimeError("mp_input_norm is on: pass the previous step's per-layer "
-                               "(x_in, r) list as prev_norm")
+        if (self._mp_norm_active or self.mp_input_routing != 'dense') and prev_norm is None:
+            raise RuntimeError("MP input transform is on: pass the previous step's per-layer "
+                               "input context list as prev_norm")
         if prev_norm is None:
             prev_norm = [(None, None)] * L
 
@@ -2628,9 +2646,8 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
                 v[m] = u_pre + u_post
             else:
                 v[m] = u_pre
-            # Both brackets are covectors at the normalized input x_in[m]_{t-1};
-            # carry them to the stream h[m]_{t-1} (identity when the norm is off).
-            v[m] = self._mp_input_norm_backward(v[m], *prev_norm[m])
+            # Both terms live at the MP input at t-1. Use that step's transform.
+            v[m] = self._mp_input_backward(v[m], prev_norm[m][1])
             # Mask the source of the write at t-1, not the current loss or the
             # same-time transport Jacobians. Supports both binary and graded masks.
             if prev_update_mask is not None:
@@ -2648,7 +2665,7 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
                 # Scale the weight path only; the identity adds the unscaled acc.
                 r = self._branch_scales[q] * acc * prev_phi[q]
                 down = torch.einsum('Ba,Bai->Bi', r, prev_Weff[q])
-                down = self._mp_input_norm_backward(down, *prev_norm[q])
+                down = self._mp_input_backward(down, prev_norm[q][1])
                 if self._residual_at[q]:
                     down = down + acc
                 acc = v[q] + down
@@ -2897,7 +2914,7 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
             prev_R = [None] * L        # R[n]_{t-1} = dh_stream[n+1]/db[n]  (B,out_n)
             prev_ablock = [None] * L   # block activation a[n]_{t-1}        (B,out_n)
             prev_xin = [None] * L      # presynaptic input layer n consumed at t-1 (stream or RMS-normalized)
-            prev_norm = [None] * L     # (x_in, r)_{t-1} per layer for the norm's transpose Jacobian
+            prev_norm = [None] * L     # previous input and its routing/RMS Jacobian context
             prev_phi = [None] * L      # phi'(z[n])_{t-1}                   (B,out_n)
             prev_Weff = [None] * L     # W_eff[n] the t-1 forward CONSUMED = W(1+M_{t-2})
             prev_update_mask = None    # which batch rows wrote their M at t-1
@@ -2956,7 +2973,7 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
 
             # 1. Forward the whole stack with M_{t-1} (no M advance yet). h is the
             #    residual stream; x_in[n] = norm[n][0] is what MP layer n consumed
-            #    (= h[n] unless mp_input_norm is on) and is what its write and its
+            #    (after any normalization and routing) and is what its write and its
             #    eligibility traces must see.
             output, h, z, phi_p, embed_pre, blocks, norm = self._forward_local_stack(
                 u_t, return_blocks=True, return_norm=True)
@@ -3014,7 +3031,8 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
                 post0 = blocks[0]
                 grad_t, proposed_input_trace = self._input_mtrace_step(
                     input_trace, features, self.act_fn_p(embed_pre), x_in[0], post0,
-                    phi_p[0], ell_h[1], *eta_lam[0])
+                    phi_p[0], ell_h[1], *eta_lam[0],
+                    winner=norm[0][1].winner if norm[0][1] is not None else None)
                 grad_input += grad_t
             elif embed:
                 ga_seq[t] = ell_h[0] * self.act_fn_p(embed_pre)
@@ -3062,8 +3080,7 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
                     if update_trace[n] is not None:
                         update_trace[n](x_in[n], cur_E[n], cur_R[n],
                                         update_mask=um, eta_lam=eta_lam[n])
-            # 6. Advance M with the consumed input x_in[n] (the stream, or its RMS-
-            #    normalized form) and raw block activation blocks[n].
+            # 6. Advance M with the consumed input x_in[n] and raw block activation blocks[n].
             #    The branch scale changes output sensitivities, not this write rule.
             for n, mp in enumerate(layers):
                 eta_n, lam_n = eta_lam[n]
@@ -3156,10 +3173,11 @@ class DeepMultiPlasticNet(MultiPlasticNetBase):
 
     def local_diag_rflo_gradients(self, inputs, labels, masks, **kwargs):
         """Diagonal RFLO eligibility per MP layer + same-time inter-layer learning
-        signals + the selected local input rule. APPROXIMATE for EVERY plastic
-        layer — including the top — regardless of feedback_mode, because the
-        diagonal eligibility itself drops off-synapse plastic sensitivities (exact
-        only when n_input == 1). The readout gradient stays exact."""
+        signals + the selected local input rule. Dropping off-synapse plastic
+        sensitivities generally approximates even the top layer's eligibility.
+        With one-sparse inputs and no RFLO gain cap, the diagonal MP weight
+        eligibility equals row-local. Cross-layer temporal credit and bias
+        eligibility still follow their configured rules."""
         return self._local_sequence_gradients(inputs, labels, masks, 'diag', **kwargs)
 
     def local_direct_gradients(self, inputs, labels, masks, **kwargs):
