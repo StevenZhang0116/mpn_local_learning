@@ -23,12 +23,13 @@ local rule on a two-MP-layer net, the RNN and the GRU). The nonlinear-system
 tasks (wh_mid / wh_out) are checked against the two recurrences by hand and
 against an independent convolution, for causality, for the pairing of the two
 variants, and for the linear (FIR) baseline that accuracy() is measured against.
-The two-hop illustration script (scripts/tasks/illustrations) is checked for the
-example it draws and for writing its figure.
+The illustration scripts (scripts/tasks/illustrations) are checked for the
+examples they draw and for writing their figures.
 
 Run from this directory (mpn_local_learning/tests):  python test_tasks.py
 """
 import os
+import tempfile
 
 import math
 
@@ -288,15 +289,20 @@ def test_twohop_task():
           only_one["one_hop"] == 1.0 and math.isnan(only_one["two_hop"]))
 
 
+def _load_illustration(name):
+    """Import scripts/tasks/illustrations/<name>.py by path. Returns (module, path)."""
+    import importlib.util
+    path = _bootstrap.ROOT / "scripts" / "tasks" / "illustrations" / f"{name}.py"
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module, path
+
+
 def test_twohop_illustration():
     """scripts/tasks/illustrations/plot_twohop_task.py: the example it draws is one
     stored history asked both ways, and the script writes its figure."""
-    import importlib.util
-    import tempfile
-    path = _bootstrap.ROOT / "scripts" / "tasks" / "illustrations" / "plot_twohop_task.py"
-    spec = importlib.util.spec_from_file_location("plot_twohop_task", path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    module, path = _load_illustration("plot_twohop_task")
 
     K, delay = 4, 4
     trial = module.example_trial(K, delay, seed=8)
@@ -319,6 +325,45 @@ def test_twohop_illustration():
     with tempfile.TemporaryDirectory() as directory:
         written = module.main(["--output", os.path.join(directory, "twohop.png")])
         check("illustration: the script writes its figure", os.path.getsize(written) > 10_000)
+
+
+def test_wh_illustration():
+    """scripts/tasks/illustrations/plot_nonlinear_system_task.py: the signals it draws
+    are the task's own, for one input shared by both systems, and it writes its figure."""
+    module, path = _load_illustration("plot_nonlinear_system_task")
+    data = module.example(seed=5, n_pool=64)
+    x = data["x"]
+    for variant in ("mid", "out"):
+        drawn, task = data[variant], data[variant]["task"]
+        y, s = task.targets(x[None])
+        check(f"illustration wh_{variant}: the target and the fast state are the task's",
+              task.variant == variant and np.array_equal(drawn["y"], y[0])
+              and np.array_equal(drawn["s"], s[0]))
+        rebuilt = (module.slow_filter(drawn["second"][None], task.beta)[0] if variant == "mid"
+                   else np.tanh(task.gain * drawn["second"]))
+        check(f"illustration wh_{variant}: the signal between the blocks leads to the target",
+              np.allclose(rebuilt, drawn["y"], rtol=0, atol=1e-12))
+        baseline = task.fir_predict(torch.as_tensor(x[None])).numpy()[0]
+        check(f"illustration wh_{variant}: the linear prediction is the task's FIR baseline",
+              np.allclose(drawn["fir"], baseline, rtol=0, atol=1e-10))
+        low, high = drawn["tanh_range"]
+        check(f"illustration wh_{variant}: a linear filter explains most of the target",
+              0.8 < drawn["r2"] < 0.97 and low < 0 < high, f"R^2 {drawn['r2']:.3f}")
+    check("illustration wh: both systems get the same input and share the fast memory",
+          np.array_equal(data["mid"]["s"], data["out"]["s"]))
+    check("illustration wh: the tanh is driven further into saturation in wh_mid",
+          np.ptp(data["mid"]["tanh_range"]) > 1.5 * np.ptp(data["out"]["tanh_range"]))
+    other = module.example("b95_g2p5_T32", n_pool=16)
+    check("illustration wh: --params builds both tasks from the task-name fragments",
+          all((other[v]["task"].beta, other[v]["task"].gain, other[v]["task"].seq_len)
+              == (0.95, 2.5, 32) for v in ("mid", "out")) and other["x"].shape == (32,))
+    check("illustration wh: default output names",
+          module.default_output().name == "nonlinear_system_task.png"
+          and module.default_output("b95_g2p5").name == "nonlinear_system_task_b95_g2p5.png"
+          and module.default_output().parent == path.parent)
+    with tempfile.TemporaryDirectory() as directory:
+        written = module.main(["--output", os.path.join(directory, "wh.png")])
+        check("illustration wh: the script writes its figure", os.path.getsize(written) > 10_000)
 
 
 def test_wh_task():
@@ -632,6 +677,7 @@ if __name__ == "__main__":
     test_twohop_task()
     test_twohop_illustration()
     test_wh_task()
+    test_wh_illustration()
     test_registry()
     test_integration_seqmnist()
     test_integration_adding()

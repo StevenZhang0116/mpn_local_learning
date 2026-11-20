@@ -121,6 +121,15 @@ and the nonlinearity is applied once, at the output. In `wh_mid` the slow memory
 accumulates a signal that has already been transformed, so a large input counts
 no more than a moderate one.
 
+![One white-noise input through the wh_mid and the wh_out system: the blocks of each
+system, the signals between them, and the target with the best linear filter's
+prediction](../scripts/tasks/illustrations/nonlinear_system_task.png)
+
+The figure runs one input through both systems at the default parameters. It is
+drawn from the task's own code by
+`scripts/tasks/illustrations/plot_nonlinear_system_task.py`; `--params` takes the
+name fragments below (e.g. `--params b95_g2p5`).
+
 | Name fragment | Sets | Default |
 |---|---|---|
 | `_a<percent>` | `alpha`, the fast memory | 0.6 (`_a60`) |
